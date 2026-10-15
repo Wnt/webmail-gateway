@@ -142,6 +142,8 @@ export async function startFakeJmap(): Promise<FakeJmap> {
         "urn:ietf:params:jmap:contacts": {},
         "https://www.fastmail.com/dev/maskedemail": {},
         "urn:ietf:params:jmap:websocket": { url: "wss://api.example.test/jmap/ws/", supportsPush: true },
+        "urn:ietf:params:jmap:webpush-vapid": { applicationServerKey: "BOGUS" },
+        "urn:ietf:params:jmap:emailpush": {},
       },
       accounts: {
         [ACCOUNT_ID]: {
@@ -156,7 +158,11 @@ export async function startFakeJmap(): Promise<FakeJmap> {
         },
         [SHARED_ACCOUNT_ID]: { name: "family@example.test", isPersonal: false, isReadOnly: true, accountCapabilities: { "urn:ietf:params:jmap:mail": {} } },
       },
-      primaryAccounts: { "urn:ietf:params:jmap:mail": ACCOUNT_ID, "urn:ietf:params:jmap:submission": ACCOUNT_ID },
+      primaryAccounts: {
+        "urn:ietf:params:jmap:mail": ACCOUNT_ID,
+        "urn:ietf:params:jmap:submission": ACCOUNT_ID,
+        "urn:ietf:params:jmap:websocket": ACCOUNT_ID,
+      },
       username: user,
       apiUrl: rel(`${f.apiOrigin}/jmap/api/`),
       downloadUrl: `${f.dlOrigin}/jmap/download/{accountId}/{blobId}/{name}?type={type}`,

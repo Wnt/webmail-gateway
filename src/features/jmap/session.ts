@@ -6,12 +6,14 @@
 export const CORE = "urn:ietf:params:jmap:core";
 /**
  * Capabilities that do not work through the gateway, so they are never
- * advertised: WebSocket (not proxied), and emailpush (PushSubscription is
- * answered by the gateway's push feature, which does not implement it, D5).
+ * advertised: WebSocket (not proxied); PushSubscription extensions, because
+ * PushSubscription/* is answered by the gateway's push feature, which
+ * implements neither emailpush (D5) nor VAPID (RFC 9749) subscriptions.
  */
 export const UNSUPPORTED_CAPABILITIES: ReadonlySet<string> = new Set([
   "urn:ietf:params:jmap:websocket",
   "urn:ietf:params:jmap:emailpush",
+  "urn:ietf:params:jmap:webpush-vapid",
 ]);
 
 /** The public URL templates. They equal legacy-proxy's; if a legacy upgrade changes those, `templateDrift` reports it. */
@@ -75,6 +77,11 @@ export function rewriteSession(s: Obj, o: RewriteOptions): Obj {
   core["maxCallsInRequest"] = clamp(core["maxCallsInRequest"], o.maxCallsInRequest);
   caps[CORE] = core;
   out["capabilities"] = caps;
+  if (isObj(s["primaryAccounts"])) {
+    const pa: Obj = { ...s["primaryAccounts"] };
+    for (const c of UNSUPPORTED_CAPABILITIES) delete pa[c];
+    out["primaryAccounts"] = pa;
+  }
 
   const accounts: Obj = {};
   for (const [id, a] of Object.entries(s["accounts"] as Obj)) {

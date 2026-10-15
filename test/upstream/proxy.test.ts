@@ -92,13 +92,13 @@ describe("session", () => {
       uploadUrl: "https://mail.example.test/jmap/upload/{accountId}",
       eventSourceUrl: "https://mail.example.test/jmap/eventsource?types={types}&closeafter={closeafter}&ping={ping}",
       username: EMAIL,
-      primaryAccounts: { [MAIL]: ACCOUNT_ID },
       state: "sess-1",
     });
     expect(Object.keys(s.capabilities)).toEqual(
       expect.arrayContaining([CORE, MAIL, "urn:ietf:params:jmap:contacts", "urn:ietf:params:jmap:vacationresponse"]),
     );
-    expect(s.capabilities["urn:ietf:params:jmap:websocket"]).toBeUndefined();
+    for (const c of ["websocket", "emailpush", "webpush-vapid"]) expect(s.capabilities[`urn:ietf:params:jmap:${c}`], c).toBeUndefined();
+    expect(s.primaryAccounts).toEqual({ [MAIL]: ACCOUNT_ID, "urn:ietf:params:jmap:submission": ACCOUNT_ID });
     expect(s.capabilities[CORE]).toMatchObject({ maxSizeUpload: 50_000_000, maxCallsInRequest: 50, maxConcurrentUpload: 10 });
     expect(s.accounts[ACCOUNT_ID].name).toBe(EMAIL);
     expect(s.accounts[ACCOUNT_ID].accountCapabilities["urn:ietf:params:jmap:websocket"]).toBeUndefined();
