@@ -44,10 +44,8 @@ describe("health endpoints", () => {
     await bad.close();
   });
 
-  it("feature stubs register no routes", async () => {
-    for (const url of ["/relay/api/push/vapid-public-key"]) {
-      expect((await app.inject(url)).statusCode).toBe(404);
-    }
+  it("registers the push routes (503 without VAPID keys)", async () => {
+    expect((await app.inject("/relay/api/push/vapid-public-key")).statusCode).toBe(503);
   });
 
   it("jmap routes exist and require authentication", async () => {

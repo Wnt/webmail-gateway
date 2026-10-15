@@ -22,7 +22,7 @@ describe("loadConfig", () => {
     expect(c.legacyProvider).toBe("gandi");
     expect(c.jmap).toMatchObject({ passwordMode: false, maxSizeUpload: 50_000_000 });
     expect(c.auth).toEqual({ rpName: "Webmail", bulwarkClientSecret: null, sessionTtlMs: 12 * 3600_000 });
-    expect(c.push).toEqual({});
+    expect(c.push).toMatchObject({ vapid: null, upstreamAlways: false });
   });
 
   it("honours overrides", () => {
