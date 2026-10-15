@@ -1,4 +1,5 @@
 import { getGandiPassword, type Account } from "./accounts.js";
+import { emitLegacyRelogin } from "./hooks.js";
 import { mintToken } from "./token.js";
 import type { CoreContext } from "../types.js";
 
@@ -89,6 +90,9 @@ function reloginWithBasic(ctx: Ctx, account: LegacyAccount): Promise<boolean> {
     await discard(res);
     if (!res.ok) {
       ctx.log?.warn({ accountId: account.id, status: res.status }, "legacy-proxy Basic re-login rejected");
+    } else {
+      // Not awaited: listeners (push) may call legacy-proxy themselves.
+      void emitLegacyRelogin(account.id);
     }
     return res.ok;
   })().finally(() => relogins.delete(account.id));

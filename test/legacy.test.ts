@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { setGandiPassword, upsertAccount, type Account } from "../src/core/accounts.js";
+import { onLegacyRelogin, resetHooks } from "../src/core/hooks.js";
 import { legacyFetch, legacyJmap, LegacyError } from "../src/core/legacy.js";
 import type { AppContext } from "../src/types.js";
 import { startFakeLegacy, type FakeLegacy } from "./fake-legacy.js";
@@ -63,6 +64,22 @@ describe("legacyFetch", () => {
     fake.calls.length = 0;
     expect((await legacyFetch(ctx, account, "/jmap/session")).status).toBe(200);
     expect(schemes()).toEqual(["GET /jmap/session Bearer"]);
+  });
+
+  it("emits onLegacyRelogin after a successful re-login only", async () => {
+    resetHooks();
+    const seen: string[] = [];
+    onLegacyRelogin((id) => {
+      seen.push(id);
+    });
+    fake.accounts.clear();
+    expect((await legacyFetch(ctx, account, "/jmap/session")).status).toBe(401); // no password: no re-login
+    expect(seen).toEqual([]);
+    await setGandiPassword(ctx, account.id, "gandi-pass");
+    fake.passwords.set(account.email, "gandi-pass");
+    expect((await legacyFetch(ctx, account, "/jmap/session")).status).toBe(200);
+    expect(seen).toEqual([account.id]);
+    resetHooks();
   });
 
   it("retries only once: a persistent 401 is returned, not looped", async () => {

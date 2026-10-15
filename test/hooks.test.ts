@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Principal } from "../src/core/auth-context.js";
 import {
+  emitLegacyRelogin,
   emitNewMail,
   handlePushSubscription,
   JmapMethodError,
+  onLegacyRelogin,
   onNewMail,
   registerPushSubscriptionHandler,
   resetHooks,
@@ -80,5 +82,22 @@ describe("PushSubscription handler", () => {
     await expect(handlePushSubscription(principal, "PushSubscription/set", {})).rejects.toMatchObject({
       type: "forbidden",
     });
+  });
+});
+
+describe("legacy re-login bus", () => {
+  it("delivers to listeners, survives a throwing one, and unsubscribes", async () => {
+    const a = vi.fn();
+    const bad = vi.fn(async () => {
+      throw new Error("nope");
+    });
+    const off = onLegacyRelogin(a);
+    onLegacyRelogin(bad);
+    await emitLegacyRelogin("acc-1");
+    expect(a).toHaveBeenCalledWith("acc-1");
+    expect(bad).toHaveBeenCalled();
+    off();
+    await emitLegacyRelogin("acc-2");
+    expect(a).toHaveBeenCalledTimes(1);
   });
 });

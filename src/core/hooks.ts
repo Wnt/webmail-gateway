@@ -78,8 +78,34 @@ export async function handlePushSubscription(
   return pushHandler(principal, method, args);
 }
 
+export type LegacyReloginListener = (accountId: string) => void | Promise<void>;
+
+const legacyReloginListeners: LegacyReloginListener[] = [];
+
+/**
+ * Subscribe to "legacy-proxy lost this account and `core/legacy` re-created it
+ * with a Basic re-login". Anything legacy-proxy held for the account (push
+ * subscriptions, ids) may be gone. Returns an unsubscribe function.
+ */
+export function onLegacyRelogin(cb: LegacyReloginListener): () => void {
+  legacyReloginListeners.push(cb);
+  return () => {
+    const i = legacyReloginListeners.indexOf(cb);
+    if (i >= 0) legacyReloginListeners.splice(i, 1);
+  };
+}
+
+/** Emitted by `core/legacy` after a successful Basic re-login. Listener errors are logged, never thrown. */
+export async function emitLegacyRelogin(accountId: string): Promise<void> {
+  const results = await Promise.allSettled([...legacyReloginListeners].map((cb) => cb(accountId)));
+  for (const r of results) {
+    if (r.status === "rejected") log.error({ err: r.reason, accountId }, "legacy-relogin listener failed");
+  }
+}
+
 /** Test helper: drop all listeners and the push handler. */
 export function resetHooks(): void {
   newMailListeners.length = 0;
+  legacyReloginListeners.length = 0;
   pushHandler = null;
 }
