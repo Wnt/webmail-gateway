@@ -1,7 +1,15 @@
 import { randomBytes } from "node:crypto";
 import type { FastifyInstance } from "fastify";
-import { getAccountById, getGandiPassword, type Account } from "../../core/accounts.js";
-import { JMAP_CORE, legacyJmap } from "../../core/legacy.js";
+import { getAccountById, type Account } from "../../core/accounts.js";
+import {
+  getUpstream as getMailUpstream,
+  JMAP_CORE,
+  watchStateChanges,
+  type JmapMethodCall,
+  type JmapResponse,
+  type Upstream as MailUpstream,
+  type Watch,
+} from "../../core/upstream/index.js";
 import type { AppContext } from "../../types.js";
 import type { Pipeline } from "./pipeline.js";
 import type { PushStats } from "./stats.js";
@@ -18,10 +26,19 @@ import {
 } from "./store.js";
 
 /**
- * The gateway's own PushSubscription in legacy-proxy (design/push.md section 4):
- * at most one per account, kept only while the account has an active browser
- * subscription (P1) unless PUSH_UPSTREAM_ALWAYS. Created, verified, refreshed
- * and recreated by `reconcile`; legacy-proxy POSTs to /internal/push/jmap/:hookId.
+ * Where new-mail signals come from, per account (design/push.md section 4),
+ * kept only while the account has an active browser subscription (P1) unless
+ * PUSH_UPSTREAM_ALWAYS. The upstream decides the mechanism:
+ *
+ * - "pushSubscription" (legacy-proxy): the gateway's own RFC 8620
+ *   PushSubscription, at most one per account. Created, verified, refreshed
+ *   and recreated by `reconcile`; the upstream POSTs to
+ *   /internal/push/jmap/:hookId.
+ * - "eventSource" (a native JMAP server such as Fastmail): one long-lived
+ *   upstream EventSource per account (types=EmailDelivery), reconnecting with
+ *   backoff. Nothing has to reach the gateway from outside.
+ *
+ * Either way a StateChange triggers the Email/changes pipeline.
  */
 
 export const DEVICE_CLIENT_ID = "webmail-gateway";
@@ -34,6 +51,8 @@ export type ReconcileReason = "startup" | "timer" | "relogin" | "subs-changed" |
 export interface UpstreamOptions {
   verifyTimeoutMs?: number;
   verifyPollMs?: number;
+  /** "eventSource" mechanism: first reconnect delay (doubles up to 5 min). */
+  eventSourceMinBackoffMs?: number;
 }
 
 const newHookId = (): string => randomBytes(16).toString("base64url");
@@ -51,8 +70,12 @@ function setResult(res: { methodResponses: [string, Record<string, unknown>, str
 
 export class UpstreamManager {
   private waiters = new Map<string, () => void>();
+  private readonly mail: MailUpstream;
+  /** Open upstream EventSource connections ("eventSource" mechanism), by gateway account id. */
+  private readonly watches = new Map<string, Watch>();
   private readonly verifyTimeoutMs: number;
   private readonly verifyPollMs: number;
+  private readonly esMinBackoffMs: number | undefined;
 
   constructor(
     private readonly ctx: AppContext,
@@ -62,6 +85,23 @@ export class UpstreamManager {
   ) {
     this.verifyTimeoutMs = opts.verifyTimeoutMs ?? 15_000;
     this.verifyPollMs = opts.verifyPollMs ?? 250;
+    this.esMinBackoffMs = opts.eventSourceMinBackoffMs;
+    this.mail = getMailUpstream(ctx);
+  }
+
+  private jmap(account: Account, calls: JmapMethodCall[]): Promise<JmapResponse> {
+    return this.mail.jmap(account, calls, [JMAP_CORE]);
+  }
+
+  /** Close every upstream EventSource (shutdown). */
+  stop(): void {
+    for (const w of this.watches.values()) w.stop();
+    this.watches.clear();
+  }
+
+  /** Whether an upstream EventSource is open for the account (tests, logs). */
+  watching(accountId: string): boolean {
+    return this.watches.get(accountId)?.connected ?? false;
   }
 
   hookUrl(hookId: string): string {
@@ -94,7 +134,7 @@ export class UpstreamManager {
   }
 
   private async wanted(account: Account): Promise<boolean> {
-    if (this.ctx.config.push.upstreamAlways) return (await getGandiPassword(this.ctx, account.id)) !== null;
+    if (this.ctx.config.push.upstreamAlways) return this.mail.hasCredential(account.id);
     return hasActiveSubs(this.ctx.db, account.id);
   }
 
@@ -103,9 +143,10 @@ export class UpstreamManager {
     const account = await getAccountById(this.ctx, accountId);
     if (!account) return false;
     if (!(await this.wanted(account))) {
-      if (row.status !== "none") await this.teardown(account, row);
+      if (row.status !== "none" || this.watches.has(accountId)) await this.teardown(account, row);
       return false;
     }
+    if (this.mail.pushMechanism === "eventSource") return this.watch(account, row);
     if (row.status === "active" && row.upstreamId) return this.probe(account, row);
     if (row.status === "failed" && reason === "timer" && row.nextAttemptAt && row.nextAttemptAt.getTime() > Date.now()) {
       return false;
@@ -117,7 +158,7 @@ export class UpstreamManager {
     const now = Date.now();
     let found: Record<string, unknown> | undefined;
     try {
-      const res = await legacyJmap(this.ctx, account, [["PushSubscription/get", { ids: [row.upstreamId] }, "g"]], [JMAP_CORE]);
+      const res = await this.jmap(account, [["PushSubscription/get", { ids: [row.upstreamId] }, "g"]]);
       const list = setResult(res, "g").list;
       found = Array.isArray(list) ? (list as Record<string, unknown>[]).find((s) => s.id === row.upstreamId) : undefined;
     } catch (err) {
@@ -136,11 +177,9 @@ export class UpstreamManager {
     if (Number.isFinite(expires) && expires - now < REFRESH_BEFORE_MS) {
       const next = new Date(now + this.ctx.config.push.upstreamExpiresMs);
       try {
-        const res = await legacyJmap(
-          this.ctx,
+        const res = await this.jmap(
           account,
           [["PushSubscription/set", { update: { [row.upstreamId!]: { expires: next.toISOString() } } }, "u"]],
-          [JMAP_CORE],
         );
         const updated = setResult(res, "u").updated as Record<string, unknown> | null | undefined;
         if (!updated || !(row.upstreamId! in updated)) return this.create(account, row, "refresh-rejected");
@@ -162,7 +201,7 @@ export class UpstreamManager {
     // A new hook id first: the old one now answers 404, so a stray old sub is deleted by legacy-proxy.
     await updateUpstream(db, account.id, { hookId, status: "creating", upstreamId: null, verificationCode: null });
     try {
-      const existing = await legacyJmap(this.ctx, account, [["PushSubscription/get", { ids: null }, "g"]], [JMAP_CORE]);
+      const existing = await this.jmap(account, [["PushSubscription/get", { ids: null }, "g"]]);
       const list = setResult(existing, "g").list;
       const others = Array.isArray(list) ? (list as { id?: unknown }[]).map((s) => s.id).filter((id): id is string => typeof id === "string") : [];
 
@@ -179,7 +218,7 @@ export class UpstreamManager {
         },
         "c",
       ]);
-      const res = await legacyJmap(this.ctx, account, calls, [JMAP_CORE]);
+      const res = await this.jmap(account, calls);
       if (others.length) this.ctx.log.info({ accountId: account.id, destroyed: others.length }, "push: destroyed other legacy-proxy subscriptions");
       const c = setResult(res, "c");
       const created = (c.created as Record<string, { id?: unknown }> | null | undefined)?.u;
@@ -192,12 +231,7 @@ export class UpstreamManager {
 
       const code = await this.waitForCode(account.id, hookId);
       if (!code) throw new Error("verification timed out");
-      const v = await legacyJmap(
-        this.ctx,
-        account,
-        [["PushSubscription/set", { update: { [upstreamId]: { verificationCode: code } } }, "v"]],
-        [JMAP_CORE],
-      );
+      const v = await this.jmap(account, [["PushSubscription/set", { update: { [upstreamId]: { verificationCode: code } } }, "v"]]);
       const updated = setResult(v, "v").updated as Record<string, unknown> | null | undefined;
       if (!updated || !(upstreamId in updated)) throw new Error("verification refused");
 
@@ -231,7 +265,7 @@ export class UpstreamManager {
       this.stats.inc("upstream_create_failed");
       this.ctx.log.warn({ accountId: account.id, reason, attempts, err: message }, "push: upstream subscription failed");
       if (upstreamId) {
-        await legacyJmap(this.ctx, account, [["PushSubscription/set", { destroy: [upstreamId] }, "x"]], [JMAP_CORE]).catch(
+        await this.jmap(account, [["PushSubscription/set", { destroy: [upstreamId] }, "x"]]).catch(
           () => undefined,
         );
       }
@@ -239,10 +273,72 @@ export class UpstreamManager {
     }
   }
 
+  /** "eventSource" mechanism: make sure the account's upstream EventSource is open. */
+  private async watch(account: Account, row: Upstream): Promise<boolean> {
+    if (row.status !== "active") {
+      const now = new Date();
+      await updateUpstream(this.ctx.db, account.id, {
+        status: "active",
+        upstreamId: null,
+        verificationCode: null,
+        verifiedAt: now,
+        // As for a new subscription: a fresh start never announces older mail.
+        baselineAt: row.status === "none" || !row.baselineAt ? now : row.baselineAt,
+        attempts: 0,
+        lastError: null,
+        nextAttemptAt: null,
+      });
+      this.ctx.log.info({ accountId: account.id }, "push: upstream eventsource wanted");
+    }
+    if (!this.watches.has(account.id)) {
+      const accountId = account.id;
+      let opened = 0;
+      this.watches.set(
+        accountId,
+        watchStateChanges(this.mail, account, {
+          types: ["EmailDelivery"],
+          log: this.ctx.log,
+          ...(this.esMinBackoffMs !== undefined ? { minBackoffMs: this.esMinBackoffMs } : {}),
+          onOpen: () => {
+            this.stats.inc("upstream_eventsource_open");
+            // A reconnect may have missed changes: catch up from the last Email state.
+            if (opened++ > 0) void this.event(accountId, {});
+          },
+          onChange: (change) => {
+            for (const [upstreamAccountId, types] of Object.entries(change.changed)) {
+              const state = types && typeof types === "object" ? types["EmailDelivery"] : undefined;
+              if (typeof state === "string") void this.event(accountId, { legacyAccountId: upstreamAccountId, state });
+            }
+          },
+        }),
+      );
+      this.stats.inc("upstream_created_eventsource");
+    }
+    await updateUpstream(this.ctx.db, account.id, { lastCheckAt: new Date(), lastCheckOk: true });
+    return true;
+  }
+
+  /** A new-mail signal from the upstream: record it and run the pipeline (never throws). */
+  private async event(accountId: string, ev: { legacyAccountId?: string; state?: string }): Promise<void> {
+    const at = new Date();
+    this.stats.inc("internal_StateChange");
+    try {
+      await updateUpstream(this.ctx.db, accountId, { lastEventAt: at });
+      await this.pipeline.trigger(accountId, { at, ...ev });
+    } catch (err) {
+      this.ctx.log.error({ accountId, err }, "push: StateChange handling failed");
+    }
+  }
+
   private async teardown(account: Account, row: Upstream): Promise<void> {
+    const w = this.watches.get(account.id);
+    if (w) {
+      w.stop();
+      this.watches.delete(account.id);
+    }
     if (row.upstreamId) {
       try {
-        await legacyJmap(this.ctx, account, [["PushSubscription/set", { destroy: [row.upstreamId] }, "x"]], [JMAP_CORE]);
+        await this.jmap(account, [["PushSubscription/set", { destroy: [row.upstreamId] }, "x"]]);
       } catch (err) {
         // A leftover gets a 404 on its next push (new hook id below) and legacy-proxy drops it.
         this.ctx.log.warn({ accountId: account.id, err: (err as Error).message }, "push: upstream destroy failed");

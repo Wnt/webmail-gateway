@@ -375,12 +375,12 @@ export async function storeUpstreamCode(
   return (res.rowCount ?? 0) > 0;
 }
 
-/** Accounts the reconciler looks at: anything with an upstream row in use, active subs, or (always-mode) a password. */
+/** Accounts the reconciler looks at: anything with an upstream row in use, active subs, or (always-mode) an upstream credential. */
 export async function accountsToReconcile(db: Queryable, always: boolean): Promise<string[]> {
   const { rows } = await db.query<{ id: string }>(
     `SELECT account_id AS id FROM push_upstream WHERE status <> 'none'
      UNION SELECT account_id FROM push_jmap_sub WHERE verified_at IS NOT NULL AND expires > now()
-     UNION SELECT id FROM account WHERE $1::boolean AND gandi_secret IS NOT NULL`,
+     UNION SELECT id FROM account WHERE $1::boolean AND (gandi_secret IS NOT NULL OR upstream_secret IS NOT NULL)`,
     [always],
   );
   return rows.map((r) => r.id);

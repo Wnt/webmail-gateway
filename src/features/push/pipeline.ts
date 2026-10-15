@@ -1,6 +1,13 @@
 import { getAccountById, type Account } from "../../core/accounts.js";
 import { emitNewMail } from "../../core/hooks.js";
-import { JMAP_CORE, JMAP_MAIL, legacyFetch, legacyJmap, type JmapMethodCall, type JmapResponse } from "../../core/legacy.js";
+import {
+  getUpstream as getMailUpstream,
+  JMAP_CORE,
+  JMAP_MAIL,
+  type JmapMethodCall,
+  type JmapResponse,
+  type Upstream as MailUpstream,
+} from "../../core/upstream/index.js";
 import type { AppContext } from "../../types.js";
 import {
   cleanPreview,
@@ -38,7 +45,7 @@ const EMAIL_PROPS = ["id", "threadId", "mailboxIds", "from", "subject", "preview
 export interface TriggerEvent {
   /** EmailDelivery state from the StateChange. */
   state?: string;
-  /** legacy-proxy's JMAP account id, from the StateChange's `changed` key. */
+  /** The upstream's JMAP account id, from the StateChange's `changed` key. */
   legacyAccountId?: string;
   /** When the StateChange arrived. */
   at: Date;
@@ -95,6 +102,7 @@ export class Pipeline {
   private stopped = false;
   private readonly errorDelays: number[];
   private readonly changesPage: number;
+  private readonly upstream: MailUpstream;
 
   constructor(
     private readonly ctx: AppContext,
@@ -104,6 +112,7 @@ export class Pipeline {
   ) {
     this.errorDelays = opts.errorRetryDelaysMs ?? [5_000, 30_000];
     this.changesPage = opts.changesPageSize ?? CHANGES_PAGE;
+    this.upstream = getMailUpstream(ctx);
   }
 
   /** Forget cached ids and the Email state (after a re-login legacy-proxy may hand out new ones, D10). */
@@ -185,21 +194,16 @@ export class Pipeline {
 
   private async legacyAccountIdFor(account: Account, hint: string | undefined | null): Promise<string> {
     if (hint) return hint;
-    const res = await legacyFetch(this.ctx, account, "/jmap/session", { signal: AbortSignal.timeout(30_000) });
-    if (!res.ok) {
-      await res.body?.cancel().catch(() => undefined);
-      throw new Error(`legacy-proxy session answered ${res.status}`);
-    }
-    const session = (await res.json()) as { primaryAccounts?: Record<string, string> };
+    const session = (await this.upstream.session(account)) as { primaryAccounts?: Record<string, string> };
     const id = session.primaryAccounts?.[JMAP_MAIL];
-    if (!id) throw new Error("legacy-proxy session has no mail account");
+    if (!id) throw new Error("upstream session has no mail account");
     return id;
   }
 
   private async inboxId(account: Account, legacyAccountId: string): Promise<string> {
     const cached = this.inbox.get(account.id);
     if (cached && cached.legacyAccountId === legacyAccountId) return cached.inboxId;
-    const res = await legacyJmap(this.ctx, account, [
+    const res = await this.upstream.jmap(account, [
       ["Mailbox/query", { accountId: legacyAccountId, filter: { role: "inbox" }, limit: 1 }, "mb"],
     ]);
     const ids = response(res, "mb", "Mailbox/query").ids;
@@ -230,7 +234,7 @@ export class Pipeline {
           "g",
         ],
       ];
-      const res = await legacyJmap(this.ctx, account, calls, [JMAP_CORE, JMAP_MAIL]);
+      const res = await this.upstream.jmap(account, calls, [JMAP_CORE, JMAP_MAIL]);
       const c = response(res, "c", "Email/changes");
       emails.push(...emailList(response(res, "g", "Email/get")));
       if (typeof c.newState !== "string") throw new JmapCallError("missingNewState");
@@ -270,7 +274,7 @@ export class Pipeline {
     ];
     let res: JmapResponse;
     try {
-      res = await legacyJmap(this.ctx, account, calls, [JMAP_CORE, JMAP_MAIL]);
+      res = await this.upstream.jmap(account, calls, [JMAP_CORE, JMAP_MAIL]);
       response(res, "q", "Email/query");
     } catch (err) {
       // A stale cached inbox id (D10): drop it so the next run looks it up again.

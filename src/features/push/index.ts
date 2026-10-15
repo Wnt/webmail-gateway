@@ -103,6 +103,7 @@ export function makePushPlugin(opts: PushTestOptions = {}): FeaturePlugin {
       offHandler();
       offRelogin();
       rt.pipeline.stop();
+      rt.upstream.stop();
       rt.stats.flush(ctx.log);
     });
 
