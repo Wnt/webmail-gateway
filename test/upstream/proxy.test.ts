@@ -126,6 +126,19 @@ describe("session", () => {
     expect(fake.seen).toHaveLength(0);
   });
 
+  it("401 / 502 (not 500) when the session behind a blob or API request cannot be fetched", async () => {
+    const { getUpstream } = await import("../../src/core/upstream/index.js");
+    fake.tokens.clear();
+    getUpstream(ctx).forget(account.id);
+    let res = await fetch(`${base}/jmap/download/${ACCOUNT_ID}/B/t/n`, { headers: AUTH() });
+    expect(res.status).toBe(401);
+    fake.tokens.set(TOKEN, EMAIL);
+    getUpstream(ctx).forget(account.id);
+    fake.failNext.set("/jmap/session", { status: 503, count: 1 });
+    res = await api({ using: [CORE], methodCalls: [["Core/echo", {}, "0"]] });
+    expect(res.status).toBe(502);
+  });
+
   it("resolves relative session URLs against the session URL", async () => {
     fake.relativeUrls = true;
     const { getUpstream } = await import("../../src/core/upstream/index.js");

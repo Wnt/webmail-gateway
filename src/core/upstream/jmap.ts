@@ -7,7 +7,7 @@
 // re-login.
 import { getUpstreamCredential, normalizeEmail, setUpstreamCredential, type UpstreamCredential } from "../accounts.js";
 import type { CoreContext } from "../../types.js";
-import { newAgent, send } from "./http.js";
+import { newAgent, send, UpstreamError } from "./http.js";
 import { appendQuery, expandTemplate } from "./templates.js";
 import {
   JMAP_CORE,
@@ -153,7 +153,19 @@ export class JmapUpstream implements Upstream {
   async request(account: UpstreamAccount, req: UpstreamRequest): Promise<UpstreamResult> {
     const cred = await this.credential(account);
     if (!cred) return { kind: "authLost" };
-    const url = req.target.kind === "session" ? this.sessionUrl : jmapUrl(await this.session(account), this.sessionUrl, req.target);
+    let url = this.sessionUrl;
+    if (req.target.kind !== "session") {
+      // The templates come from the session; a failure to get it is the upstream's answer, not ours.
+      let session: JmapSession;
+      try {
+        session = await this.session(account);
+      } catch (err) {
+        if (err instanceof UpstreamCallError && err.status === 401) return { kind: "authLost" };
+        if (err instanceof UpstreamError) throw err;
+        throw new UpstreamError(`upstream session unusable: ${(err as Error).message}`, 502);
+      }
+      url = jmapUrl(session, this.sessionUrl, req.target);
+    }
     const res = await send(this.agent, url, {
       ...req,
       headers: { ...req.headers, authorization: authorizationFor(cred) },

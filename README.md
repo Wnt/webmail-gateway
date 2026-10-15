@@ -88,6 +88,8 @@ Shared behaviour:
 - Capabilities are passed through, minus those that do not work through the gateway: `urn:ietf:params:jmap:websocket` (not proxied) and `urn:ietf:params:jmap:emailpush` (PushSubscription is answered by the push feature, D5), also in `accountCapabilities`. Core limits are clamped to the `JMAP_MAX_*` settings. Shared accounts (`isPersonal: false`) keep their names.
 - Upload, download and EventSource are streamed as before; the push pipeline (`Email/changes` from the last state, query fallback on `cannotCalculateChanges`) is the same for both.
 
+**Test stacks:** `tools/stack up <name> --gateway --upstream jmap` runs the gateway against Stalwart's native JMAP (Basic, no legacy-proxy); the default `--upstream legacy` keeps legacy-proxy. The e2e suite (`tools/stack e2e <name>`) runs in both modes.
+
 **Bootstrap** (`npm run cli -- bootstrap <email> [--reset]`) reads the credential from the terminal without echo, or from stdin when piped; it is never printed or logged. With `jmap` it fetches the upstream session with the token and requires that the session's `username`, or the name of its primary mail account, equals `<email>` (which must be in `ALLOWED_EMAILS`); then it stores the token sealed and prints the passkey enrollment link. Exit 3: rejected, or another mailbox's token. Rotating the token is the same command (the old one is replaced; passkeys stay).
 
 ### Fastmail
