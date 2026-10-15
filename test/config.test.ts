@@ -21,7 +21,7 @@ describe("loadConfig", () => {
     expect(c.publicBaseUrl).toBe("https://mail.example.test");
     expect(c.legacyProvider).toBe("gandi");
     expect(c.jmap).toEqual({});
-    expect(c.auth).toEqual({});
+    expect(c.auth).toEqual({ rpName: "Webmail", bulwarkClientSecret: null, sessionTtlMs: 12 * 3600_000 });
     expect(c.push).toEqual({});
   });
 
@@ -44,6 +44,11 @@ describe("loadConfig", () => {
     expect(msg).toContain("GATEWAY_ENC_KEY");
     expect(msg).toContain("LEGACY_PROXY_URL");
     expect(msg).not.toContain(secret);
+  });
+
+  it("parses ALLOWED_EMAILS lower-cased, trimmed and de-duplicated; empty means nobody", () => {
+    expect(loadConfig({ ...base(), ALLOWED_EMAILS: " A@X.fi, b@y.fi,a@x.fi,, " }).allowedEmails).toEqual(["a@x.fi", "b@y.fi"]);
+    expect(loadConfig(base()).allowedEmails).toEqual([]);
   });
 
   it("requires the core keys", () => {

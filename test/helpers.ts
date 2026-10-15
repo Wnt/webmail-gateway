@@ -14,6 +14,7 @@ export function makeTestConfig(env: Record<string, string> = {}): Config {
     LEGACY_SESSION_HMAC_KEY: randomBytes(32).toString("base64"),
     LEGACY_PROXY_URL: "http://127.0.0.1:1",
     PUBLIC_BASE_URL: "https://mail.example.test",
+    ALLOWED_EMAILS: "alice@example.test, bob@example.test",
     LOG_LEVEL: "silent",
     ...env,
   });

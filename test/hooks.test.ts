@@ -3,6 +3,8 @@ import type { Principal } from "../src/core/auth-context.js";
 import {
   emitLegacyRelogin,
   emitNewMail,
+  emitTokenRevoked,
+  onTokenRevoked,
   handlePushSubscription,
   JmapMethodError,
   onLegacyRelogin,
@@ -99,5 +101,21 @@ describe("legacy re-login bus", () => {
     off();
     await emitLegacyRelogin("acc-2");
     expect(a).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("token-revoked bus", () => {
+  it("delivers the event, survives a failing listener, and unsubscribes", async () => {
+    const ok = vi.fn();
+    const off = onTokenRevoked(ok);
+    onTokenRevoked(() => {
+      throw new Error("boom");
+    });
+    const ev = { grantId: "g1", accountId: "acc", tokenIds: ["ab"] };
+    await expect(emitTokenRevoked(ev)).resolves.toBeUndefined();
+    expect(ok).toHaveBeenCalledWith(ev);
+    off();
+    await emitTokenRevoked(ev);
+    expect(ok).toHaveBeenCalledOnce();
   });
 });

@@ -37,6 +37,39 @@ export async function emitNewMail(accountId: string, event: NewMailEvent): Promi
   }
 }
 
+/**
+ * An OAuth grant was revoked (A4): by the client, by refresh-token reuse
+ * detection, by code replay, or by the bootstrap CLI. `tokenIds` are the
+ * sha256 hex digests of the raw access tokens that die with it, so a consumer
+ * holding a bearer token can match without ever storing the token itself.
+ */
+export interface TokenRevokedEvent {
+  grantId: string;
+  accountId: string;
+  tokenIds: string[];
+}
+
+export type TokenRevokedListener = (event: TokenRevokedEvent) => void | Promise<void>;
+
+const tokenRevokedListeners: TokenRevokedListener[] = [];
+
+/** Subscribe to grant revocations (the jmap feature closes affected EventSource streams, D8). Returns an unsubscribe function. */
+export function onTokenRevoked(cb: TokenRevokedListener): () => void {
+  tokenRevokedListeners.push(cb);
+  return () => {
+    const i = tokenRevokedListeners.indexOf(cb);
+    if (i >= 0) tokenRevokedListeners.splice(i, 1);
+  };
+}
+
+/** Deliver a revocation to every listener; a throwing listener is logged and does not affect the others. */
+export async function emitTokenRevoked(event: TokenRevokedEvent): Promise<void> {
+  const results = await Promise.allSettled([...tokenRevokedListeners].map(async (cb) => cb(event)));
+  for (const r of results) {
+    if (r.status === "rejected") log.error({ err: r.reason, grantId: event.grantId }, "token-revoked listener failed");
+  }
+}
+
 /** A JMAP method-level error (RFC 8620 section 3.6.2): `["error", {type, description}, callId]`. */
 export class JmapMethodError extends Error {
   constructor(
@@ -107,5 +140,6 @@ export async function emitLegacyRelogin(accountId: string): Promise<void> {
 export function resetHooks(): void {
   newMailListeners.length = 0;
   legacyReloginListeners.length = 0;
+  tokenRevokedListeners.length = 0;
   pushHandler = null;
 }

@@ -38,6 +38,11 @@ export const coreConfigSchema = z.object({
   LEGACY_SESSION_HMAC_KEY: key32,
   /** Public origin of the site, e.g. https://mail.madekivi.fi (no trailing slash). */
   PUBLIC_BASE_URL: z.url().transform((u) => u.replace(/\/+$/, "")),
+  /** Comma-separated e-mail addresses allowed to sign in (A1). Lower-cased; empty means nobody. */
+  ALLOWED_EMAILS: z
+    .string()
+    .default("")
+    .transform((v) => [...new Set(v.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean))]),
   /** legacy-proxy provider key; account slugs are `<provider>:<email>` (D1). */
   LEGACY_PROVIDER: z.string().regex(/^[A-Za-z0-9_.-]+$/).default("gandi"),
 });
@@ -52,6 +57,7 @@ export interface Config {
   legacyProxyUrl: string;
   legacyHmacKey: Buffer;
   publicBaseUrl: string;
+  allowedEmails: string[];
   legacyProvider: string;
   jmap: JmapConfig;
   auth: AuthConfig;
@@ -71,6 +77,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     legacyProxyUrl: c.LEGACY_PROXY_URL,
     legacyHmacKey: c.LEGACY_SESSION_HMAC_KEY,
     publicBaseUrl: c.PUBLIC_BASE_URL,
+    allowedEmails: c.ALLOWED_EMAILS,
     legacyProvider: c.LEGACY_PROVIDER,
     jmap: parseJmapConfig(env),
     auth: parseAuthConfig(env),
