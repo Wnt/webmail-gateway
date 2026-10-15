@@ -20,7 +20,7 @@ describe("loadConfig", () => {
     expect(c.legacyHmacKey).toHaveLength(32);
     expect(c.publicBaseUrl).toBe("https://mail.example.test");
     expect(c.legacyProvider).toBe("gandi");
-    expect(c.jmap).toEqual({});
+    expect(c.jmap).toMatchObject({ passwordMode: false, maxSizeUpload: 50_000_000 });
     expect(c.auth).toEqual({ rpName: "Webmail", bulwarkClientSecret: null, sessionTtlMs: 12 * 3600_000 });
     expect(c.push).toEqual({});
   });

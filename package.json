@@ -26,6 +26,7 @@
     "fastify": "5.12.7",
     "pg": "8.23.1",
     "pino": "10.4.0",
+    "undici": "8.11.2",
     "zod": "4.6.7"
   },
   "devDependencies": {
