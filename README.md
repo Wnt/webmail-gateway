@@ -1,6 +1,6 @@
 # webmail-gateway
 
-Gateway in front of [legacy-proxy](https://github.com/bulwarkmail/legacy-proxy) for the [Bulwark](https://github.com/bulwarkmail/webmail) webmail: passkey-only login, OAuth 2.1, and web push with message previews. Part of a self-hosted webmail for Gandi mail. Licensed AGPL-3.0-or-later.
+Gateway in front of a mail upstream for the [Bulwark](https://github.com/bulwarkmail/webmail) webmail: passkey-only login, OAuth 2.1, and web push with message previews. The upstream is either [legacy-proxy](https://github.com/bulwarkmail/legacy-proxy) in front of Gandi mail, or a native JMAP server such as Fastmail (see [Upstreams](#upstreams-legacy-proxy-or-native-jmap)). Licensed AGPL-3.0-or-later.
 
 ## Contract deviations
 
@@ -12,6 +12,7 @@ Where the skeleton differs from or extends `COORDINATION.md` (the contract file 
 - **Additions:** `src/types.ts` (`AppContext`, `FeaturePlugin`, `CliCommand`); each feature's `index.ts` exports `<feature>Plugin` and `<feature>CliCommands` (merged into `src/cli.ts`); `parse<Feature>Config(env)` in each feature's `config.ts`; `src/core/token.ts` (the raw HMAC token code); `test/helpers.ts` and `test/fake-legacy.ts` for feature tests.
 - **`relogin(ctx, account)`** is exported from `core/legacy` (D2): the Basic re-login that `legacyFetch` does on 401, for callers that stream and cannot use `legacyFetch`'s retry.
 - **Core config** adds `PUBLIC_BASE_URL` (required) and `LEGACY_PROVIDER` (default `gandi`) as `config.publicBaseUrl` / `config.legacyProvider` (D1, P4).
+- **`core/upstream`** (D14) is how features reach the mail server: `getUpstream(ctx)` returns the `legacy` or `jmap` implementation chosen by `UPSTREAM_KIND`. Features no longer call `core/legacy` directly; it stays as the legacy implementation's helper (token minting, re-login, `onLegacyRelogin`). With `UPSTREAM_KIND=jmap`, `LEGACY_PROXY_URL` and `LEGACY_SESSION_HMAC_KEY` are optional (`config.legacyProxyUrl` is then `""`), and empty env values count as unset. Migration `001` adds `account.upstream_secret`, written by `accounts.setUpstreamCredential` (sealed under an HKDF purpose key, A6, AAD = account id).
 - **Image tags** are `ghcr.io/wnt/webmail-gateway:sha-<full 40-char commit sha>` and `:main`.
 
 ## What and why
@@ -19,13 +20,14 @@ Where the skeleton differs from or extends `COORDINATION.md` (the contract file 
 Bulwark is a good webmail UI, and legacy-proxy turns Gandi's IMAP/SMTP/Sieve/CardDAV into the JMAP that Bulwark speaks. What neither gives us is a login that does not involve typing the mailbox password into a browser every time. This gateway sits between them and adds:
 
 - **Passkey-only login** with username-free (discoverable) passkeys, and an **OAuth 2.1** server that Bulwark uses in OAuth-only mode.
-- A **JMAP proxy** that authenticates callers (OAuth bearer, or Basic in password mode with an allowlist and rate limit) and forwards to legacy-proxy.
+- A **JMAP proxy** that authenticates callers (OAuth bearer, or Basic in password mode with an allowlist and rate limit) and forwards to the upstream.
 - **Push with message previews**: Bulwark-relay-compatible endpoints plus web-push sending, so notifications show sender, subject and a preview even after the browser session has expired.
 
 ## Architecture
 
 ```
-browser -> edge (TLS, routing) -> gateway -> legacy-proxy -> Gandi (IMAP/SMTP/Sieve/CardDAV)
+browser -> edge (TLS, routing) -> gateway -> legacy-proxy -> Gandi (IMAP/SMTP/Sieve/CardDAV)   (UPSTREAM_KIND=legacy)
+                                         \-> native JMAP server, e.g. Fastmail                 (UPSTREAM_KIND=jmap)
                  \-> Bulwark (UI, everything the gateway does not own)
 gateway -> Postgres (accounts, passkeys, OAuth state, push subscriptions)
 ```
@@ -50,7 +52,7 @@ npm run migrate     # apply pending migrations (also runs on start unless MIGRAT
 npm run cli -- <command> [args]   # admin commands; with no command it lists them
 ```
 
-Configuration is environment-only; see `.env.example` and `src/config.ts`. Core keys: `DATABASE_URL`, `GATEWAY_ENC_KEY` and `LEGACY_SESSION_HMAC_KEY` (both base64 of 32 bytes; the latter must equal legacy-proxy's `SESSION_HMAC_KEY`), `LEGACY_PROXY_URL`, and optionally `PORT` (8080), `HOST`, `LOG_LEVEL`, `MIGRATE_ON_START`. Each feature adds its own keys in `src/features/<feature>/config.ts`.
+Configuration is environment-only; see `.env.example` and `src/config.ts`. Core keys: `DATABASE_URL`, `GATEWAY_ENC_KEY` and `LEGACY_SESSION_HMAC_KEY` (both base64 of 32 bytes; the latter must equal legacy-proxy's `SESSION_HMAC_KEY`), `LEGACY_PROXY_URL` (legacy upstream; for a native JMAP upstream `UPSTREAM_KIND=jmap`, `UPSTREAM_SESSION_URL` and `UPSTREAM_AUTH` instead, see [Upstreams](#upstreams-legacy-proxy-or-native-jmap)), and optionally `PORT` (8080), `HOST`, `LOG_LEVEL`, `MIGRATE_ON_START`. Each feature adds its own keys in `src/features/<feature>/config.ts`.
 
 Endpoints owned by the skeleton: `/healthz` (liveness) and `/readyz` (pings the database; 503 when it fails).
 
@@ -63,8 +65,46 @@ Design: `design/auth.md` in the coordinator's checkout. The gateway is the OAuth
 - **Endpoints:** `/.well-known/oauth-authorization-server`, `/oauth/authorize` (PKCE S256, exact redirect match, always a fresh passkey tap), `/oauth/token` (`client_secret_post` or Basic; `authorization_code` and `refresh_token`), `/oauth/revoke`, `/oauth/end_session`; `/auth/login`, `/auth/enroll/<token>`, `/auth/passkeys` (list, add, rename, delete, sign out) and their JSON APIs; `/auth/static/*`.
 - **Tokens:** opaque, prefixed (`gwc_` code 60 s single use, `gwa_` access 1 h, `gwr_` refresh 30 d rotated with a 30 s idempotent grace, `gws_` session, `gwe_` enroll 15 min), stored as sha256. Revocation emits `hooks.emitTokenRevoked`. Bearer tokens are recognised by the authenticator this feature registers in `core/auth-context`; Bulwark's tokens carry scope `mail`.
 - **Config:** core `PUBLIC_BASE_URL` (issuer, WebAuthn origin, RP ID = its host) and `ALLOWED_EMAILS`; `OAUTH_CLIENT_SECRET_BULWARK`, `AUTH_RP_NAME`, `AUTH_SESSION_TTL_H`.
-- **Bootstrap and recovery:** `npm run cli -- bootstrap <email> [--reset]` (in the cluster: `kubectl exec -it deploy/webmail-gateway -- node dist/cli.js bootstrap <email>`). It reads the mailbox password from the terminal (or stdin), verifies it through legacy-proxy, stores it sealed, and prints a one-time enrollment URL valid for 15 minutes. `--reset` also deletes the account's passkeys and sessions and revokes its grants.
+- **Bootstrap and recovery:** `npm run cli -- bootstrap <email> [--reset]` (in the cluster: `kubectl exec -it deploy/webmail-gateway -- node dist/cli.js bootstrap <email>`). It reads the upstream credential from the terminal (or stdin): the mailbox password with legacy-proxy, the API token with a native JMAP upstream. It verifies it with the upstream, stores it sealed, and prints a one-time enrollment URL valid for 15 minutes. `--reset` also deletes the account's passkeys and sessions and revokes its grants.
 - **Bulwark (OAuth mode) expects:** `OAUTH_ENABLED=true`, `OAUTH_ONLY=true`, `AUTO_SSO_ENABLED=true`, `OAUTH_ISSUER_URL=<PUBLIC_BASE_URL>`, `OAUTH_CLIENT_ID=bulwark`, `OAUTH_CLIENT_SECRET=<OAUTH_CLIENT_SECRET_BULWARK>`, `JMAP_SERVER_URL=<PUBLIC_BASE_URL>`; optionally `OAUTH_SCOPES=mail` (the default OIDC scopes are accepted and dropped) and `OAUTH_POST_LOGOUT_REDIRECT_URI=<PUBLIC_BASE_URL>/`. Test stacks on plain http need `COOKIE_SECURE=false` in Bulwark, and Bulwark skips `end_session` there (it requires https).
+
+## Upstreams (legacy-proxy or native JMAP)
+
+`src/core/upstream` hides which mail server sits behind the gateway. Both implementations are first-class; switching is a config change plus re-running `bootstrap`, with no code change.
+
+| | `UPSTREAM_KIND=legacy` (default) | `UPSTREAM_KIND=jmap` |
+| --- | --- | --- |
+| Server | legacy-proxy in front of Gandi IMAP/SMTP | a native JMAP server: Fastmail in production, Stalwart on test stacks |
+| Config | `LEGACY_PROXY_URL`, `LEGACY_SESSION_HMAC_KEY`, `LEGACY_PROVIDER` | `UPSTREAM_SESSION_URL` (Fastmail: `https://api.fastmail.com/jmap/session`), `UPSTREAM_AUTH=bearer` (API token) or `basic` (password) |
+| Credential per account | the Gandi password, sealed in `gandi_secret` | the API token (or password), sealed in `upstream_secret` |
+| Upstream auth | minted 300 s HMAC Bearer token; on 401 one Basic re-login with the Gandi password, then one retry | `Authorization: Bearer <token>` (or Basic). A 401 means the token was revoked or expired: the client gets 401, the log says to re-run bootstrap |
+| URLs | legacy-proxy's fixed paths | every URL from the upstream's session (`apiUrl`, `downloadUrl`, `uploadUrl`, `eventSourceUrl`), RFC 6570 templates in any variable order, any host (a separate download host works), relative URLs resolved, no https downgrade |
+| New-mail signal for push | the gateway's own `PushSubscription` in legacy-proxy, posting to `/internal/push/jmap/:hookId` | one upstream EventSource per account with an active device (P1), `types=EmailDelivery`, ping 60 s with a silence watchdog, reconnect with exponential backoff (Retry-After on 429); a reconnect triggers a catch-up run |
+| Password mode (`JMAP_PASSWORD_MODE`) | supported | not offered (config error) |
+
+Shared behaviour:
+- The public session always advertises the gateway's own URLs (`<PUBLIC_BASE_URL>/jmap`, `/jmap/download/{accountId}/{blobId}/{type}/{name}`, `/jmap/upload/{accountId}`, `/jmap/eventsource?types={types}&closeafter={closeafter}&ping={ping}`); each request is mapped onto the upstream's template. Account, mailbox and email ids pass through unchanged (P2).
+- Capabilities are passed through, minus those that do not work through the gateway: `urn:ietf:params:jmap:websocket` (not proxied) and `urn:ietf:params:jmap:emailpush` (PushSubscription is answered by the push feature, D5), also in `accountCapabilities`. Core limits are clamped to the `JMAP_MAX_*` settings. Shared accounts (`isPersonal: false`) keep their names.
+- Upload, download and EventSource are streamed as before; the push pipeline (`Email/changes` from the last state, query fallback on `cannotCalculateChanges`) is the same for both.
+
+**Bootstrap** (`npm run cli -- bootstrap <email> [--reset]`) reads the credential from the terminal without echo, or from stdin when piped; it is never printed or logged. With `jmap` it fetches the upstream session with the token and requires that the session's `username`, or the name of its primary mail account, equals `<email>` (which must be in `ALLOWED_EMAILS`); then it stores the token sealed and prints the passkey enrollment link. Exit 3: rejected, or another mailbox's token. Rotating the token is the same command (the old one is replaced; passkeys stay).
+
+### Fastmail
+
+From Fastmail's documentation (read 2026-10-15; the API itself was not called):
+- **Session and auth:** the JMAP session resource is `https://api.fastmail.com/jmap/session`; an API token is sent as `Authorization: Bearer {value}` [F1]. Tokens are created in Settings → Privacy & Security → Manage API tokens, type **JMAP**; they are shown once, have no documented expiry, and are not available on the Basic plan [F2].
+- **Token scopes** offered for JMAP tokens [F2]: *Read-only access*, *Email*, *Email submission* (requires Email), *Contacts and contact groups*, *Masked Email*. Create the token **without** Read-only, with:
+  - minimal: **Email** + **Email submission** (read, organise and send mail; push);
+  - recommended: also **Contacts and contact groups** (Bulwark's contacts use JMAP Contacts, RFC 9610 [F1]);
+  - not needed: Masked Email. There is no separate vacation-response scope for API tokens (the OAuth scope `urn:ietf:params:jmap:vacationresponse` exists [F1]); whether *Email* covers it shows in the session after bootstrap.
+- **Capabilities:** mail, submission, vacation response, contacts and Masked Email are JMAP; **calendars are CalDAV only** ("We will be opening up JMAP access as well, as soon as the specification is finalized") [F1], so Bulwark gets no calendar through the gateway. legacy-proxy's Sieve extension (`urn:bulwark:params:jmap:sieve`) does not exist there, so Bulwark's filter UI is absent.
+- **Rate limits:** no published JMAP API rate limits [F1][F3]. Account limits include 500 successful logins per user per 10 minutes "across all services" and 70 MB per message [F3]; Masked Email creation is rate-limited with a `rateLimit` SetError [F1]. The gateway passes 429 + `Retry-After` through (Bulwark waits), the push watcher honours it, and the push pipeline retries with backoff.
+- **Download host and EventSource:** not in Fastmail's own docs. A published example session [F4] shows `downloadUrl` on another host (`https://www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}?type={type}`) and an `eventSourceUrl` without template variables (`https://api.fastmail.com/jmap/event/`). Both shapes are handled generically and covered by tests.
+- **Push:** Fastmail's docs do not mention RFC 8620 `PushSubscription`. It would also need a callback URL reachable from the internet, while `/internal` is cluster-only, so the `jmap` upstream uses the EventSource (RFC 8620 section 7.3), which needs no inbound exposure.
+
+To verify at cutover (not testable without a token): the real session's `downloadUrl`/`eventSourceUrl` and their redirects, that `EmailDelivery` StateChanges arrive on the EventSource and how often it pings, the session `username` (must equal the gateway account's email), which capabilities a token with the scopes above advertises, and 429 behaviour.
+
+Sources: [F1] Fastmail API documentation, https://www.fastmail.com/dev/ · [F2] Fastmail help, API tokens, https://www.fastmail.help/hc/en-us/articles/5254602856719-API-tokens · [F3] Fastmail help, Account limits, https://www.fastmail.help/hc/en-us/articles/1500000277382 · [F4] example session output (unofficial), https://github.com/joelparkerhenderson/demo-fastmail-api-jmap · RFC 8620 sections 2 and 7.3.
 
 ## Push feature (web push with previews)
 

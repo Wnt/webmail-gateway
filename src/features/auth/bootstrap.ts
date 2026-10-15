@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
-import { normalizeEmail, setGandiPassword, upsertAccount } from "../../core/accounts.js";
+import { normalizeEmail, upsertAccount } from "../../core/accounts.js";
+import { getUpstream } from "../../core/upstream/index.js";
 import type { AppContext, CliCommand } from "../../types.js";
 import { audit } from "./audit.js";
 import { createEnrollToken } from "./enroll.js";
@@ -15,9 +16,12 @@ export interface BootstrapIo {
   stderr: Writable;
 }
 
-const USAGE = "usage: bootstrap <email> [--reset]\n  reads the mailbox password from the terminal (or stdin when piped)";
+const USAGE =
+  "usage: bootstrap <email> [--reset]\n" +
+  "  reads the upstream credential from the terminal (or stdin when piped):\n" +
+  "  UPSTREAM_KIND=legacy: the mailbox (Gandi) password; UPSTREAM_KIND=jmap: the upstream API token (or password with UPSTREAM_AUTH=basic)";
 
-/** Exit codes: 0 ok, 1 error, 2 usage or not allowlisted, 3 password rejected by legacy-proxy. */
+/** Exit codes: 0 ok, 1 error, 2 usage or not allowlisted, 3 credential rejected by the upstream or not this mailbox's. */
 export async function runBootstrap(args: string[], ctx: AppContext, io: BootstrapIo, now: () => number = Date.now): Promise<number> {
   const reset = args.includes("--reset");
   const positional = args.filter((a) => !a.startsWith("--"));
@@ -32,38 +36,29 @@ export async function runBootstrap(args: string[], ctx: AppContext, io: Bootstra
     return 2;
   }
 
-  const password = await readPassword(io);
-  if (!password) {
-    io.stderr.write("bootstrap: empty password\n");
+  const upstream = getUpstream(ctx);
+  const what = upstream.credentialPrompt.endsWith("token") ? "API token" : "password";
+  const secret = await readSecret(io, upstream.credentialPrompt);
+  if (!secret) {
+    io.stderr.write(`bootstrap: empty ${what}\n`);
     return 2;
   }
 
-  // The same probe core/legacy uses to re-login: legacy-proxy opens IMAP with
-  // these credentials and creates its account. Nothing is stored before it passes.
-  const basic = Buffer.from(`${email}:${password}`, "utf8").toString("base64");
-  let status: number;
-  try {
-    const res = await ctx.fetch(`${ctx.config.legacyProxyUrl}/jmap/session`, {
-      headers: { authorization: `Basic ${basic}` },
-      signal: AbortSignal.timeout(30_000),
-    });
-    status = res.status;
-    await res.body?.cancel().catch(() => {});
-  } catch (err) {
-    io.stderr.write(`bootstrap: legacy-proxy unreachable: ${(err as Error).message}\n`);
-    return 1;
-  }
-  if (status === 401 || status === 403) {
-    io.stderr.write("bootstrap: legacy-proxy rejected the password\n");
-    return 3;
-  }
-  if (status < 200 || status >= 300) {
-    io.stderr.write(`bootstrap: legacy-proxy answered ${status}\n`);
-    return 1;
+  // legacy: legacy-proxy opens IMAP with the password and creates its account
+  // (the re-login probe). jmap: the upstream session must answer to the token
+  // and be this mailbox. Nothing is stored before the check passes.
+  const who = upstream.kind === "legacy" ? "legacy-proxy" : "the upstream";
+  const v = await upstream.verifyCredential(email, secret);
+  if (!v.ok) {
+    if (v.reason === "rejected") io.stderr.write(`bootstrap: ${who} rejected the ${what}\n`);
+    else if (v.reason === "mismatch") io.stderr.write(`bootstrap: the ${what} is not ${email}'s mailbox: ${v.detail ?? ""}\n`);
+    else if (v.reason === "unreachable") io.stderr.write(`bootstrap: ${who} unreachable: ${v.detail ?? ""}\n`);
+    else io.stderr.write(`bootstrap: ${v.detail ?? `${who} failed`}\n`);
+    return v.reason === "rejected" || v.reason === "mismatch" ? 3 : 1;
   }
 
   const account = await upsertAccount(ctx, { email, legacySlug: `${ctx.config.legacyProvider}:${email}` });
-  await setGandiPassword(ctx, account.id, password);
+  await upstream.storeCredential(account, secret);
 
   if (reset) {
     const s = createAuthState(ctx, now);
@@ -80,11 +75,11 @@ export async function runBootstrap(args: string[], ctx: AppContext, io: Bootstra
 }
 
 /** From the terminal without echo, or the whole of a piped stdin (one trailing newline trimmed). */
-async function readPassword(io: BootstrapIo): Promise<string> {
+async function readSecret(io: BootstrapIo, prompt: string): Promise<string> {
   if (io.stdin.isTTY) {
     return new Promise((resolve) => {
       const rl = createInterface({ input: io.stdin, output: io.stderr, terminal: true });
-      io.stderr.write("Mailbox password: ");
+      io.stderr.write(`${prompt}: `);
       // Echo is suppressed: readline's output hook writes nothing for the typed characters.
       (rl as unknown as { _writeToOutput: (s: string) => void })._writeToOutput = () => {};
       rl.question("", (answer) => {
