@@ -2,7 +2,9 @@ import { registerAuthenticator } from "../../core/auth-context.js";
 import type { AppContext, CliCommand, FeaturePlugin } from "../../types.js";
 import { oauthRoutes } from "./oauth.js";
 import { securityHeaders } from "./pages.js";
+import { bootstrapCommand } from "./bootstrap.js";
 import { authRoutes } from "./routes.js";
+import { staticRoutes } from "./static.js";
 import { createAuthState, type AuthState } from "./state.js";
 
 const JANITOR_INTERVAL_MS = 3600_000;
@@ -41,10 +43,11 @@ export function makeAuthPlugin(opts: { now?: () => number } = {}): FeaturePlugin
     securityHeaders(app);
     await app.register(oauthRoutes, s);
     await app.register(authRoutes, s);
+    await app.register(staticRoutes);
   };
 }
 
 export const authPlugin: FeaturePlugin = makeAuthPlugin();
 
 /** CLI commands contributed by this feature (merged into `src/cli.ts`). */
-export const authCliCommands: Record<string, CliCommand> = {};
+export const authCliCommands: Record<string, CliCommand> = { bootstrap: bootstrapCommand };

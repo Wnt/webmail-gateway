@@ -56,6 +56,16 @@ Endpoints owned by the skeleton: `/healthz` (liveness) and `/readyz` (pings the 
 
 Writing a feature: implement the `FeaturePlugin` in `src/features/<feature>/index.ts` (its options are the `AppContext`: `config`, `db`, `log`, `fetch`), add migrations in your number range, and use `test/helpers.ts` (`makeTestContext`) and `test/fake-legacy.ts` (a stand-in legacy-proxy on an ephemeral port) in tests.
 
+## Auth feature (passkeys and OAuth 2.1)
+
+Design: `design/auth.md` in the coordinator's checkout. The gateway is the OAuth 2.1 authorization server Bulwark signs in through, and its only login UI is a username-free passkey prompt.
+
+- **Endpoints:** `/.well-known/oauth-authorization-server`, `/oauth/authorize` (PKCE S256, exact redirect match, always a fresh passkey tap), `/oauth/token` (`client_secret_post` or Basic; `authorization_code` and `refresh_token`), `/oauth/revoke`, `/oauth/end_session`; `/auth/login`, `/auth/enroll/<token>`, `/auth/passkeys` (list, add, rename, delete, sign out) and their JSON APIs; `/auth/static/*`.
+- **Tokens:** opaque, prefixed (`gwc_` code 60 s single use, `gwa_` access 1 h, `gwr_` refresh 30 d rotated with a 30 s idempotent grace, `gws_` session, `gwe_` enroll 15 min), stored as sha256. Revocation emits `hooks.emitTokenRevoked`. Bearer tokens are recognised by the authenticator this feature registers in `core/auth-context`; Bulwark's tokens carry scope `mail`.
+- **Config:** core `PUBLIC_BASE_URL` (issuer, WebAuthn origin, RP ID = its host) and `ALLOWED_EMAILS`; `OAUTH_CLIENT_SECRET_BULWARK`, `AUTH_RP_NAME`, `AUTH_SESSION_TTL_H`.
+- **Bootstrap and recovery:** `npm run cli -- bootstrap <email> [--reset]` (in the cluster: `kubectl exec -it deploy/webmail-gateway -- node dist/cli.js bootstrap <email>`). It reads the mailbox password from the terminal (or stdin), verifies it through legacy-proxy, stores it sealed, and prints a one-time enrollment URL valid for 15 minutes. `--reset` also deletes the account's passkeys and sessions and revokes its grants.
+- **Bulwark (OAuth mode) expects:** `OAUTH_ENABLED=true`, `OAUTH_ONLY=true`, `AUTO_SSO_ENABLED=true`, `OAUTH_ISSUER_URL=<PUBLIC_BASE_URL>`, `OAUTH_CLIENT_ID=bulwark`, `OAUTH_CLIENT_SECRET=<OAUTH_CLIENT_SECRET_BULWARK>`, `JMAP_SERVER_URL=<PUBLIC_BASE_URL>`; optionally `OAUTH_SCOPES=mail` (the default OIDC scopes are accepted and dropped) and `OAUTH_POST_LOGOUT_REDIRECT_URI=<PUBLIC_BASE_URL>/`. Test stacks on plain http need `COOKIE_SECURE=false` in Bulwark, and Bulwark skips `end_session` there (it requires https).
+
 ## Container image
 
 `docker build -t webmail-gateway .` gives a multi-stage image running as the non-root `node` user with a `HEALTHCHECK` on `/healthz`. CI pushes `ghcr.io/wnt/webmail-gateway` from `main`.
