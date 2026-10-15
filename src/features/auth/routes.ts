@@ -332,7 +332,8 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const id = credentialId(req);
     const name = passkeyName(body(req).name, "");
     if (!id || !name) return reply.code(400).send({ error: "invalid_request" });
-    if (!(await renamePasskey(s, session.accountId, id, name))) return reply.code(404).send({ error: "not_found" });
+    const renamed = await renamePasskey(s, session.accountId, id, name, session);
+    if (renamed !== "renamed") return reply.code(renamed === "not_found" ? 404 : 401).send({ error: renamed });
     void audit(s.ctx, { event: "passkey.rename", accountId: session.accountId, ...requestMeta(req), details: { name } }, s.now());
     return { ok: true };
   });
@@ -344,8 +345,11 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     if (limited(req, reply, "manage", 30)) return;
     const id = credentialId(req);
     if (!id) return reply.code(400).send({ error: "invalid_request" });
-    const outcome = await deletePasskey(s, session.accountId, id);
-    if (outcome.status !== "deleted") return reply.code(outcome.status === "not_found" ? 404 : 409).send({ error: outcome.status });
+    const outcome = await deletePasskey(s, session.accountId, id, session);
+    if (outcome.status !== "deleted") {
+      const status = { not_found: 404, last_passkey: 409, no_session: 401 }[outcome.status];
+      return reply.code(status).send({ error: outcome.status });
+    }
     const details = { sessions: outcome.sessions, grants: outcome.grants };
     void audit(s.ctx, { event: "passkey.delete", accountId: session.accountId, ...requestMeta(req), details }, s.now());
     return { ok: true };

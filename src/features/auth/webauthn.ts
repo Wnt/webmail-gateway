@@ -9,7 +9,7 @@ import {
   type RegistrationResponseJSON,
 } from "@simplewebauthn/server";
 import type { Queryable } from "../../db/pool.js";
-import { lockAccountAuth } from "./generation.js";
+import { holdAuth, holdSession, lockAccountForRevocation } from "./generation.js";
 import type { AuthState } from "./state.js";
 import { asBuffer, b64url } from "./util.js";
 
@@ -108,12 +108,31 @@ export async function getPasskey(s: AuthState, id: Buffer, q: Queryable = s.ctx.
   return rows[0] ? toPasskey(rows[0]) : null;
 }
 
-export async function renamePasskey(s: AuthState, accountId: string, id: Buffer, name: string): Promise<boolean> {
-  const res = await s.ctx.db.query("UPDATE passkey SET name = $3 WHERE id = $1 AND account_id = $2", [id, accountId, name]);
-  return (res.rowCount ?? 0) > 0;
+/** The session asking for a passkey change, as read at the start of the request. */
+export interface Requester {
+  idHash: Buffer;
+  generation: number;
 }
 
-export type DeleteOutcome = { status: "deleted"; sessions: number; grants: number } | { status: "not_found" | "last_passkey" };
+/** Rename, if the asking session is still live when the row is written (lock order: account, passkey, session). */
+export async function renamePasskey(
+  s: AuthState,
+  accountId: string,
+  id: Buffer,
+  name: string,
+  by: Requester,
+): Promise<"renamed" | "not_found" | "no_session"> {
+  return s.ctx.db.transaction(async (tx) => {
+    if (!(await holdAuth(tx, { accountId, generation: by.generation }))) return "no_session";
+    const { rows } = await tx.query("SELECT 1 FROM passkey WHERE id = $1 AND account_id = $2 FOR UPDATE", [id, accountId]);
+    if (rows.length === 0) return "not_found";
+    if (!(await holdSession(tx, accountId, { idHash: by.idHash, now: s.now() }))) return "no_session";
+    await tx.query("UPDATE passkey SET name = $3 WHERE id = $1 AND account_id = $2", [id, accountId, name]);
+    return "renamed";
+  });
+}
+
+export type DeleteOutcome = { status: "deleted"; sessions: number; grants: number } | { status: "not_found" | "last_passkey" | "no_session" };
 
 /**
  * Delete a passkey and everything it authorized (audit gateway-auth-2): the
@@ -121,12 +140,16 @@ export type DeleteOutcome = { status: "deleted"; sessions: number; grants: numbe
  * grants, with their tokens and push subscriptions. Grants from before grants
  * recorded their passkey go too, since any of them may be this one's. Other
  * passkeys' sessions and grants stay. Refuses to delete the last passkey
- * (`last_passkey`): recovery is the CLI, not an empty account.
+ * (`last_passkey`): recovery is the CLI, not an empty account. `by`: the
+ * session asking, rechecked under lock (`no_session` if it was reset or
+ * revoked meanwhile); null for callers that are not a session.
  */
-export async function deletePasskey(s: AuthState, accountId: string, id: Buffer): Promise<DeleteOutcome> {
+export async function deletePasskey(s: AuthState, accountId: string, id: Buffer, by: Requester | null): Promise<DeleteOutcome> {
   const out = await s.ctx.db.transaction(async (tx) => {
-    await lockAccountAuth(tx, accountId);
+    const generation = await lockAccountForRevocation(tx, accountId);
+    if (by && generation !== by.generation) return { status: "no_session" as const };
     const { rows } = await tx.query<{ id: Uint8Array }>("SELECT id FROM passkey WHERE account_id = $1 FOR UPDATE", [accountId]);
+    if (by && !(await holdSession(tx, accountId, { idHash: by.idHash, now: s.now() }))) return { status: "no_session" as const };
     if (!rows.some((r) => asBuffer(r.id)!.equals(id))) return { status: "not_found" as const };
     if (rows.length <= 1) return { status: "last_passkey" as const };
     const sessions = await tx.query("DELETE FROM auth_session WHERE passkey_id = $1 AND account_id = $2", [id, accountId]);

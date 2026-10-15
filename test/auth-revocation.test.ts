@@ -204,6 +204,43 @@ describe("deleting a passkey (gateway-auth-2)", () => {
     expect(res.statusCode).toBe(401);
     expect(await passkeyCount()).toBe(1);
   });
+
+  it("refuses a deletion or rename whose session was revoked while it was in flight", async () => {
+    const lost = new Browser();
+    const lostKey = authenticator();
+    const safe = new Browser();
+    const safeKey = authenticator();
+    await enroll(lost, lostKey);
+    await enroll(safe, safeKey);
+    await enroll(new Browser(), authenticator()); // a spare: the last-passkey guard plays no part
+    const revokeLost = async () => {
+      expect((await safe.go("DELETE", `/auth/passkeys/${credentialOf(lostKey)}`)).statusCode).toBe(200);
+    };
+    beforeNextTransaction(revokeLost);
+    expect((await lost.go("DELETE", `/auth/passkeys/${credentialOf(safeKey)}`)).statusCode).toBe(401);
+    expect(await passkeyCount()).toBe(2);
+    expect((await safe.go("GET", "/auth/passkeys")).statusCode).toBe(200);
+
+    now += 61_000; // a fresh enrollment rate-limit window
+    const renamer = new Browser();
+    const renamerKey = authenticator();
+    await enroll(renamer, renamerKey);
+    beforeNextTransaction(async () => {
+      expect((await safe.go("DELETE", `/auth/passkeys/${credentialOf(renamerKey)}`)).statusCode).toBe(200);
+    });
+    const res = await app.inject({
+      method: "PATCH",
+      url: `/auth/passkeys/${credentialOf(safeKey)}`,
+      headers: {
+        cookie: [...renamer.cookies].map(([k, v]) => `${k}=${v}`).join("; "),
+        "sec-fetch-site": "same-origin",
+        "content-type": "application/json",
+      },
+      payload: JSON.stringify({ name: "renamed by a revoked session" }),
+    });
+    expect(res.statusCode).toBe(401);
+    expect((await ctx.db.query("SELECT 1 FROM passkey WHERE name = 'renamed by a revoked session'")).rows).toHaveLength(0);
+  });
 });
 
 describe("bootstrap --reset (gateway-auth-3)", () => {

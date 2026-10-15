@@ -121,14 +121,17 @@ export async function recordRelayResult(db: Queryable, relayId: string, outcome:
  *  - the account's auth generation has not moved since it was created
  *    (`bootstrap --reset` bumps it);
  *  - its grant has not been revoked. A grant that merely expired keeps push
- *    going: notifications outlive sign-in by design;
+ *    going (notifications outlive sign-in by design) until it is revoked on
+ *    purpose, which `TokenStore.revokeIn` also does to expired grants;
  *  - a subscription without a grant (password mode, or from before grants
- *    were recorded) ends with any revocation in the account after it was made.
+ *    were recorded) ends with the account's next deliberate revocation of a
+ *    grant or passkey (`account.auth_revoked_at`).
  */
-const AUTHORIZED = `s.auth_generation = (SELECT a.auth_generation FROM account a WHERE a.id = s.account_id)
+const AUTHORIZED = `EXISTS (SELECT 1 FROM account a
+          WHERE a.id = s.account_id AND a.auth_generation = s.auth_generation
+            AND (s.grant_id IS NOT NULL OR a.auth_revoked_at IS NULL OR a.auth_revoked_at < s.created_at))
   AND NOT EXISTS (SELECT 1 FROM oauth_grant g
-                  WHERE g.revoked_at IS NOT NULL AND g.revoked_reason <> 'expired'
-                    AND (g.id = s.grant_id OR (s.grant_id IS NULL AND g.account_id = s.account_id AND g.revoked_at >= s.created_at)))`;
+                  WHERE g.id = s.grant_id AND g.revoked_at IS NOT NULL AND g.revoked_reason <> 'expired')`;
 
 /** A subscription that can receive pushes: verified, unexpired, authorized. */
 const DELIVERABLE = `s.verified_at IS NOT NULL AND s.expires > now() AND ${AUTHORIZED}`;

@@ -28,21 +28,30 @@ export async function holdAuth(
     const p = await tx.query("SELECT 1 FROM passkey WHERE id = $1 AND account_id = $2 FOR KEY SHARE", [h.passkeyId, h.accountId]);
     if (p.rows.length === 0) return false;
   }
-  // A session revoked meanwhile, with its passkey.
-  if (h.session) {
-    const q = await tx.query("SELECT 1 FROM auth_session WHERE id_hash = $1 AND account_id = $2 AND expires_at > $3 FOR SHARE", [
-      h.session.idHash,
-      h.accountId,
-      new Date(h.session.now),
-    ]);
-    if (q.rows.length === 0) return false;
-  }
-  return true;
+  return h.session ? holdSession(tx, h.accountId, h.session) : true;
 }
 
-/** The account's place in the lock order, for changes that issue nothing (passkey deletion). */
-export async function lockAccountAuth(tx: Queryable, accountId: string): Promise<void> {
-  await tx.query("SELECT 1 FROM account WHERE id = $1 FOR SHARE", [accountId]);
+/** The session is still live (not reset, not ended with its passkey); locked FOR SHARE until the commit. */
+export async function holdSession(tx: Queryable, accountId: string, session: { idHash: Buffer; now: number }): Promise<boolean> {
+  const { rows } = await tx.query("SELECT 1 FROM auth_session WHERE id_hash = $1 AND account_id = $2 AND expires_at > $3 FOR SHARE", [
+    session.idHash,
+    accountId,
+    new Date(session.now),
+  ]);
+  return rows.length > 0;
+}
+
+/**
+ * The account row for a deliberate revocation (passkey deletion): taken
+ * exclusively, since the revocation also stamps `auth_revoked_at` on it, so
+ * concurrent deletions run one after the other. Returns the generation.
+ */
+export async function lockAccountForRevocation(tx: Queryable, accountId: string): Promise<number | null> {
+  const { rows } = await tx.query<{ auth_generation: number }>(
+    "SELECT auth_generation FROM account WHERE id = $1 FOR NO KEY UPDATE",
+    [accountId],
+  );
+  return rows[0]?.auth_generation ?? null;
 }
 
 /**

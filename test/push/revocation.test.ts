@@ -106,7 +106,7 @@ describe("push stops when access is revoked (gateway-data-1)", () => {
     await h.enable(lost.principal, "lost-device");
     await h.enable(safe.principal, "safe-device");
     const s = createAuthState(h.ctx, () => now);
-    expect(await deletePasskey(s, account.id, lost.passkeyId)).toMatchObject({ status: "deleted", grants: 1 });
+    expect(await deletePasskey(s, account.id, lost.passkeyId, null)).toMatchObject({ status: "deleted", grants: 1 });
     expect(await deliver(slug, ["lost-device", "safe-device"])).toEqual({ "lost-device": 0, "safe-device": 1 });
   });
 
@@ -125,6 +125,34 @@ describe("push stops when access is revoked (gateway-data-1)", () => {
       "expired-grant-device": 0,
       "password-mode-device": 0,
     });
+  });
+
+  it("for the device whose passkey was deleted after its grant had expired", async () => {
+    const { account, slug } = await newAccount();
+    const lost = await signIn(account.id);
+    await signIn(account.id); // the safe device's passkey
+    await h.enable(lost.principal, "expired-lost-device");
+    now += GRANT_TTL_MS + 1;
+    await tokens().prune();
+    expect(await deliver(slug, ["expired-lost-device"])).toEqual({ "expired-lost-device": 1 }); // expiry alone keeps push
+    expect(await deletePasskey(createAuthState(h.ctx, () => now), account.id, lost.passkeyId, null)).toMatchObject({ status: "deleted" });
+    expect(await deliver(slug, ["expired-lost-device"])).toEqual({ "expired-lost-device": 0 });
+    const reasons = await h.ctx.db.query<{ revoked_reason: string }>("SELECT revoked_reason FROM oauth_grant ORDER BY revoked_reason");
+    expect(reasons.rows.map((r) => r.revoked_reason)).toEqual(["expired", "passkey_deleted"]);
+  });
+
+  it("for a subscription without a grant, at the next deliberate revocation even with no grant left to revoke", async () => {
+    const { account, slug, principal: unbound } = await newAccount();
+    const first = await addTestPasskey(h.ctx, account.id);
+    await addTestPasskey(h.ctx, account.id);
+    await h.enable(unbound, "unbound-device"); // like a subscription from before grants were recorded
+    expect(await deliver(slug, ["unbound-device"])).toEqual({ "unbound-device": 1 });
+    expect(await deletePasskey(createAuthState(h.ctx, () => now), account.id, first, null)).toEqual({
+      status: "deleted",
+      sessions: 0,
+      grants: 0,
+    });
+    expect(await deliver(slug, ["unbound-device"])).toEqual({ "unbound-device": 0 });
   });
 
   it("before a queued retry that was waiting when the grant was revoked", async () => {

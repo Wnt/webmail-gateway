@@ -6,6 +6,10 @@
 -- grants rechecks it under a row lock (src/features/auth/generation.ts), so
 -- nothing validated before a reset is written after it.
 ALTER TABLE account ADD COLUMN auth_generation integer NOT NULL DEFAULT 0;
+-- When a grant or passkey of the account was last revoked or deleted on
+-- purpose (not by expiry). Push subscriptions that are bound to no grant
+-- (password mode, or from before migration 202) stop at the next one.
+ALTER TABLE account ADD COLUMN auth_revoked_at timestamptz;
 
 -- A session dies with the passkey that created it. Sessions whose passkey is
 -- already gone are exactly the ones the old ON DELETE SET NULL kept alive.

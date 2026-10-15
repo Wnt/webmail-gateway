@@ -291,11 +291,14 @@ export class TokenStore {
   }
 
   /**
-   * Revoke, inside `tx`, the live grants that match: one grant, every grant of
-   * an account, or (`passkeyId`) the account's grants authorized by that
-   * passkey plus those from before grants recorded their passkey. Revocation
-   * is durable: the grant row's `revoked_at` is what push and token checks
-   * read. Call `announce` with the result after the commit.
+   * Revoke, inside `tx`, the grants that match: one grant, every grant of an
+   * account, or (`passkeyId`) the account's grants authorized by that passkey
+   * plus those from before grants recorded their passkey. Revocation is
+   * durable: the grant row's `revoked_at` and reason are what token and push
+   * checks read, and the account's `auth_revoked_at` is stamped (an account or
+   * passkey selector always stamps it, even with no grant to revoke). Grants
+   * that merely expired are revoked too: push outlives expiry, not this. Call
+   * `announce` with the result after the commit.
    */
   async revokeIn(
     tx: Queryable,
@@ -303,22 +306,25 @@ export class TokenStore {
     reason: RevokeReason,
   ): Promise<RevokedGrant[]> {
     const t = new Date(this.now());
+    const revocable = "(revoked_at IS NULL OR revoked_reason = 'expired')";
     const { rows } =
       "grantId" in which
         ? await tx.query<{ id: string; account_id: string }>(
-            "UPDATE oauth_grant SET revoked_at = $2, revoked_reason = $3 WHERE id = $1 AND revoked_at IS NULL RETURNING id, account_id",
+            `UPDATE oauth_grant SET revoked_at = $2, revoked_reason = $3 WHERE id = $1 AND ${revocable} RETURNING id, account_id`,
             [which.grantId, t, reason],
           )
         : which.passkeyId
           ? await tx.query<{ id: string; account_id: string }>(
               `UPDATE oauth_grant SET revoked_at = $3, revoked_reason = $4
-               WHERE account_id = $1 AND (passkey_id = $2 OR passkey_id IS NULL) AND revoked_at IS NULL RETURNING id, account_id`,
+               WHERE account_id = $1 AND (passkey_id = $2 OR passkey_id IS NULL) AND ${revocable} RETURNING id, account_id`,
               [which.accountId, which.passkeyId, t, reason],
             )
           : await tx.query<{ id: string; account_id: string }>(
-              "UPDATE oauth_grant SET revoked_at = $2, revoked_reason = $3 WHERE account_id = $1 AND revoked_at IS NULL RETURNING id, account_id",
+              `UPDATE oauth_grant SET revoked_at = $2, revoked_reason = $3 WHERE account_id = $1 AND ${revocable} RETURNING id, account_id`,
               [which.accountId, t, reason],
             );
+    const account = "grantId" in which ? rows[0]?.account_id : which.accountId;
+    if (account) await tx.query("UPDATE account SET auth_revoked_at = $2 WHERE id = $1", [account, t]);
     const out: RevokedGrant[] = [];
     for (const g of rows) {
       const ats = await tx.query<{ token_hash: Uint8Array }>("DELETE FROM oauth_access_token WHERE grant_id = $1 RETURNING token_hash", [g.id]);
