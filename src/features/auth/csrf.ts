@@ -6,11 +6,11 @@ import type { FastifyReply, FastifyRequest } from "fastify";
  * authoritative when present (browsers since 2020; JS cannot set it), else the
  * `Origin` header must be our own origin; neither header means a non-browser
  * client that cannot ride a victim's cookie. The JSON content type is required
- * as well: a cross-site form cannot send it.
+ * as well on routes with a body: a cross-site form cannot send it.
  */
-export function sameOriginJson(req: FastifyRequest, reply: FastifyReply, origin: string): boolean {
+export function sameOrigin(req: FastifyRequest, reply: FastifyReply, origin: string, opts: { json: boolean }): boolean {
   const ct = req.headers["content-type"] ?? "";
-  if (!/^application\/json\b/i.test(ct)) {
+  if (opts.json && !/^application\/json\b/i.test(ct)) {
     void reply.code(415).send({ error: "json_required" });
     return false;
   }
