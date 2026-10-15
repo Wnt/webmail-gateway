@@ -9,6 +9,7 @@ import { messagePage, sendPage } from "./pages.js";
 import { openJson, sealJson } from "./sealed.js";
 import { appendSetCookie } from "./sessions.js";
 import type { AuthState } from "./state.js";
+import { WEBAUTHN_SCRIPT } from "./static.js";
 import { b64url, escapeHtml, hashToken, parseCookies, serializeCookie } from "./util.js";
 import {
   authenticationOptions,
@@ -29,7 +30,6 @@ import {
 
 const CHAL_COOKIE = "gw_chal";
 const ENROLL_COOKIE = "gw_enroll";
-const WEBAUTHN_SCRIPT = "webauthn-14.0.0.js";
 
 type Body = Record<string, unknown>;
 const body = (req: FastifyRequest): Body => (typeof req.body === "object" && req.body !== null ? (req.body as Body) : {});

@@ -24,13 +24,13 @@ export interface PageOptions {
   body: string;
   status?: number;
   lang?: string;
-  /** Script files under /auth/static to load (module scripts). */
+  /** Script files under /auth/static to load, in order (classic, deferred: the WebAuthn bundle is UMD). */
   scripts?: string[];
 }
 
 export function sendPage(reply: FastifyReply, o: PageOptions): FastifyReply {
   const lang = o.lang && /^[a-z]{2}(-[A-Za-z]{2,4})?$/.test(o.lang) ? o.lang : "en";
-  const scripts = (o.scripts ?? []).map((s) => `<script type="module" src="/auth/static/${escapeHtml(s)}"></script>`).join("");
+  const scripts = (o.scripts ?? []).map((s) => `<script defer src="/auth/static/${escapeHtml(s)}"></script>`).join("");
   const html =
     `<!doctype html><html lang="${lang}"><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width, initial-scale=1">` +
