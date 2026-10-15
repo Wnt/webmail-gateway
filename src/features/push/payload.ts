@@ -8,6 +8,8 @@ export interface PayloadEmail {
   from: string;
   subject: string;
   preview: string;
+  /** AI summary (Phase 5), only in the quiet replacement push: <= 200 chars, plain text. */
+  summary?: string;
 }
 
 export interface PushPayload {
@@ -17,6 +19,8 @@ export interface PushPayload {
   emailIds: string[];
   changed: Record<string, Record<string, string>>;
   email?: PayloadEmail;
+  /** `false` on the quiet replacement push: update the notification (same tag) without alerting again. */
+  renotify?: false;
 }
 
 export const PREVIEW_MAX = 200;

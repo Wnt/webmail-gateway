@@ -21,6 +21,8 @@ import {
 import { Sender, topicFor } from "./sender.js";
 import type { PushStats } from "./stats.js";
 import { claimEmails, getUpstream, targetsForAccount, updateUpstream } from "./store.js";
+import { Summarizer, type SummarizerOptions, type SummaryJob, type SummarySource } from "./summarizer.js";
+import type { BodyPart } from "./summary-text.js";
 
 /**
  * New-mail pipeline (design/push.md section 5), written against plain JMAP so
@@ -56,6 +58,7 @@ export interface PipelineOptions {
   errorRetryDelaysMs?: number[];
   /** `maxChanges` per Email/changes call. */
   changesPageSize?: number;
+  summarizer?: SummarizerOptions;
 }
 
 interface EmailLite {
@@ -91,10 +94,26 @@ function response(res: JmapResponse, callId: string, name: string): Record<strin
   return r[1];
 }
 
+/** Why a message is not (or no longer) worth a notification, or null. Same rules for the preview and the summary push. */
+function skipReason(
+  e: { mailboxIds?: Record<string, boolean> | null; keywords?: Record<string, boolean> | null },
+  inboxId: string,
+): "not_inbox" | "seen" | "junk" | "draft" | null {
+  const kw = Object.fromEntries(Object.entries(e.keywords ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
+  if (!e.mailboxIds?.[inboxId]) return "not_inbox";
+  if (kw["$seen"]) return "seen";
+  if (kw["$junk"]) return "junk";
+  if (kw["$draft"]) return "draft";
+  return null;
+}
+
+/** Enough for any real message once quotes are stripped; the model input is capped far lower. */
+const MAX_BODY_VALUE_BYTES = 64 * 1024;
+
 const emailList = (g: Record<string, unknown>): EmailLite[] =>
   Array.isArray(g.list) ? (g.list as EmailLite[]).filter((e) => e && typeof e.id === "string") : [];
 
-export class Pipeline {
+export class Pipeline implements SummarySource {
   private runs = new Map<string, RunState>();
   private inbox = new Map<string, { legacyAccountId: string; inboxId: string }>();
   private forgetState = new Set<string>();
@@ -103,6 +122,8 @@ export class Pipeline {
   private readonly errorDelays: number[];
   private readonly changesPage: number;
   private readonly upstream: MailUpstream;
+  /** AI summaries (Phase 5); null when SUMMARY_ENABLED is off. */
+  readonly summarizer: Summarizer | null;
 
   constructor(
     private readonly ctx: AppContext,
@@ -113,6 +134,8 @@ export class Pipeline {
     this.errorDelays = opts.errorRetryDelaysMs ?? [5_000, 30_000];
     this.changesPage = opts.changesPageSize ?? CHANGES_PAGE;
     this.upstream = getMailUpstream(ctx);
+    const summary = ctx.config.push.summary;
+    this.summarizer = summary ? new Summarizer(ctx, summary, stats, sender, this, opts.summarizer) : null;
   }
 
   /** Forget cached ids and the Email state (after a re-login legacy-proxy may hand out new ones, D10). */
@@ -125,13 +148,62 @@ export class Pipeline {
     this.stopped = true;
     for (const t of this.timers) clearTimeout(t);
     this.timers.clear();
+    this.summarizer?.stop();
   }
 
   /** Wait for every running pipeline (tests). */
   async idle(): Promise<void> {
-    while ([...this.runs.values()].some((r) => r.running)) {
-      await Promise.all([...this.runs.values()].map((r) => r.running));
+    for (;;) {
+      while ([...this.runs.values()].some((r) => r.running)) {
+        await Promise.all([...this.runs.values()].map((r) => r.running));
+      }
+      await this.summarizer?.idle();
+      if (![...this.runs.values()].some((r) => r.running)) return;
     }
+  }
+
+  /** One message's keywords, mailboxes and (optionally) text body, or null when it no longer exists. */
+  private async getForSummary(job: SummaryJob, withBody: boolean): Promise<{ notifiable: boolean; parts: BodyPart[] } | null> {
+    const account = await getAccountById(this.ctx, job.accountId);
+    if (!account) return null;
+    const inboxId = await this.inboxId(account, job.legacyAccountId);
+    const res = await this.upstream.jmap(
+      account,
+      [
+        [
+          "Email/get",
+          {
+            accountId: job.legacyAccountId,
+            ids: [job.emailId],
+            properties: withBody ? ["id", "mailboxIds", "keywords", "textBody", "bodyValues"] : ["id", "mailboxIds", "keywords"],
+            ...(withBody ? { fetchTextBodyValues: true, maxBodyValueBytes: MAX_BODY_VALUE_BYTES } : {}),
+          },
+          "g",
+        ],
+      ],
+      [JMAP_CORE, JMAP_MAIL],
+    );
+    const e = (response(res, "g", "Email/get").list as Record<string, unknown>[] | undefined)?.[0];
+    if (!e || e.id !== job.emailId) return null;
+    const notifiable = skipReason(e as Parameters<typeof skipReason>[0], inboxId) === null;
+    const values = (e.bodyValues ?? {}) as Record<string, { value?: unknown }>;
+    const parts: BodyPart[] = [];
+    for (const p of (Array.isArray(e.textBody) ? e.textBody : []) as { partId?: unknown; type?: unknown }[]) {
+      const v = typeof p?.partId === "string" ? values[p.partId]?.value : undefined;
+      if (typeof v === "string" && typeof p.type === "string" && /^text\//i.test(p.type)) parts.push({ type: p.type, value: v });
+    }
+    return { notifiable, parts };
+  }
+
+  /** SummarySource: the body of a message that is still unread in the Inbox. */
+  async bodyParts(job: SummaryJob): Promise<BodyPart[] | null> {
+    const r = await this.getForSummary(job, true);
+    return r?.notifiable ? r.parts : null;
+  }
+
+  /** SummarySource: re-check right before the replacement push. */
+  async stillNotifiable(job: SummaryJob): Promise<boolean> {
+    return (await this.getForSummary(job, false))?.notifiable ?? false;
   }
 
   /**
@@ -319,11 +391,8 @@ export class Pipeline {
     const candidates: (EmailLite & { at: number })[] = [];
     for (const e of fetched.emails) {
       const at = Date.parse(e.receivedAt);
-      const kw = Object.fromEntries(Object.entries(e.keywords ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
-      if (!e.mailboxIds?.[inboxId]) this.stats.inc("mail_skipped_not_inbox");
-      else if (kw["$seen"]) this.stats.inc("mail_skipped_seen");
-      else if (kw["$junk"]) this.stats.inc("mail_skipped_junk");
-      else if (kw["$draft"]) this.stats.inc("mail_skipped_draft");
+      const skip = skipReason(e, inboxId);
+      if (skip) this.stats.inc(`mail_skipped_${skip}`);
       else if (!Number.isFinite(at) || at < baseline || at < oldest) this.stats.inc("mail_skipped_old");
       else candidates.push({ ...e, at });
     }
@@ -369,8 +438,13 @@ export class Pipeline {
       this.ctx.log.debug({ accountId, messages: items.length, targets: targets.length }, "push: new mail, nobody to push to");
       return;
     }
-    const outcomes = await this.sender.sendAll(targets, payload, topicFor(accountId, legacyAccountId));
+    const topic = topicFor(accountId, legacyAccountId);
+    const outcomes = await this.sender.sendAll(targets, payload, topic);
     const sentAt = Date.now();
+    // Phase 5: summarise the newest message and replace the preview quietly (same topic, same tag).
+    if (this.summarizer && payload.email) {
+      this.summarizer.enqueue({ accountId, legacyAccountId, emailId: newest.emailId, payload, topic });
+    }
     this.ctx.log.info(
       {
         accountId,

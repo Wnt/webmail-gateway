@@ -13,6 +13,8 @@ export interface FakeEmail {
   preview: string | null;
   receivedAt: string;
   keywords: Record<string, boolean>;
+  /** Body parts served as `textBody` + `bodyValues` when `fetchTextBodyValues` is set. */
+  body?: { type: string; value: string }[];
 }
 
 export interface FakeSub {
@@ -204,8 +206,20 @@ export async function startFakeLegacyPush(hmacKey: Buffer): Promise<FakeLegacyPu
             .map((id) => a.emails.find((e) => e.id === id))
             .filter(Boolean)
             .map((e) => {
-              const { mailboxId, ...rest } = e!;
-              return { ...rest, mailboxIds: { [mailboxId]: true } };
+              const { mailboxId, body, ...rest } = e!;
+              const parts = body ?? [{ type: "text/plain", value: e!.preview ?? "" }];
+              return {
+                ...rest,
+                mailboxIds: { [mailboxId]: true },
+                ...(args.fetchTextBodyValues
+                  ? {
+                      textBody: parts.map((p, i) => ({ partId: String(i + 1), type: p.type })),
+                      bodyValues: Object.fromEntries(
+                        parts.map((p, i) => [String(i + 1), { value: p.value, isTruncated: false, isEncodingProblem: false }]),
+                      ),
+                    }
+                  : {}),
+              };
             });
           results.push([name, { accountId: a.legacyAccountId, state: String(a.state), list, notFound: [] }, callId]);
           break;

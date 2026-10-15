@@ -13,6 +13,7 @@ Where the skeleton differs from or extends `COORDINATION.md` (the contract file 
 - **`relogin(ctx, account)`** is exported from `core/legacy` (D2): the Basic re-login that `legacyFetch` does on 401, for callers that stream and cannot use `legacyFetch`'s retry.
 - **Core config** adds `PUBLIC_BASE_URL` (required) and `LEGACY_PROVIDER` (default `gandi`) as `config.publicBaseUrl` / `config.legacyProvider` (D1, P4).
 - **`core/upstream`** (D14) is how features reach the mail server: `getUpstream(ctx)` returns the `legacy` or `jmap` implementation chosen by `UPSTREAM_KIND`. Features no longer call `core/legacy` directly; it stays as the legacy implementation's helper (token minting, re-login, `onLegacyRelogin`). With `UPSTREAM_KIND=jmap`, `LEGACY_PROXY_URL` and `LEGACY_SESSION_HMAC_KEY` are optional (`config.legacyProxyUrl` is then `""`), and empty env values count as unset. Migration `001` adds `account.upstream_secret`, written by `accounts.setUpstreamCredential` (sealed under an HKDF purpose key, A6, AAD = account id).
+- **Push payload** (Phase 5): the quiet replacement push adds `email.summary` (≤ 200 chars, plain text) and a top-level `renotify: false` to the contract payload; see [AI summaries](#ai-summaries-phase-5).
 - **Image tags** are `ghcr.io/wnt/webmail-gateway:sha-<full 40-char commit sha>` and `:main`.
 
 ## What and why
@@ -116,6 +117,22 @@ Design: `design/push.md` in the coordinator's checkout. Bulwark registers browse
   - **At most 1 pooled connection at a time** for the push path: per account it runs one JMAP request at a time (event runs and sweeps share a single flight), and legacy-proxy borrows a connection per method. `Email/changes` and `PushSubscription/*` need none; `Mailbox/query`, `Email/query` and `Email/get` borrow one from the per-account pool.
   - The pool itself is legacy-proxy's: up to 3 interactive + 2 bulk connections per account, shared with Bulwark's own traffic. Worst case for one account is therefore 1 IDLE + 5 pooled = 6 sessions, of which push adds the IDLE one.
 - **Config:** `PUSH_VAPID_PUBLIC_KEY`/`PUSH_VAPID_PRIVATE_KEY`/`PUSH_VAPID_SUBJECT` (generate with `npm run cli -- push:vapid-keys`), `PUSH_INTERNAL_BASE_URL`, `PUSH_ENDPOINT_HOSTS`; the rest are in `.env.example`. Counters are logged as `push stats` lines; each push logs `latencyMs` (newest message's `receivedAt` to send) and `eventLatencyMs` (StateChange to send).
+
+### AI summaries (Phase 5)
+
+With `SUMMARY_ENABLED=true` the gateway follows the preview push with a quiet replacement:
+
+1. The preview push goes out at once, unchanged.
+2. The newest message of the run is summarised through an **OpenAI-compatible** `POST <SUMMARY_API_URL>/chat/completions` (`SUMMARY_MODEL`, optional `SUMMARY_API_KEY`, `SUMMARY_TIMEOUT_MS` default 45000). The input is the message's text body from the upstream (`Email/get` with `fetchTextBodyValues`), with HTML converted, quoted replies, signatures and URLs removed, and capped at about 700 tokens (2,100 characters).
+3. The replacement push is the same payload (same `emailIds`, same Topic) plus `email.summary` (≤ 200 characters, plain text) and `renotify: false`. Our Bulwark `sw.js` swaps the text of the notification with the same tag without alerting again.
+
+Rules:
+- One summary at a time, gateway-wide. Per account only the newest message: a newer push replaces a queued job and aborts a running one.
+- Mail that is read, junked or moved out of the Inbox is skipped, checked before the model call and again before the push (the same rules as the preview push).
+- On timeout, an error or a doubtful answer, nothing more is sent and the preview stays.
+- **Safety:** the email is untrusted. The system prompt is fixed and the email goes into the user message between `<email>` delimiters it cannot forge. Markup, labels and quotes are stripped from the answer and its length is enforced. Answers with links, host names, e-mail addresses, prompt-injection or role markers, refusals, or more than 600 characters are dropped.
+- Results are cached per message in `push_summary` (migration 210, sealed under an HKDF purpose key, pruned after 7 days). Rejected answers are cached too; timeouts and errors are not.
+- Counters `summary_*` appear in the `push stats` lines. Each replacement logs `push: summary pushed` with `modelMs`. Mail content is never logged.
 
 ## Container image
 

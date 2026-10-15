@@ -6,6 +6,7 @@ import { Pipeline, type PipelineOptions } from "./pipeline.js";
 import { registerRelayRoutes } from "./relay-routes.js";
 import { Sender, type SenderOptions } from "./sender.js";
 import { PushStats } from "./stats.js";
+import type { SummarizerOptions } from "./summarizer.js";
 import { garbageCollect } from "./store.js";
 import { UpstreamManager, type ReconcileReason, type UpstreamOptions } from "./upstream.js";
 
@@ -13,7 +14,8 @@ import { UpstreamManager, type ReconcileReason, type UpstreamOptions } from "./u
  * Push feature (design/push.md): relay-compatible browser registration under
  * /relay/api/push, emulated JMAP PushSubscription/*, one upstream
  * subscription per account in legacy-proxy, and encrypted Web Push with a
- * from/subject/preview summary for every new INBOX message.
+ * from/subject/preview summary for every new INBOX message, optionally
+ * followed by a quiet replacement push carrying an AI summary (Phase 5).
  */
 
 export interface PushRuntime {
@@ -33,6 +35,7 @@ export interface PushTestOptions {
   sender?: SenderOptions;
   pipeline?: PipelineOptions;
   upstream?: UpstreamOptions;
+  summarizer?: SummarizerOptions;
   /** Receives the runtime once the plugin is registered. */
   onRuntime?: (rt: PushRuntime) => void;
 }
@@ -42,7 +45,7 @@ const GC_EVERY_TICKS = 12;
 export function createPushRuntime(ctx: AppContext, opts: PushTestOptions = {}): PushRuntime {
   const stats = new PushStats();
   const sender = new Sender(ctx, stats, opts.sender);
-  const pipeline = new Pipeline(ctx, stats, sender, opts.pipeline);
+  const pipeline = new Pipeline(ctx, stats, sender, { ...opts.pipeline, summarizer: opts.summarizer ?? opts.pipeline?.summarizer });
   const upstream = new UpstreamManager(ctx, stats, pipeline, opts.upstream);
   const pending = new Set<Promise<void>>();
   let ticks = 0;
