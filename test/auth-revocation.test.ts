@@ -195,6 +195,7 @@ describe("deleting a passkey (gateway-auth-2)", () => {
     const key = authenticator();
     await enroll(b, key);
     await enroll(new Browser(), authenticator());
+    expect((await login(b, key)).statusCode).toBe(200);
     const options = await b.go("POST", "/auth/passkeys/options", {});
     expect(options.statusCode).toBe(200);
     beforeNextTransaction(async () => {
@@ -213,6 +214,9 @@ describe("deleting a passkey (gateway-auth-2)", () => {
     await enroll(lost, lostKey);
     await enroll(safe, safeKey);
     await enroll(new Browser(), authenticator()); // a spare: the last-passkey guard plays no part
+    // Within the step-up window of a login, so only the session recheck can refuse.
+    expect((await login(lost, lostKey)).statusCode).toBe(200);
+    expect((await login(safe, safeKey)).statusCode).toBe(200);
     const revokeLost = async () => {
       expect((await safe.go("DELETE", `/auth/passkeys/${credentialOf(lostKey)}`)).statusCode).toBe(200);
     };

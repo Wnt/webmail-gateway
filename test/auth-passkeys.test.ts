@@ -294,7 +294,15 @@ describe("passkey management", () => {
     expect((await new Browser().go("GET", "/auth/passkeys")).statusCode).toBe(303);
     expect((await new Browser().go("POST", "/auth/passkeys/options", {})).statusCode).toBe(401);
 
+    // Enrolling registered a passkey but proved none: one step-up first (audit gateway-auth-1).
     let res = await b.go("POST", "/auth/passkeys/options", {});
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: "reauth_required" });
+    res = await b.go("POST", "/auth/passkeys/reauth/options", {});
+    expect(res.json().allowCredentials).toHaveLength(1);
+    expect((await b.go("POST", "/auth/passkeys/reauth/verify", a.authenticate(res.json()))).json()).toEqual({ ok: true, manageFor: 300 });
+
+    res = await b.go("POST", "/auth/passkeys/options", {});
     expect(res.statusCode).toBe(200);
     expect(res.json().excludeCredentials).toHaveLength(1);
     res = await b.go("POST", "/auth/passkeys/verify", { response: a.register(res.json()), name: "Second" });

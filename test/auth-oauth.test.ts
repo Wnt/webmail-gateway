@@ -238,7 +238,7 @@ describe("POST /oauth/token", () => {
 
 describe("GET /oauth/end_session", () => {
   it("ends the gateway session and goes to a registered post-logout URI, else shows a page", async () => {
-    const token = await state.sessions.create({ accountId, passkeyId });
+    const token = await state.sessions.create({ accountId, passkeyId, verified: true });
     let res = await app.inject({
       method: "GET",
       url: `/oauth/end_session?client_id=bulwark&post_logout_redirect_uri=${encodeURIComponent(BASE + "/")}&state=abc`,

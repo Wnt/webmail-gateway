@@ -5,11 +5,11 @@ import type { Queryable } from "../../db/pool.js";
 import { audit, requestMeta } from "./audit.js";
 import { sameOrigin } from "./csrf.js";
 import { consumeEnrollToken, peekEnrollToken } from "./enroll.js";
-import { holdAuth } from "./generation.js";
+import { holdAuth, holdStepUp } from "./generation.js";
 import { clearPendingAuthz, readPendingAuthz } from "./oauth.js";
 import { messagePage, sendPage } from "./pages.js";
 import { openJson, sealJson } from "./sealed.js";
-import { appendSetCookie } from "./sessions.js";
+import { appendSetCookie, STEP_UP_WINDOW_MS, stepUpValid, type Session } from "./sessions.js";
 import type { AuthState } from "./state.js";
 import { WEBAUTHN_SCRIPT } from "./static.js";
 import { b64url, escapeHtml, hashToken, parseCookies, serializeCookie } from "./util.js";
@@ -78,12 +78,27 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     return reply.code(503).send({ error: "temporarily_unavailable" });
   }
 
-  /** The new session replaces the browser's old one; call inside the issuing transaction. */
-  async function startSession(tx: Queryable, req: FastifyRequest, accountId: string, passkeyId: Buffer): Promise<string> {
+  /**
+   * The new session replaces the browser's old one; call inside the issuing
+   * transaction. `verified`: it comes from an assertion with an existing
+   * passkey (login), which opens its step-up window; enrollment does not.
+   */
+  async function startSession(tx: Queryable, req: FastifyRequest, accountId: string, passkeyId: Buffer, verified: boolean): Promise<string> {
     const old = s.sessions.fromRequest(req);
     if (old) await s.sessions.delete(old, tx);
     const { ip, userAgent } = requestMeta(req);
-    return s.sessions.create({ accountId, passkeyId, ip, userAgent }, tx);
+    return s.sessions.create({ accountId, passkeyId, verified, ip, userAgent }, tx);
+  }
+
+  /**
+   * Adding or deleting a passkey needs a recent assertion with an existing
+   * passkey in this session (audit gateway-auth-1): checked here at the start
+   * and again under lock where the change is written.
+   */
+  function needsStepUp(session: Session, reply: FastifyReply): boolean {
+    if (stepUpValid(session, s.now())) return false;
+    void reply.code(403).send({ error: "reauth_required" });
+    return true;
   }
 
   /** The material a ceremony validated was revoked or reset before anything was issued from it. */
@@ -136,7 +151,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const pending = readPendingAuthz(s, req);
     const issued = await s.ctx.db.transaction(async (tx) => {
       if (!(await holdAuth(tx, { accountId: account.id, generation, passkeyId: passkey.id }))) return null;
-      const session = await startSession(tx, req, account.id, passkey.id);
+      const session = await startSession(tx, req, account.id, passkey.id, true);
       const code = pending
         ? await s.store.issueCode(
             {
@@ -232,7 +247,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
           accountId: peek.accountId,
           name: passkeyName(b.name, `Passkey ${new Date(s.now()).toISOString().slice(0, 10)}`),
         });
-        return { passkey, session: await startSession(tx, req, peek.accountId, passkey.id) };
+        return { passkey, session: await startSession(tx, req, peek.accountId, passkey.id, false) };
       });
     } catch (err) {
       return fail(req, reply, "enroll.fail", err, peek.accountId);
@@ -262,12 +277,15 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
           `<button type="button" data-action="delete"${keys.length <= 1 ? " disabled title=\"The last passkey cannot be deleted\"" : ""}>Delete</button></div></li>`,
       )
       .join("");
+    // Seconds left of the step-up window: the page asks for a passkey first once it has run out.
+    const manageFor = session.verifiedAt === null ? 0 : Math.max(0, Math.floor((session.verifiedAt + STEP_UP_WINDOW_MS - s.now()) / 1000));
     return sendPage(reply, {
       title: "Passkeys",
       scripts: [WEBAUTHN_SCRIPT, "auth.js"],
       body:
         `<h1>Passkeys</h1><p>Signed in as <strong>${escapeHtml(session.email)}</strong>.</p>` +
-        `<ul class="passkeys" id="passkeys">${rows}</ul>` +
+        `<ul class="passkeys" id="passkeys" data-manage-for="${manageFor}">${rows}</ul>` +
+        `<p><small>Adding or deleting a passkey asks for one of your passkeys first, unless you signed in within the last ${STEP_UP_WINDOW_MS / 60_000} minutes.</small></p>` +
         `<form id="flow" data-flow="add"><label for="name">New passkey</label>` +
         `<input id="name" name="name" maxlength="64" placeholder="Name, e.g. Phone" autocomplete="off">` +
         `<button type="submit" id="go">Add passkey</button></form>` +
@@ -281,6 +299,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const session = await s.sessions.ofRequest(req);
     if (!session) return reply.code(401).send({ error: "no_session" });
     if (limited(req, reply, "manage", 30)) return;
+    if (needsStepUp(session, reply)) return;
     const options = await registrationOptions(s, { id: session.accountId, email: session.email });
     setChallengeCookie(reply, await storeChallenge(s, "add", options.challenge, session.accountId));
     return options;
@@ -291,6 +310,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const session = await s.sessions.ofRequest(req);
     if (!session) return reply.code(401).send({ error: "no_session" });
     if (limited(req, reply, "manage", 30)) return;
+    if (needsStepUp(session, reply)) return;
     const { ip, userAgent } = requestMeta(req);
     const b = body(req);
     try {
@@ -304,6 +324,8 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
           session: { idHash: session.idHash, now: s.now() },
         });
         if (!held) return null;
+        // Registering never renews the step-up: only an assertion with an existing passkey does.
+        if (!(await holdStepUp(tx, session, s.now()))) return "reauth_required" as const;
         return storePasskey(s, tx, {
           info,
           accountId: session.accountId,
@@ -311,6 +333,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
         });
       });
       if (!passkey) return stale(req, reply, "passkey.add_fail", session.accountId, 401, "no_session");
+      if (passkey === "reauth_required") return reply.code(403).send({ error: "reauth_required" });
       clearCookie(reply, CHAL_COOKIE, "/auth");
       void audit(s.ctx, { event: "passkey.add", accountId: session.accountId, ip, userAgent, details: { passkey: passkey.name } }, s.now());
       return { ok: true, id: b64url.encode(passkey.id), name: passkey.name };
@@ -345,14 +368,58 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     if (limited(req, reply, "manage", 30)) return;
     const id = credentialId(req);
     if (!id) return reply.code(400).send({ error: "invalid_request" });
+    if (needsStepUp(session, reply)) return;
     const outcome = await deletePasskey(s, session.accountId, id, session);
     if (outcome.status !== "deleted") {
-      const status = { not_found: 404, last_passkey: 409, no_session: 401 }[outcome.status];
+      const status = { not_found: 404, last_passkey: 409, no_session: 401, reauth_required: 403 }[outcome.status];
       return reply.code(status).send({ error: outcome.status });
     }
     const details = { sessions: outcome.sessions, grants: outcome.grants };
     void audit(s.ctx, { event: "passkey.delete", accountId: session.accountId, ...requestMeta(req), details }, s.now());
     return { ok: true };
+  });
+
+  // --- step-up: prove an existing passkey before adding or deleting one ------
+
+  app.post("/auth/passkeys/reauth/options", async (req, reply) => {
+    if (!sameOrigin(req, reply, s.origin, { json: false })) return;
+    const session = await s.sessions.ofRequest(req);
+    if (!session) return reply.code(401).send({ error: "no_session" });
+    if (limited(req, reply, "manage", 30)) return;
+    const options = await authenticationOptions(s, await listPasskeys(s, session.accountId));
+    setChallengeCookie(reply, await storeChallenge(s, "reauth", options.challenge, session.accountId));
+    return options;
+  });
+
+  app.post("/auth/passkeys/reauth/verify", async (req, reply) => {
+    if (!sameOrigin(req, reply, s.origin, { json: true })) return;
+    const session = await s.sessions.ofRequest(req);
+    if (!session) return reply.code(401).send({ error: "no_session" });
+    if (limited(req, reply, "manage", 30)) return;
+    const { ip, userAgent } = requestMeta(req);
+    let verified: { passkey: Passkey; generation: number };
+    try {
+      const challenge = await consumeFor(req, "reauth", session.accountId);
+      verified = await verifyAuthentication(s, { response: body(req) as unknown as AuthenticationResponseJSON, challenge });
+      if (verified.passkey.accountId !== session.accountId) throw new CeremonyError("step-up: another account's passkey");
+    } catch (err) {
+      return fail(req, reply, "passkey.reauth_fail", err, session.accountId);
+    }
+    const { passkey, generation } = verified;
+    const ok = await s.ctx.db.transaction(async (tx) => {
+      const held = await holdAuth(tx, {
+        accountId: session.accountId,
+        generation,
+        passkeyId: passkey.id,
+        session: { idHash: session.idHash, now: s.now() },
+      });
+      if (held) await s.sessions.markVerified(tx, session.idHash, passkey.id);
+      return held;
+    });
+    if (!ok) return stale(req, reply, "passkey.reauth_fail", session.accountId, 401, "no_session");
+    clearCookie(reply, CHAL_COOKIE, "/auth");
+    void audit(s.ctx, { event: "passkey.reauth", accountId: session.accountId, ip, userAgent, details: { passkey: passkey.name } }, s.now());
+    return { ok: true, manageFor: STEP_UP_WINDOW_MS / 1000 };
   });
 
   app.post("/auth/logout", async (req, reply) => {

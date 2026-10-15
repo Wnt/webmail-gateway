@@ -9,14 +9,15 @@ import {
   type RegistrationResponseJSON,
 } from "@simplewebauthn/server";
 import type { Queryable } from "../../db/pool.js";
-import { holdAuth, holdSession, lockAccountForRevocation } from "./generation.js";
+import { holdAuth, holdSession, holdStepUp, lockAccountForRevocation } from "./generation.js";
 import type { AuthState } from "./state.js";
 import { asBuffer, b64url } from "./util.js";
 
 export const CHALLENGE_TTL_MS = 120_000;
 /** Ed25519, ES256, RS256: what passkey providers ship today. Pinned so the library does not probe the runtime for PQC algorithms. */
 export const SUPPORTED_ALGORITHMS = [-8, -7, -257];
-export type ChallengeKind = "login" | "enroll" | "add";
+/** `reauth`: the step-up assertion on the management page (account-bound, like `enroll` and `add`). */
+export type ChallengeKind = "login" | "enroll" | "add" | "reauth";
 
 export interface Passkey {
   /** Raw credential id. */
@@ -132,7 +133,7 @@ export async function renamePasskey(
   });
 }
 
-export type DeleteOutcome = { status: "deleted"; sessions: number; grants: number } | { status: "not_found" | "last_passkey" | "no_session" };
+export type DeleteOutcome = { status: "deleted"; sessions: number; grants: number } | { status: "not_found" | "last_passkey" | "no_session" | "reauth_required" };
 
 /**
  * Delete a passkey and everything it authorized (audit gateway-auth-2): the
@@ -142,7 +143,8 @@ export type DeleteOutcome = { status: "deleted"; sessions: number; grants: numbe
  * passkeys' sessions and grants stay. Refuses to delete the last passkey
  * (`last_passkey`): recovery is the CLI, not an empty account. `by`: the
  * session asking, rechecked under lock (`no_session` if it was reset or
- * revoked meanwhile); null for callers that are not a session.
+ * revoked meanwhile), which must also hold a step-up authorization
+ * (`reauth_required`); null for callers that are not a session.
  */
 export async function deletePasskey(s: AuthState, accountId: string, id: Buffer, by: Requester | null): Promise<DeleteOutcome> {
   const out = await s.ctx.db.transaction(async (tx) => {
@@ -150,6 +152,7 @@ export async function deletePasskey(s: AuthState, accountId: string, id: Buffer,
     if (by && generation !== by.generation) return { status: "no_session" as const };
     const { rows } = await tx.query<{ id: Uint8Array }>("SELECT id FROM passkey WHERE account_id = $1 FOR UPDATE", [accountId]);
     if (by && !(await holdSession(tx, accountId, { idHash: by.idHash, now: s.now() }))) return { status: "no_session" as const };
+    if (by && !(await holdStepUp(tx, { idHash: by.idHash, accountId }, s.now()))) return { status: "reauth_required" as const };
     if (!rows.some((r) => asBuffer(r.id)!.equals(id))) return { status: "not_found" as const };
     if (rows.length <= 1) return { status: "last_passkey" as const };
     const sessions = await tx.query("DELETE FROM auth_session WHERE passkey_id = $1 AND account_id = $2", [id, accountId]);
@@ -246,9 +249,18 @@ export async function storePasskey(
   return (await getPasskey(s, id, q))!;
 }
 
-/** Discoverable-credential request: no `allowCredentials`, user verification required. */
-export async function authenticationOptions(s: AuthState): Promise<PublicKeyCredentialRequestOptionsJSON> {
-  return generateAuthenticationOptions({ rpID: s.rpId, userVerification: "required", timeout: CHALLENGE_TTL_MS });
+/**
+ * Login: a discoverable-credential request, no `allowCredentials`. Step-up:
+ * `allow` lists the account's passkeys, so the browser offers only those.
+ * User verification is required either way.
+ */
+export async function authenticationOptions(s: AuthState, allow?: Passkey[]): Promise<PublicKeyCredentialRequestOptionsJSON> {
+  return generateAuthenticationOptions({
+    rpID: s.rpId,
+    userVerification: "required",
+    timeout: CHALLENGE_TTL_MS,
+    ...(allow ? { allowCredentials: allow.map((p) => ({ id: b64url.encode(p.id), transports: p.transports })) } : {}),
+  });
 }
 
 /**

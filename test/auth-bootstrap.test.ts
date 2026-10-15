@@ -81,7 +81,7 @@ describe("bootstrap", () => {
     const account = (await getAccountByEmail(ctx, "alice@example.test"))!;
     const s = createAuthState(ctx, () => now);
     const passkeyId = await addTestPasskey(ctx, account.id, Buffer.from("cred-1"));
-    const session = await s.sessions.create({ accountId: account.id, passkeyId });
+    const session = await s.sessions.create({ accountId: account.id, passkeyId, verified: true });
     await s.store.issueCode({ clientId: "bulwark", accountId: account.id, passkeyId, redirectUri: "https://mail.example.test/en/auth/callback", codeChallenge: "c".repeat(43), scopes: ["mail"] });
     const grant = await ctx.db.query<{ id: string }>(
       "INSERT INTO oauth_grant (client_id, account_id, scopes, created_at, expires_at) VALUES ('bulwark', $1, 'mail', $2, $3) RETURNING id",

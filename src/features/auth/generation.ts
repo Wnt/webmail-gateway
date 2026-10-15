@@ -1,4 +1,5 @@
 import type { Queryable } from "../../db/pool.js";
+import { STEP_UP_WINDOW_MS } from "./sessions.js";
 import type { AuthState } from "./state.js";
 
 /**
@@ -52,6 +53,21 @@ export async function lockAccountForRevocation(tx: Queryable, accountId: string)
     [accountId],
   );
   return rows[0]?.auth_generation ?? null;
+}
+
+/**
+ * Inside the transaction that adds or deletes a passkey, after `holdAuth`
+ * (or `lockAccountForRevocation` and the passkey locks): the session still
+ * holds a step-up authorization (audit gateway-auth-1). The session row is locked FOR SHARE, so deleting the
+ * passkey that authorized it (which clears `verified_passkey_id`) waits.
+ */
+export async function holdStepUp(tx: Queryable, session: { idHash: Buffer; accountId: string }, now: number): Promise<boolean> {
+  const { rows } = await tx.query(
+    `SELECT 1 FROM auth_session WHERE id_hash = $1 AND account_id = $2 AND expires_at > $3
+       AND verified_passkey_id IS NOT NULL AND verified_at > $4 FOR SHARE`,
+    [session.idHash, session.accountId, new Date(now), new Date(now - STEP_UP_WINDOW_MS)],
+  );
+  return rows.length > 0;
 }
 
 /**
