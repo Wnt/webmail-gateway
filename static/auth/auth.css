@@ -1,23 +1,24 @@
 :root {
+  /* Madekivi Mail palette: stone #2E5A6B, light stone #7FB0C1, cream #F4EFE6, night #13202A. */
   color-scheme: light dark;
-  --bg: #f5f6f8;
+  --bg: #f4efe6;
   --card: #ffffff;
-  --fg: #1b1f24;
-  --muted: #5c6670;
-  --line: #d9dde2;
-  --accent: #1f6feb;
-  --accent-fg: #ffffff;
+  --fg: #1c262c;
+  --muted: #5a666d;
+  --line: #ddd6ca;
+  --accent: #2e5a6b;
+  --accent-fg: #f4efe6;
   --danger: #b42318;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0f1216;
-    --card: #181c22;
-    --fg: #e6e8eb;
-    --muted: #9aa4ae;
-    --line: #2b323b;
-    --accent: #4c8dff;
-    --accent-fg: #0b0f14;
+    --bg: #13202a;
+    --card: #1a2a35;
+    --fg: #e8edf0;
+    --muted: #9fb0ba;
+    --line: #2c3e4a;
+    --accent: #7fb0c1;
+    --accent-fg: #13202a;
     --danger: #ff7b72;
   }
 }
@@ -25,6 +26,8 @@
 html, body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 body { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
 .card { width: 100%; max-width: 440px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 28px 24px; }
+.brand { display: flex; align-items: center; gap: 10px; margin: 0 0 20px; font-weight: 600; font-size: 1.05rem; letter-spacing: 0.01em; }
+.brand img { display: block; width: 32px; height: 32px; }
 h1 { font-size: 1.4rem; margin: 0 0 12px; }
 p { margin: 0 0 12px; }
 small { color: var(--muted); }

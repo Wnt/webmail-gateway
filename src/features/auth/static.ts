@@ -20,11 +20,12 @@ interface Asset {
   type: string;
 }
 
-/** The three assets the pages need, read once at startup and served immutable. */
+/** The assets the pages need, read once at startup and served immutable. */
 export async function staticRoutes(app: FastifyInstance): Promise<void> {
   const assets = new Map<string, Asset>([
     ["auth.css", { body: await readFile(path.join(STATIC_DIR, "auth.css")), type: "text/css; charset=utf-8" }],
     ["auth.js", { body: await readFile(path.join(STATIC_DIR, "auth.js")), type: "text/javascript; charset=utf-8" }],
+    ["logo.svg", { body: await readFile(path.join(STATIC_DIR, "logo.svg")), type: "image/svg+xml" }],
     [WEBAUTHN_SCRIPT, { body: await readFile(browserBundlePath()), type: "text/javascript; charset=utf-8" }],
   ]);
   app.get("/auth/static/:name", async (req, reply) => {

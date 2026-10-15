@@ -1,7 +1,7 @@
 import { registerAuthenticator } from "../../core/auth-context.js";
 import type { AppContext, CliCommand, FeaturePlugin } from "../../types.js";
 import { oauthRoutes } from "./oauth.js";
-import { securityHeaders } from "./pages.js";
+import { brandPages, securityHeaders } from "./pages.js";
 import { bootstrapCommand } from "./bootstrap.js";
 import { authRoutes } from "./routes.js";
 import { staticRoutes } from "./static.js";
@@ -41,6 +41,7 @@ export function makeAuthPlugin(opts: { now?: () => number } = {}): FeaturePlugin
     });
 
     securityHeaders(app);
+    brandPages(app, ctx.config.auth.rpName);
     await app.register(oauthRoutes, s);
     await app.register(authRoutes, s);
     await app.register(staticRoutes);

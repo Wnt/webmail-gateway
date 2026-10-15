@@ -17,6 +17,7 @@ describe("auth static assets and pages", () => {
     for (const [name, type, needle] of [
       ["auth.css", "text/css", ".passkey"],
       ["auth.js", "text/javascript", "startAuthentication"],
+      ["logo.svg", "image/svg+xml", "<svg"],
       ["webauthn-14.0.0.js", "text/javascript", "SimpleWebAuthnBrowser"],
     ]) {
       const res = await app.inject({ method: "GET", url: `/auth/static/${name}` });
@@ -33,7 +34,10 @@ describe("auth static assets and pages", () => {
     expect(res.statusCode).toBe(200);
     expect(res.body).toContain('<link rel="stylesheet" href="/auth/static/auth.css">');
     expect(res.body).toContain('<script defer src="/auth/static/webauthn-14.0.0.js"></script><script defer src="/auth/static/auth.js"></script>');
-    expect(res.body).not.toMatch(/<script>|onclick=/);
+    expect(res.body).toContain('<link rel="icon" href="/auth/static/logo.svg" type="image/svg+xml">');
+    expect(res.body).toContain('<header class="brand"><img src="/auth/static/logo.svg" alt="" width="32" height="32"><span>Webmail</span></header>');
+    expect(res.body).toContain("<title>Sign in · Webmail</title>");
+    expect(res.body).not.toMatch(/<script>|onclick=|<style|style=/);
     expect(res.headers["content-security-policy"]).toBe(
       "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
     );
@@ -41,5 +45,18 @@ describe("auth static assets and pages", () => {
     expect(res.headers["cache-control"]).toBe("no-store");
     expect(res.headers["referrer-policy"]).toBe("no-referrer");
     expect(res.headers["x-content-type-options"]).toBe("nosniff");
+  });
+
+  it("names the pages after AUTH_RP_NAME", async () => {
+    const c = await makeTestContext({ OAUTH_CLIENT_SECRET_BULWARK: "s".repeat(40), AUTH_RP_NAME: "Madekivi <Mail>" });
+    const branded = await buildApp(c.config, { db: c.db, log: c.log });
+    try {
+      const res = await branded.inject({ method: "GET", url: "/auth/login" });
+      expect(res.body).toContain("<title>Sign in · Madekivi &lt;Mail&gt;</title>");
+      expect(res.body).toContain("<span>Madekivi &lt;Mail&gt;</span></header>");
+    } finally {
+      await branded.close();
+      await c.db.close();
+    }
   });
 });

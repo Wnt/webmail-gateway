@@ -92,7 +92,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
       lang: pending?.ui_locales.split(/[\s,]/)[0],
       scripts: [WEBAUTHN_SCRIPT, "auth.js"],
       body:
-        `<h1>Sign in</h1><p>Use your passkey to continue${pending ? " to the webmail" : ""}.</p>` +
+        `<h1>Sign in</h1><p>Use your passkey to continue${pending ? ` to ${escapeHtml(s.ctx.config.auth.rpName)}` : ""}.</p>` +
         `<form id="flow" data-flow="login"><button type="submit" id="go">Sign in with passkey</button></form>` +
         `<p id="msg" class="msg" role="status" aria-live="polite"></p>`,
     });
@@ -169,7 +169,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
       title: "Create a passkey",
       scripts: [WEBAUTHN_SCRIPT, "auth.js"],
       body:
-        `<h1>Create a passkey</h1><p>This passkey will sign <strong>${escapeHtml(peek.email)}</strong> in to the webmail.</p>` +
+        `<h1>Create a passkey</h1><p>This passkey will sign <strong>${escapeHtml(peek.email)}</strong> in to ${escapeHtml(s.ctx.config.auth.rpName)}.</p>` +
         `<form id="flow" data-flow="enroll"><label for="name">Name</label>` +
         `<input id="name" name="name" maxlength="64" placeholder="e.g. Phone, Laptop" autocomplete="off">` +
         `<button type="submit" id="go">Create passkey</button></form>` +

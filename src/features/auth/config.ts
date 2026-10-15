@@ -6,7 +6,10 @@ import { z } from "zod";
  * RP ID are all derived from `PUBLIC_BASE_URL`.
  */
 export const authConfigSchema = z.object({
-  /** WebAuthn `rp.name`, shown by some authenticators when creating a passkey. */
+  /**
+   * The product name: WebAuthn `rp.name` (shown by some authenticators when
+   * creating a passkey) and the name in the auth pages' header and `<title>`.
+   */
   AUTH_RP_NAME: z.string().min(1).max(64).default("Webmail"),
   /**
    * Bulwark's client secret (the same value as Bulwark's `OAUTH_CLIENT_SECRET`).

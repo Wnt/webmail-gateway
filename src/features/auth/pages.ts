@@ -1,6 +1,13 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { escapeHtml } from "./util.js";
 
+declare module "fastify" {
+  interface FastifyInstance {
+    /** Product name in the page header and `<title>` (`AUTH_RP_NAME`). */
+    authBrand?: string;
+  }
+}
+
 /**
  * The gateway's few HTML pages: strings plus `escapeHtml`, no template engine,
  * no inline scripts (the CSP forbids them). Assets live under /auth/static.
@@ -18,6 +25,11 @@ export function securityHeaders(app: FastifyInstance): void {
   });
 }
 
+/** Name the pages after the product (`AUTH_RP_NAME`, also the passkey `rp.name`). */
+export function brandPages(app: FastifyInstance, name: string): void {
+  app.decorate("authBrand", name);
+}
+
 export interface PageOptions {
   title: string;
   /** Already-escaped HTML. */
@@ -28,14 +40,23 @@ export interface PageOptions {
   scripts?: string[];
 }
 
+/** Page background (`--bg` in auth.css), for the browser chrome. */
+const THEME_LIGHT = "#f4efe6";
+const THEME_DARK = "#13202a";
+
 export function sendPage(reply: FastifyReply, o: PageOptions): FastifyReply {
   const lang = o.lang && /^[a-z]{2}(-[A-Za-z]{2,4})?$/.test(o.lang) ? o.lang : "en";
   const scripts = (o.scripts ?? []).map((s) => `<script defer src="/auth/static/${escapeHtml(s)}"></script>`).join("");
+  const brand = escapeHtml(reply.server.authBrand ?? "Webmail");
   const html =
     `<!doctype html><html lang="${lang}"><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width, initial-scale=1">` +
-    `<title>${escapeHtml(o.title)}</title><link rel="stylesheet" href="/auth/static/auth.css">` +
-    `</head><body><main class="card">${o.body}</main>${scripts}</body></html>`;
+    `<meta name="theme-color" content="${THEME_LIGHT}" media="(prefers-color-scheme: light)">` +
+    `<meta name="theme-color" content="${THEME_DARK}" media="(prefers-color-scheme: dark)">` +
+    `<title>${escapeHtml(o.title)} · ${brand}</title><link rel="stylesheet" href="/auth/static/auth.css">` +
+    `<link rel="icon" href="/auth/static/logo.svg" type="image/svg+xml">` +
+    `</head><body><main class="card"><header class="brand"><img src="/auth/static/logo.svg" alt="" width="32" height="32">` +
+    `<span>${brand}</span></header>${o.body}</main>${scripts}</body></html>`;
   return reply
     .code(o.status ?? 200)
     .header("Content-Security-Policy", CSP)
