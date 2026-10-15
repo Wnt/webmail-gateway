@@ -11,6 +11,9 @@ const bool = (def: "true" | "false") =>
     .default(def)
     .transform((v) => v === "true");
 
+/** Optional; an empty value counts as unset. */
+const opt = <T extends z.ZodType>(schema: T) => z.preprocess((v) => (v === "" ? undefined : v), schema.optional());
+
 const posInt = (def: number) => z.coerce.number().int().positive().default(def);
 
 /** base64url of exactly `len` bytes (a VAPID key). */
@@ -64,6 +67,18 @@ export const pushConfigSchema = z
     PUSH_TTL_S: posInt(21600),
     /** Run the background reconciler once the server listens. */
     PUSH_WORKER_ENABLED: bool("true"),
+
+    // --- AI summaries (Phase 5): a quiet replacement push with `email.summary`
+    /** Summarise new mail and send a quiet replacement push. */
+    SUMMARY_ENABLED: bool("false"),
+    /** OpenAI-compatible base URL, e.g. `http://llm:8080/v1` (`/chat/completions` is appended unless present). */
+    SUMMARY_API_URL: opt(z.url()),
+    /** The `model` sent with every request. */
+    SUMMARY_MODEL: opt(z.string().trim().min(1)),
+    /** Optional Bearer token for the summary endpoint. Secret. */
+    SUMMARY_API_KEY: opt(z.string().trim().min(1)),
+    /** Give up on one summary after this long; the preview then stays. */
+    SUMMARY_TIMEOUT_MS: posInt(45_000),
   })
   .superRefine((c, ctx) => {
     const n = [c.PUSH_VAPID_PUBLIC_KEY, c.PUSH_VAPID_PRIVATE_KEY].filter(Boolean).length;
@@ -73,12 +88,31 @@ export const pushConfigSchema = z
     if (n === 2 && !c.PUSH_VAPID_SUBJECT) {
       ctx.addIssue({ code: "custom", path: ["PUSH_VAPID_SUBJECT"], message: "required when VAPID keys are set" });
     }
+    if (c.SUMMARY_ENABLED) {
+      for (const k of ["SUMMARY_API_URL", "SUMMARY_MODEL"] as const) {
+        if (!c[k]) ctx.addIssue({ code: "custom", path: [k], message: "required when SUMMARY_ENABLED=true" });
+      }
+    }
   });
+
+/** `<base>/chat/completions`, unless the URL already names that endpoint. */
+export function chatCompletionsUrl(url: string): string {
+  const u = url.replace(/\/+$/, "");
+  return /\/chat\/completions$/.test(u) ? u : `${u}/chat/completions`;
+}
 
 export interface VapidConfig {
   publicKey: string;
   privateKey: string;
   subject: string;
+}
+
+export interface SummaryConfig {
+  /** The chat-completions endpoint. */
+  url: string;
+  model: string;
+  apiKey: string | null;
+  timeoutMs: number;
 }
 
 export interface PushConfig {
@@ -92,6 +126,8 @@ export interface PushConfig {
   maxNotifyAgeMs: number;
   ttlSec: number;
   workerEnabled: boolean;
+  /** null: no AI summaries (SUMMARY_ENABLED=false). */
+  summary: SummaryConfig | null;
 }
 
 export function parsePushConfig(env: NodeJS.ProcessEnv): PushConfig {
@@ -109,5 +145,14 @@ export function parsePushConfig(env: NodeJS.ProcessEnv): PushConfig {
     maxNotifyAgeMs: c.PUSH_MAX_NOTIFY_AGE_S * 1000,
     ttlSec: c.PUSH_TTL_S,
     workerEnabled: c.PUSH_WORKER_ENABLED,
+    summary:
+      c.SUMMARY_ENABLED && c.SUMMARY_API_URL && c.SUMMARY_MODEL
+        ? {
+            url: chatCompletionsUrl(c.SUMMARY_API_URL),
+            model: c.SUMMARY_MODEL,
+            apiKey: c.SUMMARY_API_KEY ?? null,
+            timeoutMs: c.SUMMARY_TIMEOUT_MS,
+          }
+        : null,
   };
 }

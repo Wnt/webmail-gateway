@@ -416,6 +416,7 @@ export async function notifiedIds(db: Queryable, accountId: string, ids: string[
 /** Housekeeping: old dedupe rows, long-expired emulated subs, dead or orphaned relay records. */
 export async function garbageCollect(db: Queryable): Promise<void> {
   await db.query("DELETE FROM push_notified WHERE notified_at < now() - interval '7 days'");
+  await db.query("DELETE FROM push_summary WHERE created_at < now() - interval '7 days'");
   await db.query("DELETE FROM push_jmap_sub WHERE expires < now() - interval '7 days'");
   await db.query(
     `DELETE FROM push_relay_sub r
