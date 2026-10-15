@@ -4,7 +4,7 @@ import type { AppContext } from "../../types.js";
 import { minimalPayload, type PushPayload } from "./payload.js";
 import { safeHost } from "./relay-routes.js";
 import type { PushStats } from "./stats.js";
-import { recordRelayResult, type PushTarget, type SendOutcome } from "./store.js";
+import { recordRelayResult, targetStillAuthorized, type PushTarget, type SendOutcome } from "./store.js";
 
 /**
  * Encrypted Web Push (RFC 8291 aes128gcm) with VAPID (RFC 8292). `web-push`
@@ -68,6 +68,12 @@ export class Sender {
     let body = payload;
     let shrunk = false;
     for (let attempt = 0; ; attempt++) {
+      // Revocation is durable state: re-read it before every attempt, so a
+      // retry queued before a revocation does not go out after it.
+      if (!(await targetStillAuthorized(this.ctx.db, target))) {
+        this.stats.inc("push_send_revoked");
+        return "revoked";
+      }
       const { status, retryAfterMs } = await this.post(target, body, topic);
       if (status >= 200 && status < 300) return this.done(target, "ok", "push_send_ok");
       if (status === 404 || status === 410) {

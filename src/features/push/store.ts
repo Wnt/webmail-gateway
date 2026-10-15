@@ -82,8 +82,7 @@ export async function relayActive(db: Queryable, relayId: string, graceMs: numbe
   const { rows } = await db.query<{ gone: boolean; fresh: boolean; referenced: boolean }>(
     `SELECT r.gone_at IS NOT NULL AS gone,
             r.created_at > now() - make_interval(secs => $2::double precision / 1000) AS fresh,
-            EXISTS (SELECT 1 FROM push_jmap_sub s
-                    WHERE s.relay_id = r.relay_id AND s.verified_at IS NOT NULL AND s.expires > now()) AS referenced
+            EXISTS (SELECT 1 FROM push_jmap_sub s WHERE s.relay_id = r.relay_id AND ${DELIVERABLE}) AS referenced
        FROM push_relay_sub r WHERE r.relay_id = $1`,
     [relayId, graceMs],
   );
@@ -92,7 +91,8 @@ export async function relayActive(db: Queryable, relayId: string, graceMs: numbe
   return !r.gone && (r.referenced || r.fresh);
 }
 
-export type SendOutcome = "ok" | "gone" | "failed" | "rejected";
+/** `revoked`: the subscription lost its authorization before the send (nothing is recorded on the relay). */
+export type SendOutcome = "ok" | "gone" | "failed" | "rejected" | "revoked";
 
 /** Record a send result. `rejected` (400/401/403) marks the record gone after 3 in a row. */
 export async function recordRelayResult(db: Queryable, relayId: string, outcome: SendOutcome): Promise<void> {
@@ -114,9 +114,30 @@ export async function recordRelayResult(db: Queryable, relayId: string, outcome:
 
 // ------------------------------------------------------- emulated JMAP subscriptions
 
+/**
+ * Push authorization of the emulated subscription `s` (audit gateway-data-1),
+ * read from the database on every use so that a revocation made anywhere,
+ * including the bootstrap CLI's process, holds:
+ *  - the account's auth generation has not moved since it was created
+ *    (`bootstrap --reset` bumps it);
+ *  - its grant has not been revoked. A grant that merely expired keeps push
+ *    going: notifications outlive sign-in by design;
+ *  - a subscription without a grant (password mode, or from before grants
+ *    were recorded) ends with any revocation in the account after it was made.
+ */
+const AUTHORIZED = `s.auth_generation = (SELECT a.auth_generation FROM account a WHERE a.id = s.account_id)
+  AND NOT EXISTS (SELECT 1 FROM oauth_grant g
+                  WHERE g.revoked_at IS NOT NULL AND g.revoked_reason <> 'expired'
+                    AND (g.id = s.grant_id OR (s.grant_id IS NULL AND g.account_id = s.account_id AND g.revoked_at >= s.created_at)))`;
+
+/** A subscription that can receive pushes: verified, unexpired, authorized. */
+const DELIVERABLE = `s.verified_at IS NOT NULL AND s.expires > now() AND ${AUTHORIZED}`;
+
 export interface JmapSub {
   id: string;
   accountId: string;
+  /** The OAuth grant whose token created it; null in password mode. */
+  grantId: string | null;
   deviceClientId: string;
   relayId: string;
   url: string;
@@ -130,6 +151,7 @@ export interface JmapSub {
 interface JmapSubRow {
   id: string;
   account_id: string;
+  grant_id: string | null;
   device_client_id: string;
   relay_id: string;
   url: string;
@@ -143,6 +165,7 @@ interface JmapSubRow {
 const toJmapSub = (r: JmapSubRow): JmapSub => ({
   id: r.id,
   accountId: r.account_id,
+  grantId: r.grant_id,
   deviceClientId: r.device_client_id,
   relayId: r.relay_id,
   url: r.url,
@@ -153,19 +176,21 @@ const toJmapSub = (r: JmapSubRow): JmapSub => ({
   createdAt: r.created_at,
 });
 
+/** The account's subscriptions. Revoked ones are gone as far as clients can tell, so a re-sync after signing in again creates a new one. */
 export async function listJmapSubs(db: Queryable, accountId: string): Promise<JmapSub[]> {
   const { rows } = await db.query<JmapSubRow>(
-    "SELECT * FROM push_jmap_sub WHERE account_id = $1 ORDER BY created_at, id",
+    `SELECT * FROM push_jmap_sub s WHERE s.account_id = $1 AND ${AUTHORIZED} ORDER BY s.created_at, s.id`,
     [accountId],
   );
   return rows.map(toJmapSub);
 }
 
+/** Bound to `grantId` and to the account's current auth generation. */
 export async function insertJmapSub(db: Queryable, s: Omit<JmapSub, "verifiedAt" | "createdAt">): Promise<void> {
   await db.query(
-    `INSERT INTO push_jmap_sub (id, account_id, device_client_id, relay_id, url, types, expires, verification_code)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [s.id, s.accountId, s.deviceClientId, s.relayId, s.url, s.types, s.expires, s.verificationCode],
+    `INSERT INTO push_jmap_sub (id, account_id, grant_id, device_client_id, relay_id, url, types, expires, verification_code, auth_generation)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, (SELECT auth_generation FROM account WHERE id = $2))`,
+    [s.id, s.accountId, s.grantId, s.deviceClientId, s.relayId, s.url, s.types, s.expires, s.verificationCode],
   );
 }
 
@@ -199,13 +224,14 @@ export async function deleteJmapSub(db: Queryable, id: string, accountId: string
 export async function hasActiveSubs(db: Queryable, accountId: string): Promise<boolean> {
   const { rows } = await db.query<{ n: number }>(
     `SELECT count(*)::int AS n FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
-      WHERE s.account_id = $1 AND s.verified_at IS NOT NULL AND s.expires > now() AND r.gone_at IS NULL`,
+      WHERE s.account_id = $1 AND ${DELIVERABLE} AND r.gone_at IS NULL`,
     [accountId],
   );
   return (rows[0]?.n ?? 0) > 0;
 }
 
 export interface PushTarget {
+  accountId: string;
   relayId: string;
   endpoint: string;
   p256dh: string;
@@ -217,12 +243,21 @@ export async function targetsForAccount(db: Queryable, accountId: string): Promi
   const { rows } = await db.query<{ relay_id: string; endpoint: string; p256dh: string; auth: string }>(
     `SELECT DISTINCT ON (r.endpoint) r.relay_id, r.endpoint, r.p256dh, r.auth
        FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
-      WHERE s.account_id = $1 AND s.verified_at IS NOT NULL AND s.expires > now() AND r.gone_at IS NULL
+      WHERE s.account_id = $1 AND ${DELIVERABLE} AND r.gone_at IS NULL
         AND (s.types IS NULL OR 'EmailDelivery' = ANY (s.types))
       ORDER BY r.endpoint, r.updated_at DESC`,
     [accountId],
   );
-  return rows.map((r) => ({ relayId: r.relay_id, endpoint: r.endpoint, p256dh: r.p256dh, auth: r.auth }));
+  return rows.map((r) => ({ accountId, relayId: r.relay_id, endpoint: r.endpoint, p256dh: r.p256dh, auth: r.auth }));
+}
+
+/** Is `target` still a recipient? Checked before every send attempt, retries included. */
+export async function targetStillAuthorized(db: Queryable, target: PushTarget): Promise<boolean> {
+  const { rows } = await db.query(
+    `SELECT 1 FROM push_jmap_sub s WHERE s.account_id = $1 AND s.relay_id = $2 AND ${DELIVERABLE} LIMIT 1`,
+    [target.accountId, target.relayId],
+  );
+  return rows.length > 0;
 }
 
 // -------------------------------------------------------------- upstream subscription
@@ -379,7 +414,7 @@ export async function storeUpstreamCode(
 export async function accountsToReconcile(db: Queryable, always: boolean): Promise<string[]> {
   const { rows } = await db.query<{ id: string }>(
     `SELECT account_id AS id FROM push_upstream WHERE status <> 'none'
-     UNION SELECT account_id FROM push_jmap_sub WHERE verified_at IS NOT NULL AND expires > now()
+     UNION SELECT s.account_id FROM push_jmap_sub s WHERE ${DELIVERABLE}
      UNION SELECT id FROM account WHERE $1::boolean AND (gandi_secret IS NOT NULL OR upstream_secret IS NOT NULL)`,
     [always],
   );
@@ -418,6 +453,7 @@ export async function garbageCollect(db: Queryable): Promise<void> {
   await db.query("DELETE FROM push_notified WHERE notified_at < now() - interval '7 days'");
   await db.query("DELETE FROM push_summary WHERE created_at < now() - interval '7 days'");
   await db.query("DELETE FROM push_jmap_sub WHERE expires < now() - interval '7 days'");
+  await db.query(`DELETE FROM push_jmap_sub s WHERE NOT (${AUTHORIZED})`);
   await db.query(
     `DELETE FROM push_relay_sub r
       WHERE (r.gone_at IS NOT NULL AND r.gone_at < now() - interval '30 days')

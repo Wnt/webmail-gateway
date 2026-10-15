@@ -128,7 +128,12 @@ export function createPushSubscriptionHandler(deps: EmulationDeps) {
     return { list, notFound };
   }
 
-  async function create(accountId: string, raw: unknown, existing: number): Promise<Record<string, unknown> | { error: SetError }> {
+  async function create(
+    accountId: string,
+    grantId: string | null,
+    raw: unknown,
+    existing: number,
+  ): Promise<Record<string, unknown> | { error: SetError }> {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { error: { type: "invalidProperties", description: "not an object" } };
     const o = raw as Record<string, unknown>;
     for (const k of Object.keys(o)) if (!CREATE_PROPS.has(k)) return invalid(k, `unsupported property ${k}`);
@@ -154,6 +159,7 @@ export function createPushSubscriptionHandler(deps: EmulationDeps) {
     await insertJmapSub(db, {
       id,
       accountId,
+      grantId,
       deviceClientId: o.deviceClientId,
       relayId,
       url: o.url as string,
@@ -206,7 +212,7 @@ export function createPushSubscriptionHandler(deps: EmulationDeps) {
     return { result, changed: Boolean(patch.verified || patch.expires) };
   }
 
-  async function set(accountId: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async function set(accountId: string, grantId: string | null, args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const { create: c, update: u, destroy: d } = args;
     const isMap = (v: unknown) => v === null || v === undefined || (typeof v === "object" && !Array.isArray(v));
     if (!isMap(c) || !isMap(u)) throw new JmapMethodError("invalidArguments", "create and update must be maps");
@@ -223,7 +229,7 @@ export function createPushSubscriptionHandler(deps: EmulationDeps) {
 
     let count = (await listJmapSubs(db, accountId)).length;
     for (const [key, raw] of Object.entries((c as Record<string, unknown>) ?? {})) {
-      const r = await create(accountId, raw, count);
+      const r = await create(accountId, grantId, raw, count);
       if ("error" in r) notCreated[key] = r.error as SetError;
       else {
         created[key] = r;
@@ -273,7 +279,8 @@ export function createPushSubscriptionHandler(deps: EmulationDeps) {
   ): Promise<Record<string, unknown>> {
     if (!principal.scopes.includes("mail")) throw new JmapMethodError("forbidden", "push needs the mail scope");
     if (method === "PushSubscription/get") return get(principal.accountId, args ?? {});
-    if (method === "PushSubscription/set") return set(principal.accountId, args ?? {});
+    // A new subscription belongs to the caller's grant: revoking the grant ends it (audit gateway-data-1).
+    if (method === "PushSubscription/set") return set(principal.accountId, principal.grantId ?? null, args ?? {});
     throw new JmapMethodError("unknownMethod", `${method} is not supported`);
   };
 }
