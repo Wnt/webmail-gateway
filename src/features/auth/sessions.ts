@@ -1,12 +1,17 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
+import type { Queryable } from "../../db/pool.js";
 import type { AppContext } from "../../types.js";
-import { hashToken, newToken, parseCookies, serializeCookie, tokenKind, type CookieOptions } from "./util.js";
+import { asBuffer, hashToken, newToken, parseCookies, serializeCookie, tokenKind, type CookieOptions } from "./util.js";
 
 export interface Session {
   idHash: Buffer;
   accountId: string;
   email: string;
   expiresAt: number;
+  /** The passkey that created the session; deleting it ends the session. */
+  passkeyId: Buffer;
+  /** The account's auth generation, read with the session (see generation.ts). */
+  generation: number;
 }
 
 type Ctx = Pick<AppContext, "config" | "db">;
@@ -30,16 +35,20 @@ export class SessionStore {
     this.cookie = { path: "/", maxAge: Math.floor(ctx.config.auth.sessionTtlMs / 1000), secure, sameSite: "Strict" };
   }
 
-  async create(input: { accountId: string; passkeyId?: Buffer | null; ip?: string | null; userAgent?: string | null }): Promise<string> {
+  /** Call inside the issuing transaction, after `holdAuth`. */
+  async create(
+    input: { accountId: string; passkeyId: Buffer; ip?: string | null; userAgent?: string | null },
+    q: Queryable = this.ctx.db,
+  ): Promise<string> {
     const token = newToken("session");
     const t = this.now();
-    await this.ctx.db.query(
+    await q.query(
       `INSERT INTO auth_session (id_hash, account_id, passkey_id, created_at, last_seen_at, expires_at, ip, user_agent)
        VALUES ($1, $2, $3, $4, $4, $5, $6, $7)`,
       [
         hashToken(token),
         input.accountId,
-        input.passkeyId ?? null,
+        input.passkeyId,
         new Date(t),
         new Date(t + this.ctx.config.auth.sessionTtlMs),
         input.ip ?? null,
@@ -54,8 +63,16 @@ export class SessionStore {
     if (!token || tokenKind(token) !== "session") return null;
     const t = this.now();
     const hash = hashToken(token);
-    const { rows } = await this.ctx.db.query<{ account_id: string; email: string; expires_at: Date; last_seen_at: Date }>(
-      `SELECT s.account_id, a.email, s.expires_at, s.last_seen_at FROM auth_session s JOIN account a ON a.id = s.account_id
+    const { rows } = await this.ctx.db.query<{
+      account_id: string;
+      email: string;
+      expires_at: Date;
+      last_seen_at: Date;
+      passkey_id: Uint8Array;
+      auth_generation: number;
+    }>(
+      `SELECT s.account_id, a.email, s.expires_at, s.last_seen_at, s.passkey_id, a.auth_generation
+       FROM auth_session s JOIN account a ON a.id = s.account_id
        WHERE s.id_hash = $1`,
       [hash],
     );
@@ -64,18 +81,19 @@ export class SessionStore {
     if (t - row.last_seen_at.getTime() > 60_000) {
       await this.ctx.db.query("UPDATE auth_session SET last_seen_at = $2 WHERE id_hash = $1", [hash, new Date(t)]);
     }
-    return { idHash: hash, accountId: row.account_id, email: row.email, expiresAt: row.expires_at.getTime() };
+    return {
+      idHash: hash,
+      accountId: row.account_id,
+      email: row.email,
+      expiresAt: row.expires_at.getTime(),
+      passkeyId: asBuffer(row.passkey_id)!,
+      generation: row.auth_generation,
+    };
   }
 
-  async delete(token: string | undefined): Promise<void> {
+  async delete(token: string | undefined, q: Queryable = this.ctx.db): Promise<void> {
     if (!token || tokenKind(token) !== "session") return;
-    await this.ctx.db.query("DELETE FROM auth_session WHERE id_hash = $1", [hashToken(token)]);
-  }
-
-  /** Every session of an account (bootstrap `--reset`). Returns the count. */
-  async deleteAccount(accountId: string): Promise<number> {
-    const res = await this.ctx.db.query("DELETE FROM auth_session WHERE account_id = $1", [accountId]);
-    return res.rowCount ?? 0;
+    await q.query("DELETE FROM auth_session WHERE id_hash = $1", [hashToken(token)]);
   }
 
   async prune(): Promise<void> {

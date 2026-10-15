@@ -95,7 +95,7 @@
           if (name === null) return;
           await api("PATCH", "/auth/passkeys/" + encodeURIComponent(id), { name: name });
         } else {
-          if (!confirm("Delete the passkey “" + current + "”?")) return;
+          if (!confirm("Delete the passkey “" + current + "”? Anything signed in with it is signed out: its sessions here, and the webmail and notifications it signed in.")) return;
           await api("DELETE", "/auth/passkeys/" + encodeURIComponent(id));
         }
         location.reload();

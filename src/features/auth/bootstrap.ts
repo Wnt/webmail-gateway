@@ -5,9 +5,7 @@ import { getUpstream } from "../../core/upstream/index.js";
 import type { AppContext, CliCommand } from "../../types.js";
 import { audit } from "./audit.js";
 import { createEnrollToken } from "./enroll.js";
-import { SessionStore } from "./sessions.js";
-import { TokenStore } from "./tokens.js";
-import { deleteAllPasskeys } from "./webauthn.js";
+import { resetAccountAuth } from "./generation.js";
 import { createAuthState } from "./state.js";
 
 export interface BootstrapIo {
@@ -61,10 +59,9 @@ export async function runBootstrap(args: string[], ctx: AppContext, io: Bootstra
   await upstream.storeCredential(account, secret);
 
   if (reset) {
-    const s = createAuthState(ctx, now);
-    const passkeys = await deleteAllPasskeys(s, account.id);
-    const sessions = await new SessionStore(ctx, now).deleteAccount(account.id);
-    const grants = await new TokenStore(ctx, now).revokeAccount(account.id, "bootstrap_reset");
+    // Also ends earlier enrollment links, unused codes, pending ceremonies and
+    // push subscriptions, and bumps the auth generation (see generation.ts).
+    const { passkeys, sessions, grants } = await resetAccountAuth(createAuthState(ctx, now), account.id);
     io.stdout.write(`reset: ${passkeys} passkey(s), ${sessions} session(s), ${grants} grant(s) revoked\n`);
   }
 

@@ -5,15 +5,18 @@ import { resetHooks } from "../src/core/hooks.js";
 import { runBootstrap, type BootstrapIo } from "../src/features/auth/bootstrap.js";
 import { createEnrollToken, peekEnrollToken } from "../src/features/auth/enroll.js";
 import { createAuthState } from "../src/features/auth/state.js";
+import { storeChallenge } from "../src/features/auth/webauthn.js";
 import type { AppContext } from "../src/types.js";
 import { startFakeLegacy, type FakeLegacy } from "./fake-legacy.js";
-import { makeTestContext } from "./helpers.js";
+import { addTestPasskey, makeTestContext } from "./helpers.js";
 
 const base = await makeTestContext();
 const legacy: FakeLegacy = await startFakeLegacy(base.config.legacyHmacKey);
 const ctx: AppContext = await makeTestContext({ LEGACY_PROXY_URL: legacy.url });
 await base.db.close();
 let now = Date.parse("2026-10-15T12:00:00Z");
+const getAccountGeneration = async (id: string) =>
+  (await ctx.db.query<{ auth_generation: number }>("SELECT auth_generation FROM account WHERE id = $1", [id])).rows[0]?.auth_generation;
 
 function io(password: string): BootstrapIo & { out: string; err: string } {
   const out = new PassThrough();
@@ -29,7 +32,7 @@ beforeEach(async () => {
   legacy.passwords.clear();
   legacy.calls.length = 0;
   legacy.passwords.set("alice@example.test", "hunter2");
-  await ctx.db.exec("DELETE FROM auth_session; DELETE FROM auth_enroll_token; DELETE FROM passkey; DELETE FROM oauth_grant; DELETE FROM auth_audit; DELETE FROM account");
+  await ctx.db.exec("DELETE FROM auth_session; DELETE FROM auth_challenge; DELETE FROM auth_enroll_token; DELETE FROM passkey; DELETE FROM oauth_grant; DELETE FROM auth_audit; DELETE FROM account");
 });
 afterAll(async () => {
   await legacy.close();
@@ -73,24 +76,20 @@ describe("bootstrap", () => {
     expect(i.err).toContain("unreachable");
   });
 
-  it("--reset wipes passkeys, sessions and grants before issuing the new link", async () => {
+  it("--reset wipes passkeys, sessions, grants, older links, unused codes and ceremonies before issuing the new link", async () => {
     expect(await runBootstrap(["alice@example.test"], ctx, io("hunter2"), () => now)).toBe(0);
     const account = (await getAccountByEmail(ctx, "alice@example.test"))!;
     const s = createAuthState(ctx, () => now);
-    await ctx.db.query("INSERT INTO passkey (id, account_id, public_key, name, created_at) VALUES ($1, $2, $3, 'old', $4)", [
-      Buffer.from("cred-1"),
-      account.id,
-      Buffer.from("k"),
-      new Date(now),
-    ]);
-    const session = await s.sessions.create({ accountId: account.id });
-    const code = await s.store.issueCode({ clientId: "bulwark", accountId: account.id, redirectUri: "https://mail.example.test/en/auth/callback", codeChallenge: "c".repeat(43), scopes: ["mail"] });
-    void code;
+    const passkeyId = await addTestPasskey(ctx, account.id, Buffer.from("cred-1"));
+    const session = await s.sessions.create({ accountId: account.id, passkeyId });
+    await s.store.issueCode({ clientId: "bulwark", accountId: account.id, passkeyId, redirectUri: "https://mail.example.test/en/auth/callback", codeChallenge: "c".repeat(43), scopes: ["mail"] });
     const grant = await ctx.db.query<{ id: string }>(
       "INSERT INTO oauth_grant (client_id, account_id, scopes, created_at, expires_at) VALUES ('bulwark', $1, 'mail', $2, $3) RETURNING id",
       [account.id, new Date(now), new Date(now + 86400_000)],
     );
+    await storeChallenge(s, "enroll", "chal", account.id);
     const { token: older } = await createEnrollToken(ctx, account.id, now);
+    const before = (await getAccountGeneration(account.id))!;
 
     const i = io("hunter2");
     expect(await runBootstrap(["alice@example.test", "--reset"], ctx, i, () => now)).toBe(0);
@@ -98,7 +97,13 @@ describe("bootstrap", () => {
     expect((await ctx.db.query("SELECT 1 FROM passkey")).rows).toHaveLength(0);
     expect(await s.sessions.get(session)).toBeNull();
     expect((await ctx.db.query("SELECT revoked_reason FROM oauth_grant WHERE id = $1", [grant.rows[0]!.id])).rows[0]).toEqual({ revoked_reason: "bootstrap_reset" });
-    // Earlier links keep working until they expire; the new one is separate.
-    expect(await peekEnrollToken(ctx, older, now)).not.toBeNull();
-  });
+    // Nothing issued before the reset survives it: links, unused codes, ceremonies (audit gateway-auth-3).
+    expect(await peekEnrollToken(ctx, older, now)).toBeNull();
+    expect((await ctx.db.query("SELECT 1 FROM oauth_code")).rows).toHaveLength(0);
+    expect((await ctx.db.query("SELECT 1 FROM auth_challenge")).rows).toHaveLength(0);
+    expect(await getAccountGeneration(account.id)).toBe(before + 1);
+    // Only the new link is live.
+    const url = /\/auth\/enroll\/(gwe_[A-Za-z0-9_-]{43})/.exec(i.out)!;
+    expect(await peekEnrollToken(ctx, url[1], now)).toMatchObject({ accountId: account.id, generation: before + 1 });
+});
 });

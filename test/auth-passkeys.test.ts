@@ -313,7 +313,13 @@ describe("passkey management", () => {
     expect((await b.go("PATCH", `/auth/passkeys/${first}`, { name: "   " })).statusCode).toBe(400);
     expect((await b.go("PATCH", "/auth/passkeys/AAAA", { name: "x" })).statusCode).toBe(404);
 
+    // b's session came from enrolling `first`: sign in with `second` so deleting `first` keeps it.
+    const other = new Browser();
+    expect((await login(other, a)).statusCode).toBe(200); // with `first`
+    const opts2 = (await b.go("POST", "/auth/login/options", {})).json();
+    expect((await b.go("POST", "/auth/login/verify", a.authenticate(opts2, {}, second.id))).statusCode).toBe(200);
     expect((await b.go("DELETE", `/auth/passkeys/${first}`)).statusCode).toBe(200);
+    expect((await other.go("GET", "/auth/passkeys")).statusCode).toBe(303); // its passkey is gone, so is its session
     res = await b.go("DELETE", `/auth/passkeys/${second.id}`);
     expect(res.statusCode).toBe(409);
     expect(res.json()).toEqual({ error: "last_passkey" });

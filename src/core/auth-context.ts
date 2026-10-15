@@ -6,6 +6,8 @@ export type Principal = {
   email: string;
   scopes: string[];
   via: "basic" | "oauth";
+  /** OAuth only: the grant behind the token. Push subscriptions are bound to it and die with it. */
+  grantId?: string;
 };
 
 /** Return a Principal if this authenticator recognises the credentials on `req`, else null (never throw for "not mine"). */

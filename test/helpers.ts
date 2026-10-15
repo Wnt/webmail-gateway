@@ -31,3 +31,13 @@ export async function makeTestDb(): Promise<Db> {
 export async function makeTestContext(env: Record<string, string> = {}): Promise<AppContext> {
   return { config: makeTestConfig(env), db: await makeTestDb(), log: pino({ level: "silent" }), fetch };
 }
+
+/** A bare passkey row (no key material) for tests that need one to hang sessions, codes or grants on. */
+export async function addTestPasskey(ctx: Pick<AppContext, "db">, accountId: string, id: Buffer = randomBytes(16)): Promise<Buffer> {
+  await ctx.db.query("INSERT INTO passkey (id, account_id, public_key, name, created_at) VALUES ($1, $2, $3, 'test', now())", [
+    id,
+    accountId,
+    Buffer.from("k"),
+  ]);
+  return id;
+}

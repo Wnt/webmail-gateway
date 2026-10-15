@@ -8,6 +8,8 @@ import {
   type PublicKeyCredentialRequestOptionsJSON,
   type RegistrationResponseJSON,
 } from "@simplewebauthn/server";
+import type { Queryable } from "../../db/pool.js";
+import { lockAccountAuth } from "./generation.js";
 import type { AuthState } from "./state.js";
 import { asBuffer, b64url } from "./util.js";
 
@@ -44,6 +46,7 @@ interface Row {
 }
 
 const COLS = "id, account_id, public_key, counter, transports, aaguid, backed_up, name, created_at, last_used_at";
+const P_COLS = COLS.split(", ").map((c) => `p.${c}`).join(", ");
 const toPasskey = (r: Row): Passkey => ({
   id: asBuffer(r.id)!,
   accountId: r.account_id,
@@ -100,8 +103,8 @@ export async function listPasskeys(s: AuthState, accountId: string): Promise<Pas
   return rows.map(toPasskey);
 }
 
-export async function getPasskey(s: AuthState, id: Buffer): Promise<Passkey | null> {
-  const { rows } = await s.ctx.db.query<Row>(`SELECT ${COLS} FROM passkey WHERE id = $1`, [id]);
+export async function getPasskey(s: AuthState, id: Buffer, q: Queryable = s.ctx.db): Promise<Passkey | null> {
+  const { rows } = await q.query<Row>(`SELECT ${COLS} FROM passkey WHERE id = $1`, [id]);
   return rows[0] ? toPasskey(rows[0]) : null;
 }
 
@@ -110,20 +113,30 @@ export async function renamePasskey(s: AuthState, accountId: string, id: Buffer,
   return (res.rowCount ?? 0) > 0;
 }
 
-/** Refuses to delete the last passkey (`last_passkey`): recovery is the CLI, not an empty account. */
-export async function deletePasskey(s: AuthState, accountId: string, id: Buffer): Promise<"deleted" | "not_found" | "last_passkey"> {
-  return s.ctx.db.transaction(async (tx) => {
-    const { rows } = await tx.query<{ id: Uint8Array }>("SELECT id FROM passkey WHERE account_id = $1 FOR UPDATE", [accountId]);
-    if (!rows.some((r) => asBuffer(r.id)!.equals(id))) return "not_found";
-    if (rows.length <= 1) return "last_passkey";
-    await tx.query("DELETE FROM passkey WHERE id = $1 AND account_id = $2", [id, accountId]);
-    return "deleted";
-  });
-}
+export type DeleteOutcome = { status: "deleted"; sessions: number; grants: number } | { status: "not_found" | "last_passkey" };
 
-export async function deleteAllPasskeys(s: AuthState, accountId: string): Promise<number> {
-  const res = await s.ctx.db.query("DELETE FROM passkey WHERE account_id = $1", [accountId]);
-  return res.rowCount ?? 0;
+/**
+ * Delete a passkey and everything it authorized (audit gateway-auth-2): the
+ * gateway sessions it created, its unused codes (by cascade) and its OAuth
+ * grants, with their tokens and push subscriptions. Grants from before grants
+ * recorded their passkey go too, since any of them may be this one's. Other
+ * passkeys' sessions and grants stay. Refuses to delete the last passkey
+ * (`last_passkey`): recovery is the CLI, not an empty account.
+ */
+export async function deletePasskey(s: AuthState, accountId: string, id: Buffer): Promise<DeleteOutcome> {
+  const out = await s.ctx.db.transaction(async (tx) => {
+    await lockAccountAuth(tx, accountId);
+    const { rows } = await tx.query<{ id: Uint8Array }>("SELECT id FROM passkey WHERE account_id = $1 FOR UPDATE", [accountId]);
+    if (!rows.some((r) => asBuffer(r.id)!.equals(id))) return { status: "not_found" as const };
+    if (rows.length <= 1) return { status: "last_passkey" as const };
+    const sessions = await tx.query("DELETE FROM auth_session WHERE passkey_id = $1 AND account_id = $2", [id, accountId]);
+    const revoked = await s.store.revokeIn(tx, { accountId, passkeyId: id }, "passkey_deleted");
+    await tx.query("DELETE FROM passkey WHERE id = $1 AND account_id = $2", [id, accountId]);
+    return { status: "deleted" as const, sessions: sessions.rowCount ?? 0, revoked };
+  });
+  if (out.status !== "deleted") return out;
+  await s.store.announce(out.revoked, "passkey_deleted");
+  return { status: "deleted", sessions: out.sessions, grants: out.revoked.length };
 }
 
 export const passkeyName = (raw: unknown, fallback: string): string => {
@@ -150,10 +163,14 @@ export async function registrationOptions(s: AuthState, account: { id: string; e
   });
 }
 
+/** A registration response that verified; `storePasskey` writes it. */
+export type NewCredential = NonNullable<Awaited<ReturnType<typeof verifyRegistrationResponse>>["registrationInfo"]>;
+
+/** Verify a registration response (no database writes). */
 export async function verifyRegistration(
   s: AuthState,
-  input: { response: RegistrationResponseJSON; challenge: string; accountId: string; name: string },
-): Promise<Passkey> {
+  input: { response: RegistrationResponseJSON; challenge: string },
+): Promise<NewCredential> {
   let result: Awaited<ReturnType<typeof verifyRegistrationResponse>>;
   try {
     result = await verifyRegistrationResponse({
@@ -168,11 +185,20 @@ export async function verifyRegistration(
     throw new CeremonyError(`registration: ${(err as Error).message}`);
   }
   if (!result.verified) throw new CeremonyError("registration: not verified");
-  const info = result.registrationInfo;
+  return result.registrationInfo;
+}
+
+/** Store a verified credential for `accountId`; call inside the issuing transaction, after `holdAuth`. */
+export async function storePasskey(
+  s: AuthState,
+  q: Queryable,
+  input: { info: NewCredential; accountId: string; name: string },
+): Promise<Passkey> {
+  const { info } = input;
   const id = b64url.decode(info.credential.id);
   const t = s.now();
   try {
-    await s.ctx.db.query(
+    await q.query(
       `INSERT INTO passkey (id, account_id, public_key, counter, transports, aaguid, backed_up, name, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
       [
@@ -194,7 +220,7 @@ export async function verifyRegistration(
     }
     throw err;
   }
-  return (await getPasskey(s, id))!;
+  return (await getPasskey(s, id, q))!;
 }
 
 /** Discoverable-credential request: no `allowCredentials`, user verification required. */
@@ -205,16 +231,22 @@ export async function authenticationOptions(s: AuthState): Promise<PublicKeyCred
 /**
  * Verify an assertion against the passkey named by `response.id`, check that
  * the `userHandle` names the same account, and bump the counter. Returns the
- * passkey (with its account) on success.
+ * passkey (with its account) and the account's auth generation as read with
+ * it, for the issuer's `holdAuth`.
  */
 export async function verifyAuthentication(
   s: AuthState,
   input: { response: AuthenticationResponseJSON; challenge: string },
-): Promise<Passkey> {
+): Promise<{ passkey: Passkey; generation: number }> {
   const r = input.response;
   if (!b64url.is(r?.id) || r.id.length > 1400) throw new CeremonyError("assertion: bad credential id");
-  const passkey = await getPasskey(s, b64url.decode(r.id));
-  if (!passkey) throw new CeremonyError("assertion: unknown credential");
+  const { rows } = await s.ctx.db.query<Row & { auth_generation: number }>(
+    `SELECT ${P_COLS}, a.auth_generation FROM passkey p JOIN account a ON a.id = p.account_id WHERE p.id = $1`,
+    [b64url.decode(r.id)],
+  );
+  if (!rows[0]) throw new CeremonyError("assertion: unknown credential");
+  const passkey = toPasskey(rows[0]);
+  const generation = rows[0].auth_generation;
   const expectedHandle = Buffer.from(passkey.accountId.replace(/-/g, ""), "hex");
   if (!r.response?.userHandle || !b64url.decode(r.response.userHandle).equals(expectedHandle)) {
     throw new CeremonyError("assertion: user handle mismatch");
@@ -240,5 +272,5 @@ export async function verifyAuthentication(
     new Date(s.now()),
     result.authenticationInfo.credentialBackedUp,
   ]);
-  return { ...passkey, counter: result.authenticationInfo.newCounter };
+  return { passkey: { ...passkey, counter: result.authenticationInfo.newCounter }, generation };
 }

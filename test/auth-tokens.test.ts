@@ -12,13 +12,14 @@ import {
 } from "../src/features/auth/tokens.js";
 import { hashToken } from "../src/features/auth/util.js";
 import type { AppContext } from "../src/types.js";
-import { makeTestContext } from "./helpers.js";
+import { addTestPasskey, makeTestContext } from "./helpers.js";
 
 const ctx: AppContext = await makeTestContext();
 let now = Date.parse("2026-10-15T12:00:00Z");
 const clock = () => now;
 const store = new TokenStore(ctx, clock);
 let accountId: string;
+let passkeyId: Buffer;
 let events: TokenRevokedEvent[] = [];
 
 const verifier = randomBytes(32).toString("base64url");
@@ -29,6 +30,7 @@ async function code(overrides: Partial<Parameters<TokenStore["issueCode"]>[0]> =
   return store.issueCode({
     clientId: "bulwark",
     accountId,
+    passkeyId,
     redirectUri: REDIRECT,
     codeChallenge: challenge,
     scopes: ["mail"],
@@ -50,6 +52,7 @@ beforeEach(async () => {
   });
   await ctx.db.exec("DELETE FROM oauth_code; DELETE FROM oauth_grant; DELETE FROM account");
   accountId = (await upsertAccount(ctx, { email: "alice@example.test" })).id;
+  passkeyId = await addTestPasskey(ctx, accountId);
 });
 afterAll(() => ctx.db.close());
 
@@ -65,6 +68,7 @@ describe("authorization codes", () => {
       email: "alice@example.test",
       scopes: ["mail"],
       via: "oauth",
+      grantId: t!.grantId,
     });
 
     expect(await store.redeemCode({ code: c, clientId: "bulwark", redirectUri: REDIRECT, codeVerifier: verifier })).toBeNull();

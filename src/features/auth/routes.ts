@@ -1,9 +1,11 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import { getAccountById } from "../../core/accounts.js";
+import type { Queryable } from "../../db/pool.js";
 import { audit, requestMeta } from "./audit.js";
 import { sameOrigin } from "./csrf.js";
 import { consumeEnrollToken, peekEnrollToken } from "./enroll.js";
+import { holdAuth } from "./generation.js";
 import { clearPendingAuthz, readPendingAuthz } from "./oauth.js";
 import { messagePage, sendPage } from "./pages.js";
 import { openJson, sealJson } from "./sealed.js";
@@ -22,6 +24,7 @@ import {
   registrationOptions,
   renamePasskey,
   storeChallenge,
+  storePasskey,
   verifyAuthentication,
   verifyRegistration,
   type ChallengeKind,
@@ -75,11 +78,18 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     return reply.code(503).send({ error: "temporarily_unavailable" });
   }
 
-  async function startSession(req: FastifyRequest, reply: FastifyReply, accountId: string, passkeyId: Buffer | null): Promise<void> {
+  /** The new session replaces the browser's old one; call inside the issuing transaction. */
+  async function startSession(tx: Queryable, req: FastifyRequest, accountId: string, passkeyId: Buffer): Promise<string> {
     const old = s.sessions.fromRequest(req);
-    if (old) await s.sessions.delete(old);
+    if (old) await s.sessions.delete(old, tx);
     const { ip, userAgent } = requestMeta(req);
-    s.sessions.setCookie(reply, await s.sessions.create({ accountId, passkeyId, ip, userAgent }));
+    return s.sessions.create({ accountId, passkeyId, ip, userAgent }, tx);
+  }
+
+  /** The material a ceremony validated was revoked or reset before anything was issued from it. */
+  function stale(req: FastifyRequest, reply: FastifyReply, event: string, accountId: string, status: number, error: string) {
+    void audit(s.ctx, { event, accountId, ...requestMeta(req), details: { reason: "revoked meanwhile" } }, s.now());
+    return reply.code(status).send({ error });
   }
 
   // --- login (discoverable passkey) ----------------------------------------
@@ -110,9 +120,10 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     if (limited(req, reply, "login", 10)) return;
     const { ip, userAgent } = requestMeta(req);
     let passkey: Passkey;
+    let generation: number;
     try {
       const challenge = await consumeFor(req, "login", null);
-      passkey = await verifyAuthentication(s, { response: body(req) as unknown as AuthenticationResponseJSON, challenge });
+      ({ passkey, generation } = await verifyAuthentication(s, { response: body(req) as unknown as AuthenticationResponseJSON, challenge }));
     } catch (err) {
       return fail(req, reply, "login.fail", err);
     }
@@ -122,19 +133,32 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
       void audit(s.ctx, { event: "login.not_allowed", accountId: passkey.accountId, ip, userAgent }, s.now());
       return reply.code(403).send({ error: "account_not_allowed" });
     }
-    s.limiter.refund("login", req.ip);
-    await startSession(req, reply, account.id, passkey.id);
     const pending = readPendingAuthz(s, req);
+    const issued = await s.ctx.db.transaction(async (tx) => {
+      if (!(await holdAuth(tx, { accountId: account.id, generation, passkeyId: passkey.id }))) return null;
+      const session = await startSession(tx, req, account.id, passkey.id);
+      const code = pending
+        ? await s.store.issueCode(
+            {
+              clientId: pending.client_id,
+              accountId: account.id,
+              passkeyId: passkey.id,
+              redirectUri: pending.redirect_uri,
+              codeChallenge: pending.code_challenge,
+              scopes: pending.scopes,
+              resource: pending.resource,
+            },
+            tx,
+          )
+        : null;
+      return { session, code };
+    });
+    if (!issued) return stale(req, reply, "login.fail", account.id, 400, "verification_failed");
+    s.limiter.refund("login", req.ip);
+    s.sessions.setCookie(reply, issued.session);
     let next = "/auth/passkeys";
-    if (pending) {
-      const code = await s.store.issueCode({
-        clientId: pending.client_id,
-        accountId: account.id,
-        redirectUri: pending.redirect_uri,
-        codeChallenge: pending.code_challenge,
-        scopes: pending.scopes,
-        resource: pending.resource,
-      });
+    if (pending && issued.code) {
+      const code = issued.code;
       clearPendingAuthz(s, reply);
       const url = new URL(pending.redirect_uri);
       url.searchParams.set("code", code);
@@ -194,26 +218,30 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     if (!peek || !token) return reply.code(410).send({ error: "link_expired" });
     const { ip, userAgent } = requestMeta(req);
     const b = body(req);
-    let passkey: Passkey;
+    let issued: { passkey: Passkey; session: string } | null;
     try {
       const challenge = await consumeFor(req, "enroll", peek.accountId);
-      passkey = await verifyRegistration(s, {
-        response: b.response as RegistrationResponseJSON,
-        challenge,
-        accountId: peek.accountId,
-        name: passkeyName(b.name, `Passkey ${new Date(s.now()).toISOString().slice(0, 10)}`),
+      const info = await verifyRegistration(s, { response: b.response as RegistrationResponseJSON, challenge });
+      // Link, passkey and session in one transaction under the generation:
+      // a reset (which deletes the link) is either before it or after it.
+      issued = await s.ctx.db.transaction(async (tx) => {
+        if (!(await holdAuth(tx, { accountId: peek.accountId, generation: peek.generation }))) return null;
+        if ((await consumeEnrollToken(tx, hashToken(token), s.now())) !== peek.accountId) return null;
+        const passkey = await storePasskey(s, tx, {
+          info,
+          accountId: peek.accountId,
+          name: passkeyName(b.name, `Passkey ${new Date(s.now()).toISOString().slice(0, 10)}`),
+        });
+        return { passkey, session: await startSession(tx, req, peek.accountId, passkey.id) };
       });
     } catch (err) {
       return fail(req, reply, "enroll.fail", err, peek.accountId);
     }
-    const consumed = await consumeEnrollToken(s.ctx.db, hashToken(token), s.now());
-    if (consumed !== peek.accountId) {
-      await s.ctx.db.query("DELETE FROM passkey WHERE id = $1", [passkey.id]);
-      return reply.code(410).send({ error: "link_expired" });
-    }
+    if (!issued) return stale(req, reply, "enroll.fail", peek.accountId, 410, "link_expired");
+    const { passkey } = issued;
     clearCookie(reply, CHAL_COOKIE, "/auth");
     clearCookie(reply, ENROLL_COOKIE, "/auth/enroll");
-    await startSession(req, reply, peek.accountId, passkey.id);
+    s.sessions.setCookie(reply, issued.session);
     void audit(s.ctx, { event: "enroll.ok", accountId: peek.accountId, ip, userAgent, details: { passkey: passkey.name } }, s.now());
     return { next: "/auth/passkeys" };
   });
@@ -267,12 +295,22 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const b = body(req);
     try {
       const challenge = await consumeFor(req, "add", session.accountId);
-      const passkey = await verifyRegistration(s, {
-        response: b.response as RegistrationResponseJSON,
-        challenge,
-        accountId: session.accountId,
-        name: passkeyName(b.name, `Passkey ${new Date(s.now()).toISOString().slice(0, 10)}`),
+      const info = await verifyRegistration(s, { response: b.response as RegistrationResponseJSON, challenge });
+      // The session must still be live (not reset, not ended with its passkey) when the passkey is written.
+      const passkey = await s.ctx.db.transaction(async (tx) => {
+        const held = await holdAuth(tx, {
+          accountId: session.accountId,
+          generation: session.generation,
+          session: { idHash: session.idHash, now: s.now() },
+        });
+        if (!held) return null;
+        return storePasskey(s, tx, {
+          info,
+          accountId: session.accountId,
+          name: passkeyName(b.name, `Passkey ${new Date(s.now()).toISOString().slice(0, 10)}`),
+        });
       });
+      if (!passkey) return stale(req, reply, "passkey.add_fail", session.accountId, 401, "no_session");
       clearCookie(reply, CHAL_COOKIE, "/auth");
       void audit(s.ctx, { event: "passkey.add", accountId: session.accountId, ip, userAgent, details: { passkey: passkey.name } }, s.now());
       return { ok: true, id: b64url.encode(passkey.id), name: passkey.name };
@@ -307,9 +345,9 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const id = credentialId(req);
     if (!id) return reply.code(400).send({ error: "invalid_request" });
     const outcome = await deletePasskey(s, session.accountId, id);
-    if (outcome === "not_found") return reply.code(404).send({ error: "not_found" });
-    if (outcome === "last_passkey") return reply.code(409).send({ error: "last_passkey" });
-    void audit(s.ctx, { event: "passkey.delete", accountId: session.accountId, ...requestMeta(req) }, s.now());
+    if (outcome.status !== "deleted") return reply.code(outcome.status === "not_found" ? 404 : 409).send({ error: outcome.status });
+    const details = { sessions: outcome.sessions, grants: outcome.grants };
+    void audit(s.ctx, { event: "passkey.delete", accountId: session.accountId, ...requestMeta(req), details }, s.now());
     return { ok: true };
   });
 

@@ -4,6 +4,7 @@ import { open, seal } from "../../core/crypto.js";
 import { emitTokenRevoked } from "../../core/hooks.js";
 import type { Queryable } from "../../db/pool.js";
 import type { AppContext } from "../../types.js";
+import { holdAuth } from "./generation.js";
 import { asBuffer, deriveKey, hashToken, newToken, pkceMatches, scopes as scopeUtil, tokenKind } from "./util.js";
 
 export const CODE_TTL_MS = 60_000;
@@ -24,7 +25,14 @@ export interface IssuedTokens {
   scopes: string[];
 }
 
-export type RevokeReason = "client_revoke" | "refresh_reuse" | "code_replay" | "bootstrap_reset" | "not_allowed";
+export type RevokeReason = "client_revoke" | "refresh_reuse" | "code_replay" | "bootstrap_reset" | "not_allowed" | "passkey_deleted";
+
+/** A grant revoked inside a transaction; `announce` it once that commits. */
+export interface RevokedGrant {
+  grantId: string;
+  accountId: string;
+  tokenIds: string[];
+}
 
 interface GrantRow {
   id: string;
@@ -60,23 +68,29 @@ export class TokenStore {
 
   // --- authorization codes -------------------------------------------------
 
-  async issueCode(input: {
-    clientId: string;
-    accountId: string;
-    redirectUri: string;
-    codeChallenge: string;
-    scopes: readonly string[];
-    resource?: string | null;
-  }): Promise<string> {
+  /** `passkeyId`: the passkey whose assertion authorized it; the grant inherits it (deleting the passkey revokes the grant). */
+  async issueCode(
+    input: {
+      clientId: string;
+      accountId: string;
+      passkeyId: Buffer;
+      redirectUri: string;
+      codeChallenge: string;
+      scopes: readonly string[];
+      resource?: string | null;
+    },
+    q: Queryable = this.ctx.db,
+  ): Promise<string> {
     const code = newToken("code");
     const t = this.now();
-    await this.ctx.db.query(
-      `INSERT INTO oauth_code (code_hash, client_id, account_id, redirect_uri, code_challenge, scopes, resource, created_at, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    await q.query(
+      `INSERT INTO oauth_code (code_hash, client_id, account_id, passkey_id, redirect_uri, code_challenge, scopes, resource, created_at, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
         hashToken(code),
         input.clientId,
         input.accountId,
+        input.passkeyId,
         input.redirectUri,
         input.codeChallenge,
         scopeUtil.join(input.scopes),
@@ -99,9 +113,26 @@ export class TokenStore {
     const t = this.now();
     let replayOf: string | null = null;
     const issued = await this.ctx.db.transaction(async (tx) => {
+      // The code and the account's auth generation in one snapshot, then the
+      // generation and the code's passkey held before the code is spent: a
+      // reset or passkey deletion either finished first (no grant) or waits
+      // for this grant and revokes it.
+      const live = await tx.query<{ account_id: string; passkey_id: Uint8Array; auth_generation: number }>(
+        `SELECT c.account_id, c.passkey_id, a.auth_generation FROM oauth_code c JOIN account a ON a.id = c.account_id
+         WHERE c.code_hash = $1 AND c.used_at IS NULL AND c.expires_at > $2`,
+        [hash, new Date(t)],
+      );
+      const held = live.rows[0];
+      if (
+        held &&
+        !(await holdAuth(tx, { accountId: held.account_id, generation: held.auth_generation, passkeyId: asBuffer(held.passkey_id)! }))
+      ) {
+        return null;
+      }
       const { rows } = await tx.query<{
         client_id: string;
         account_id: string;
+        passkey_id: Uint8Array;
         redirect_uri: string;
         code_challenge: string;
         scopes: string;
@@ -110,7 +141,7 @@ export class TokenStore {
       }>(
         `UPDATE oauth_code c SET used_at = $2 FROM account a
          WHERE c.code_hash = $1 AND c.used_at IS NULL AND c.expires_at > $2 AND a.id = c.account_id
-         RETURNING c.client_id, c.account_id, c.redirect_uri, c.code_challenge, c.scopes, c.resource, a.email`,
+         RETURNING c.client_id, c.account_id, c.passkey_id, c.redirect_uri, c.code_challenge, c.scopes, c.resource, a.email`,
         [hash, new Date(t)],
       );
       const row = rows[0];
@@ -130,7 +161,14 @@ export class TokenStore {
       ) {
         return null;
       }
-      const grant = await this.createGrant(tx, row.account_id, row.client_id, scopeUtil.parse(row.scopes), row.resource, row.email);
+      const grant = await this.createGrant(tx, {
+        accountId: row.account_id,
+        passkeyId: asBuffer(row.passkey_id)!,
+        clientId: row.client_id,
+        scopes: scopeUtil.parse(row.scopes),
+        resource: row.resource,
+        email: row.email,
+      });
       await tx.query("UPDATE oauth_code SET grant_id = $2 WHERE code_hash = $1", [hash, grant.grantId]);
       return grant;
     });
@@ -140,17 +178,14 @@ export class TokenStore {
 
   private async createGrant(
     tx: Queryable,
-    accountId: string,
-    clientId: string,
-    scopes: string[],
-    resource: string | null,
-    email: string,
+    g: { accountId: string; passkeyId: Buffer; clientId: string; scopes: string[]; resource: string | null; email: string },
   ): Promise<IssuedTokens> {
+    const { accountId, clientId, scopes, email } = g;
     const t = this.now();
     const { rows } = await tx.query<{ id: string }>(
-      `INSERT INTO oauth_grant (client_id, account_id, scopes, resource, created_at, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [clientId, accountId, scopeUtil.join(scopes), resource, new Date(t), new Date(t + GRANT_TTL_MS)],
+      `INSERT INTO oauth_grant (client_id, account_id, passkey_id, scopes, resource, created_at, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+      [clientId, accountId, g.passkeyId, scopeUtil.join(scopes), g.resource, new Date(t), new Date(t + GRANT_TTL_MS)],
     );
     const grantId = rows[0]!.id;
     const pair = await this.mint(tx, grantId);
@@ -252,24 +287,54 @@ export class TokenStore {
 
   /** Revoke a grant: its tokens are deleted, the grant row stays for the record, listeners are told. */
   async revokeGrant(grantId: string, reason: RevokeReason): Promise<void> {
-    const t = this.now();
-    const tokenIds = await this.ctx.db.transaction(async (tx) => {
-      const { rows } = await tx.query<{ id: string; account_id: string }>(
-        "UPDATE oauth_grant SET revoked_at = $2, revoked_reason = $3 WHERE id = $1 AND revoked_at IS NULL RETURNING id, account_id",
-        [grantId, new Date(t), reason],
-      );
-      if (!rows[0]) return null;
-      const ats = await tx.query<{ token_hash: Uint8Array }>(
-        "DELETE FROM oauth_access_token WHERE grant_id = $1 RETURNING token_hash",
-        [grantId],
-      );
-      await tx.query("DELETE FROM oauth_refresh_token WHERE grant_id = $1", [grantId]);
-      return { accountId: rows[0].account_id, ids: ats.rows.map((r) => asBuffer(r.token_hash)!.toString("hex")) };
-    });
-    if (!tokenIds) return;
-    for (const id of tokenIds.ids) this.cache.delete(id);
-    this.ctx.log?.info({ grantId, reason, accountId: tokenIds.accountId }, "oauth grant revoked");
-    await emitTokenRevoked({ grantId, accountId: tokenIds.accountId, tokenIds: tokenIds.ids });
+    await this.announce(await this.ctx.db.transaction((tx) => this.revokeIn(tx, { grantId }, reason)), reason);
+  }
+
+  /**
+   * Revoke, inside `tx`, the live grants that match: one grant, every grant of
+   * an account, or (`passkeyId`) the account's grants authorized by that
+   * passkey plus those from before grants recorded their passkey. Revocation
+   * is durable: the grant row's `revoked_at` is what push and token checks
+   * read. Call `announce` with the result after the commit.
+   */
+  async revokeIn(
+    tx: Queryable,
+    which: { grantId: string } | { accountId: string; passkeyId?: Buffer },
+    reason: RevokeReason,
+  ): Promise<RevokedGrant[]> {
+    const t = new Date(this.now());
+    const { rows } =
+      "grantId" in which
+        ? await tx.query<{ id: string; account_id: string }>(
+            "UPDATE oauth_grant SET revoked_at = $2, revoked_reason = $3 WHERE id = $1 AND revoked_at IS NULL RETURNING id, account_id",
+            [which.grantId, t, reason],
+          )
+        : which.passkeyId
+          ? await tx.query<{ id: string; account_id: string }>(
+              `UPDATE oauth_grant SET revoked_at = $3, revoked_reason = $4
+               WHERE account_id = $1 AND (passkey_id = $2 OR passkey_id IS NULL) AND revoked_at IS NULL RETURNING id, account_id`,
+              [which.accountId, which.passkeyId, t, reason],
+            )
+          : await tx.query<{ id: string; account_id: string }>(
+              "UPDATE oauth_grant SET revoked_at = $2, revoked_reason = $3 WHERE account_id = $1 AND revoked_at IS NULL RETURNING id, account_id",
+              [which.accountId, t, reason],
+            );
+    const out: RevokedGrant[] = [];
+    for (const g of rows) {
+      const ats = await tx.query<{ token_hash: Uint8Array }>("DELETE FROM oauth_access_token WHERE grant_id = $1 RETURNING token_hash", [g.id]);
+      await tx.query("DELETE FROM oauth_refresh_token WHERE grant_id = $1", [g.id]);
+      out.push({ grantId: g.id, accountId: g.account_id, tokenIds: ats.rows.map((r) => asBuffer(r.token_hash)!.toString("hex")) });
+    }
+    return out;
+  }
+
+  /** After the revoking transaction committed: drop cached tokens, log, tell listeners (open streams close, A4). */
+  async announce(revoked: RevokedGrant[], reason: RevokeReason): Promise<void> {
+    for (const r of revoked) {
+      for (const id of r.tokenIds) this.cache.delete(id);
+      this.ctx.log?.info({ grantId: r.grantId, reason, accountId: r.accountId }, "oauth grant revoked");
+      await emitTokenRevoked(r);
+    }
   }
 
   /** RFC 7009: revoke by token. Unknown tokens and other clients' tokens are silently ignored. */
@@ -298,14 +363,11 @@ export class TokenStore {
     }
   }
 
-  /** Every live grant of an account (bootstrap `--reset`). Returns how many were revoked. */
+  /** Every live grant of an account. Returns how many were revoked. */
   async revokeAccount(accountId: string, reason: RevokeReason): Promise<number> {
-    const { rows } = await this.ctx.db.query<{ id: string }>(
-      "SELECT id FROM oauth_grant WHERE account_id = $1 AND revoked_at IS NULL",
-      [accountId],
-    );
-    for (const r of rows) await this.revokeGrant(r.id, reason);
-    return rows.length;
+    const revoked = await this.ctx.db.transaction((tx) => this.revokeIn(tx, { accountId }, reason));
+    await this.announce(revoked, reason);
+    return revoked.length;
   }
 
   // --- bearer authentication -----------------------------------------------
@@ -327,7 +389,13 @@ export class TokenStore {
     const row = rows[0];
     if (!row || row.revoked_at || row.at_expires_at.getTime() <= t || row.expires_at.getTime() <= t) return null;
     if (!this.allowed(row.email)) return null;
-    const principal: Principal = { accountId: row.account_id, email: row.email, scopes: scopeUtil.parse(row.scopes), via: "oauth" };
+    const principal: Principal = {
+      accountId: row.account_id,
+      email: row.email,
+      scopes: scopeUtil.parse(row.scopes),
+      via: "oauth",
+      grantId: row.id,
+    };
     if (this.cache.size >= CACHE_MAX) this.cache.delete(this.cache.keys().next().value!);
     this.cache.set(id, { principal, until: Math.min(t + CACHE_TTL_MS, row.at_expires_at.getTime()) });
     return principal;

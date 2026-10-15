@@ -9,7 +9,7 @@ import { AUTHZ_COOKIE, readPendingAuthz } from "../src/features/auth/oauth.js";
 import { createAuthState } from "../src/features/auth/state.js";
 import { hashToken } from "../src/features/auth/util.js";
 import type { AppContext } from "../src/types.js";
-import { makeTestContext } from "./helpers.js";
+import { addTestPasskey, makeTestContext } from "./helpers.js";
 
 const SECRET = "s".repeat(40);
 const BASE = "https://mail.example.test";
@@ -21,6 +21,7 @@ const app: FastifyInstance = Fastify();
 await app.register(makeAuthPlugin({ now: () => now }), ctx);
 await app.ready();
 let accountId: string;
+let passkeyId: Buffer;
 
 const verifier = randomBytes(32).toString("base64url");
 const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -43,13 +44,14 @@ const post = (url: string, body: Record<string, string>, headers: Record<string,
 const tokenReq = (body: Record<string, string>) => post("/oauth/token", { client_id: "bulwark", client_secret: SECRET, ...body });
 
 async function codeFor(): Promise<string> {
-  return state.store.issueCode({ clientId: "bulwark", accountId, redirectUri: REDIRECT, codeChallenge: challenge, scopes: ["mail"] });
+  return state.store.issueCode({ clientId: "bulwark", accountId, passkeyId, redirectUri: REDIRECT, codeChallenge: challenge, scopes: ["mail"] });
 }
 
 beforeEach(async () => {
   resetHooks();
   await ctx.db.exec("DELETE FROM auth_session; DELETE FROM oauth_code; DELETE FROM oauth_grant; DELETE FROM auth_audit; DELETE FROM account");
   accountId = (await upsertAccount(ctx, { email: "alice@example.test" })).id;
+  passkeyId = await addTestPasskey(ctx, accountId);
 });
 afterAll(async () => {
   await app.close();
@@ -172,7 +174,7 @@ describe("POST /oauth/token", () => {
 
     // The core authenticator now recognises the bearer token.
     const principal = await authenticate({ headers: { authorization: `Bearer ${t1.access_token}` } } as never);
-    expect(principal).toEqual({ accountId, email: "alice@example.test", scopes: ["mail"], via: "oauth" });
+    expect(principal).toEqual({ accountId, email: "alice@example.test", scopes: ["mail"], via: "oauth", grantId: expect.any(String) });
 
     // Replaying the code is invalid_grant and kills the grant.
     res = await tokenReq({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: verifier });
@@ -236,7 +238,7 @@ describe("POST /oauth/token", () => {
 
 describe("GET /oauth/end_session", () => {
   it("ends the gateway session and goes to a registered post-logout URI, else shows a page", async () => {
-    const token = await state.sessions.create({ accountId });
+    const token = await state.sessions.create({ accountId, passkeyId });
     let res = await app.inject({
       method: "GET",
       url: `/oauth/end_session?client_id=bulwark&post_logout_redirect_uri=${encodeURIComponent(BASE + "/")}&state=abc`,
