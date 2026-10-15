@@ -30,6 +30,9 @@ interface FakeAccount {
   inboxId: string;
   emails: FakeEmail[];
   subs: Map<string, FakeSub>;
+  /** Email state counter and its change log (created ids), for Email/changes. */
+  state: number;
+  log: { state: number; id: string }[];
 }
 
 export type VerifyMode = "before-reply" | "after-reply" | "never" | "wrong-code";
@@ -43,8 +46,12 @@ export interface FakeLegacyPush {
   verifyMode: VerifyMode;
   /** When set, every /jmap call answers this HTTP status. */
   failStatus: number | null;
+  /** "cannot": Email/changes always answers cannotCalculateChanges. */
+  changesMode: "normal" | "cannot";
   calls: string[];
   account(slug: string): FakeAccount;
+  /** Store a message (a new Email state with it in the change log) without any StateChange. */
+  addEmail(slug: string, email: Partial<FakeEmail> & { id: string }): FakeEmail;
   /** Simulate an IDLE arrival: add the mail and POST a StateChange to every verified EmailDelivery sub. */
   deliver(slug: string, email: Partial<FakeEmail> & { id: string }): Promise<number[]>;
   /** Wipe an account entirely (volume lost): subs and ids gone, slug unknown. */
@@ -63,19 +70,20 @@ export async function startFakeLegacyPush(hmacKey: Buffer): Promise<FakeLegacyPu
     data: new Map(),
     verifyMode: "after-reply",
     failStatus: null,
+    changesMode: "normal",
     calls: [],
     account(slug) {
       let a = this.data.get(slug);
       if (!a) {
         const n = nextLegacyId++;
-        a = { legacyAccountId: String(n), inboxId: `mb-inbox-${n}`, emails: [], subs: new Map() };
+        a = { legacyAccountId: String(n), inboxId: `mb-inbox-${n}`, emails: [], subs: new Map(), state: 0, log: [] };
         this.data.set(slug, a);
       }
       return a;
     },
-    async deliver(slug, partial) {
+    addEmail(slug, partial) {
       const a = this.account(slug);
-      a.emails.push({
+      const e: FakeEmail = {
         threadId: `t-${partial.id}`,
         mailboxId: a.inboxId,
         from: [{ name: "Alice Example", email: "alice@example.com" }],
@@ -84,7 +92,15 @@ export async function startFakeLegacyPush(hmacKey: Buffer): Promise<FakeLegacyPu
         receivedAt: new Date().toISOString(),
         keywords: {},
         ...partial,
-      });
+      };
+      a.emails.push(e);
+      a.state++;
+      a.log.push({ state: a.state, id: e.id });
+      return e;
+    },
+    async deliver(slug, partial) {
+      const a = this.account(slug);
+      this.addEmail(slug, partial);
       const out: number[] = [];
       for (const s of a.subs.values()) {
         if (!s.verified || (s.types && !s.types.includes("EmailDelivery"))) continue;
@@ -188,10 +204,34 @@ export async function startFakeLegacyPush(hmacKey: Buffer): Promise<FakeLegacyPu
             .map((id) => a.emails.find((e) => e.id === id))
             .filter(Boolean)
             .map((e) => {
-              const { mailboxId: _m, ...rest } = e!;
-              return rest;
+              const { mailboxId, ...rest } = e!;
+              return { ...rest, mailboxIds: { [mailboxId]: true } };
             });
-          results.push([name, { list, notFound: [] }, callId]);
+          results.push([name, { accountId: a.legacyAccountId, state: String(a.state), list, notFound: [] }, callId]);
+          break;
+        }
+        case "Email/changes": {
+          const since = Number(args.sinceState);
+          if (fake.changesMode === "cannot" || !Number.isInteger(since) || since > a.state) {
+            results.push(["error", { type: "cannotCalculateChanges" }, callId]);
+            break;
+          }
+          const pending = a.log.filter((l) => l.state > since);
+          const page = pending.slice(0, Number(args.maxChanges ?? 1000));
+          const more = page.length < pending.length;
+          results.push([
+            name,
+            {
+              accountId: a.legacyAccountId,
+              oldState: String(since),
+              newState: String(more ? page[page.length - 1]!.state : a.state),
+              hasMoreChanges: more,
+              created: page.map((l) => l.id),
+              updated: [],
+              destroyed: [],
+            },
+            callId,
+          ]);
           break;
         }
         case "PushSubscription/get": {

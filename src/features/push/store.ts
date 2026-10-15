@@ -245,6 +245,8 @@ export interface Upstream {
   nextAttemptAt: Date | null;
   attempts: number;
   lastError: string | null;
+  /** Last processed JMAP Email state (for Email/changes), or null. */
+  emailState: string | null;
 }
 
 interface UpstreamRow {
@@ -263,6 +265,7 @@ interface UpstreamRow {
   next_attempt_at: Date | null;
   attempts: number;
   last_error: string | null;
+  email_state: string | null;
 }
 
 const toUpstream = (r: UpstreamRow): Upstream => ({
@@ -281,6 +284,7 @@ const toUpstream = (r: UpstreamRow): Upstream => ({
   nextAttemptAt: r.next_attempt_at,
   attempts: r.attempts,
   lastError: r.last_error,
+  emailState: r.email_state,
 });
 
 const UPSTREAM_COLS: Record<keyof Omit<Upstream, "accountId">, string> = {
@@ -298,6 +302,7 @@ const UPSTREAM_COLS: Record<keyof Omit<Upstream, "accountId">, string> = {
   nextAttemptAt: "next_attempt_at",
   attempts: "attempts",
   lastError: "last_error",
+  emailState: "email_state",
 };
 
 export async function getUpstream(db: Queryable, accountId: string): Promise<Upstream | null> {

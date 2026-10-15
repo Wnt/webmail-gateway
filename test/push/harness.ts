@@ -58,7 +58,7 @@ export async function makeHarness(opts: PushTestOptions = {}, env: Record<string
   await app.register(
     makePushPlugin({
       sender: { retryDelaysMs: [5, 5, 5] },
-      pipeline: { recheckDelaysMs: [40, 80], errorRetryDelaysMs: [40] },
+      pipeline: { errorRetryDelaysMs: [40], changesPageSize: 2 },
       upstream: { verifyTimeoutMs: 600, verifyPollMs: 20 },
       ...opts,
       onRuntime: (r) => (rt = r),
@@ -87,6 +87,7 @@ export async function makeHarness(opts: PushTestOptions = {}, env: Record<string
       legacy.calls.length = 0;
       legacy.verifyMode = "after-reply";
       legacy.failStatus = null;
+      legacy.changesMode = "normal";
       pushSvc.requests.length = 0;
       pushSvc.script.clear();
       rt.stats.reset();

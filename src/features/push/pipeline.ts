@@ -16,14 +16,24 @@ import type { PushStats } from "./stats.js";
 import { claimEmails, getUpstream, targetsForAccount, updateUpstream } from "./store.js";
 
 /**
- * New-mail pipeline (design/push.md section 5): on an EmailDelivery
- * StateChange (or a catch-up sweep) fetch the newest INBOX mail through
- * legacy-proxy, claim the new messages atomically, emit `onNewMail`, and send
- * one push per device.
+ * New-mail pipeline (design/push.md section 5), written against plain JMAP so
+ * the upstream can be any RFC 8620/8621 server:
+ *
+ * - On an EmailDelivery StateChange: `Email/changes` from the last Email state
+ *   we processed, `Email/get` of the created ids, keep the ones in the Inbox.
+ *   No known state, or `cannotCalculateChanges`: fall back to a query.
+ * - Sweep (the reconciler's safety net for missed StateChanges): `Email/query`
+ *   of the newest unseen Inbox mail.
+ *
+ * New messages are claimed atomically (dedupe), announced with `onNewMail`,
+ * and pushed once per device. Transient errors get a generic retry/backoff.
  */
 
 const QUERY_LIMIT = 20;
+const CHANGES_PAGE = 100;
+const CHANGES_MAX_PAGES = 10;
 const CLOCK_SKEW_MS = 2 * 60_000;
+const EMAIL_PROPS = ["id", "threadId", "mailboxIds", "from", "subject", "preview", "receivedAt", "keywords"];
 
 export interface TriggerEvent {
   /** EmailDelivery state from the StateChange. */
@@ -32,20 +42,19 @@ export interface TriggerEvent {
   legacyAccountId?: string;
   /** When the StateChange arrived. */
   at: Date;
-  /** How many "not visible yet" re-runs already happened for this event. */
-  recheck?: number;
 }
 
 export interface PipelineOptions {
-  /** Re-runs when a StateChange found nothing yet (message not visible in Email/query). */
-  recheckDelaysMs?: number[];
-  /** Re-runs after a legacy-proxy error. */
+  /** Re-runs after a transient error (legacy-proxy unreachable, 5xx, method error). */
   errorRetryDelaysMs?: number[];
+  /** `maxChanges` per Email/changes call. */
+  changesPageSize?: number;
 }
 
 interface EmailLite {
   id: string;
   threadId: string;
+  mailboxIds: Record<string, boolean> | null;
   from: JmapAddress[] | null;
   subject: string | null;
   preview: string | null;
@@ -57,6 +66,7 @@ interface RunState {
   running: Promise<void> | null;
   rerun: boolean;
   event: TriggerEvent | null;
+  sweep: boolean;
   errorAttempt: number;
 }
 
@@ -66,20 +76,25 @@ class JmapCallError extends Error {
   }
 }
 
-function response(res: JmapResponse, callId: string): Record<string, unknown> {
+function response(res: JmapResponse, callId: string, name: string): Record<string, unknown> {
   const r = res.methodResponses.find(([, , id]) => id === callId);
   if (!r) throw new JmapCallError("missingResponse");
   if (r[0] === "error") throw new JmapCallError(String((r[1] as { type?: unknown }).type ?? "unknown"));
+  if (r[0] !== name) throw new JmapCallError("unexpectedResponse");
   return r[1];
 }
+
+const emailList = (g: Record<string, unknown>): EmailLite[] =>
+  Array.isArray(g.list) ? (g.list as EmailLite[]).filter((e) => e && typeof e.id === "string") : [];
 
 export class Pipeline {
   private runs = new Map<string, RunState>();
   private inbox = new Map<string, { legacyAccountId: string; inboxId: string }>();
+  private forgetState = new Set<string>();
   private timers = new Set<NodeJS.Timeout>();
   private stopped = false;
-  private readonly recheckDelays: number[];
   private readonly errorDelays: number[];
+  private readonly changesPage: number;
 
   constructor(
     private readonly ctx: AppContext,
@@ -87,13 +102,14 @@ export class Pipeline {
     private readonly sender: Sender,
     opts: PipelineOptions = {},
   ) {
-    this.recheckDelays = opts.recheckDelaysMs ?? [2_000, 10_000];
     this.errorDelays = opts.errorRetryDelaysMs ?? [5_000, 30_000];
+    this.changesPage = opts.changesPageSize ?? CHANGES_PAGE;
   }
 
-  /** Forget cached legacy ids (after a re-login legacy-proxy may hand out new ones, D10). */
+  /** Forget cached ids and the Email state (after a re-login legacy-proxy may hand out new ones, D10). */
   invalidate(accountId: string): void {
     this.inbox.delete(accountId);
+    this.forgetState.add(accountId);
   }
 
   stop(): void {
@@ -110,16 +126,18 @@ export class Pipeline {
   }
 
   /**
-   * Run the pipeline for an account. Single flight per account: a trigger
-   * while a run is in progress makes that run loop once more.
+   * Run the pipeline for an account: with an event for a StateChange, without
+   * one for a sweep. Single flight per account: a trigger while a run is in
+   * progress makes that run loop once more (a pending sweep is not dropped).
    */
   trigger(accountId: string, event?: TriggerEvent): Promise<void> {
     let st = this.runs.get(accountId);
     if (!st) {
-      st = { running: null, rerun: false, event: null, errorAttempt: 0 };
+      st = { running: null, rerun: false, event: null, sweep: false, errorAttempt: 0 };
       this.runs.set(accountId, st);
     }
     if (event) st.event = event;
+    else st.sweep = true;
     if (st.running) {
       st.rerun = true;
       return st.running;
@@ -130,9 +148,11 @@ export class Pipeline {
         do {
           s.rerun = false;
           const ev = s.event;
+          const sweep = s.sweep;
           s.event = null;
+          s.sweep = false;
           try {
-            await this.runOnce(accountId, ev);
+            await this.runOnce(accountId, ev, sweep);
             s.errorAttempt = 0;
           } catch (err) {
             this.stats.inc("pipeline_error");
@@ -182,15 +202,51 @@ export class Pipeline {
     const res = await legacyJmap(this.ctx, account, [
       ["Mailbox/query", { accountId: legacyAccountId, filter: { role: "inbox" }, limit: 1 }, "mb"],
     ]);
-    const ids = response(res, "mb").ids;
+    const ids = response(res, "mb", "Mailbox/query").ids;
     const inboxId = Array.isArray(ids) && typeof ids[0] === "string" ? ids[0] : null;
     if (!inboxId) throw new Error("no inbox mailbox");
     this.inbox.set(account.id, { legacyAccountId, inboxId });
     return inboxId;
   }
 
-  private async fetchNewest(account: Account, legacyAccountId: string): Promise<EmailLite[]> {
-    const inboxId = await this.inboxId(account, legacyAccountId);
+  /** Created messages since `sinceState` (all pages). Throws JmapCallError("cannotCalculateChanges"). */
+  private async fetchChanges(
+    account: Account,
+    legacyAccountId: string,
+    sinceState: string,
+  ): Promise<{ emails: EmailLite[]; state: string | null }> {
+    const emails: EmailLite[] = [];
+    let state = sinceState;
+    for (let page = 0; page < CHANGES_MAX_PAGES; page++) {
+      const calls: JmapMethodCall[] = [
+        ["Email/changes", { accountId: legacyAccountId, sinceState: state, maxChanges: this.changesPage }, "c"],
+        [
+          "Email/get",
+          {
+            accountId: legacyAccountId,
+            "#ids": { resultOf: "c", name: "Email/changes", path: "/created" },
+            properties: EMAIL_PROPS,
+          },
+          "g",
+        ],
+      ];
+      const res = await legacyJmap(this.ctx, account, calls, [JMAP_CORE, JMAP_MAIL]);
+      const c = response(res, "c", "Email/changes");
+      emails.push(...emailList(response(res, "g", "Email/get")));
+      if (typeof c.newState !== "string") throw new JmapCallError("missingNewState");
+      state = c.newState;
+      if (c.hasMoreChanges !== true) return { emails, state };
+    }
+    // Still more after many pages: let the next run continue from here.
+    return { emails, state };
+  }
+
+  /** The newest unseen Inbox messages, and the Email state they were read at. */
+  private async fetchNewest(
+    account: Account,
+    legacyAccountId: string,
+    inboxId: string,
+  ): Promise<{ emails: EmailLite[]; state: string | null }> {
     const calls: JmapMethodCall[] = [
       [
         "Email/query",
@@ -207,7 +263,7 @@ export class Pipeline {
         {
           accountId: legacyAccountId,
           "#ids": { resultOf: "q", name: "Email/query", path: "/ids" },
-          properties: ["id", "threadId", "from", "subject", "preview", "receivedAt", "keywords"],
+          properties: EMAIL_PROPS,
         },
         "g",
       ],
@@ -215,35 +271,53 @@ export class Pipeline {
     let res: JmapResponse;
     try {
       res = await legacyJmap(this.ctx, account, calls, [JMAP_CORE, JMAP_MAIL]);
-      response(res, "q");
+      response(res, "q", "Email/query");
     } catch (err) {
       // A stale cached inbox id (D10): drop it so the next run looks it up again.
       if (err instanceof JmapCallError) this.inbox.delete(account.id);
       throw err;
     }
-    const list = response(res, "g").list;
-    return Array.isArray(list) ? (list as EmailLite[]).filter((e) => e && typeof e.id === "string") : [];
+    const g = response(res, "g", "Email/get");
+    return { emails: emailList(g), state: typeof g.state === "string" ? g.state : null };
   }
 
-  private async runOnce(accountId: string, ev: TriggerEvent | null): Promise<void> {
+  private async runOnce(accountId: string, ev: TriggerEvent | null, sweep: boolean): Promise<void> {
     const account = await getAccountById(this.ctx, accountId);
     const up = await getUpstream(this.ctx.db, accountId);
     if (!account || !up || up.status === "none") return;
 
     const legacyAccountId = await this.legacyAccountIdFor(account, ev?.legacyAccountId ?? up.legacyAccountId);
-    if (legacyAccountId !== up.legacyAccountId) {
-      await updateUpstream(this.ctx.db, accountId, { legacyAccountId });
+    let knownState = up.emailState;
+    if (legacyAccountId !== up.legacyAccountId || this.forgetState.delete(accountId)) {
+      knownState = null;
+      await updateUpstream(this.ctx.db, accountId, { legacyAccountId, emailState: null });
     }
-    const emails = await this.fetchNewest(account, legacyAccountId);
+    const inboxId = await this.inboxId(account, legacyAccountId);
+
+    let fetched: { emails: EmailLite[]; state: string | null } | null = null;
+    if (!sweep && knownState) {
+      try {
+        fetched = await this.fetchChanges(account, legacyAccountId, knownState);
+        this.stats.inc("pipeline_changes");
+      } catch (err) {
+        if (!(err instanceof JmapCallError && err.type === "cannotCalculateChanges")) throw err;
+        this.stats.inc("pipeline_changes_fallback");
+      }
+    }
+    if (!fetched) {
+      fetched = await this.fetchNewest(account, legacyAccountId, inboxId);
+      this.stats.inc(sweep ? "pipeline_sweep" : "pipeline_query");
+    }
 
     const now = Date.now();
     const baseline = (up.baselineAt ?? up.verifiedAt ?? new Date(now)).getTime() - CLOCK_SKEW_MS;
     const oldest = now - this.ctx.config.push.maxNotifyAgeMs;
     const candidates: (EmailLite & { at: number })[] = [];
-    for (const e of emails) {
+    for (const e of fetched.emails) {
       const at = Date.parse(e.receivedAt);
       const kw = Object.fromEntries(Object.entries(e.keywords ?? {}).map(([k, v]) => [k.toLowerCase(), v]));
-      if (kw["$seen"]) this.stats.inc("mail_skipped_seen");
+      if (!e.mailboxIds?.[inboxId]) this.stats.inc("mail_skipped_not_inbox");
+      else if (kw["$seen"]) this.stats.inc("mail_skipped_seen");
       else if (kw["$junk"]) this.stats.inc("mail_skipped_junk");
       else if (kw["$draft"]) this.stats.inc("mail_skipped_draft");
       else if (!Number.isFinite(at) || at < baseline || at < oldest) this.stats.inc("mail_skipped_old");
@@ -256,20 +330,12 @@ export class Pipeline {
       candidates.map((c) => ({ emailId: c.id, receivedAt: new Date(c.at) })),
     );
     this.stats.inc("mail_duplicate", candidates.length - won.size);
-    const fresh = candidates.filter((c) => won.has(c.id)).sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
-
-    if (fresh.length === 0) {
-      // StateChange but nothing visible yet: legacy-proxy's query may lag the IDLE event.
-      const n = ev?.recheck ?? 0;
-      const evAt = ev?.at.getTime() ?? 0;
-      const sawIt = emails.some((e) => Date.parse(e.receivedAt) >= evAt - CLOCK_SKEW_MS);
-      const delay = this.recheckDelays[n];
-      if (ev && !sawIt && delay !== undefined) {
-        this.stats.inc("pipeline_recheck");
-        this.later(delay, () => this.trigger(accountId, { ...ev, recheck: n + 1 }));
-      }
-      return;
+    // Advance only after the claim: a crash before this re-reads the same changes, and the claim dedupes them.
+    if (fetched.state && fetched.state !== knownState) {
+      await updateUpstream(this.ctx.db, accountId, { emailState: fetched.state });
     }
+    const fresh = candidates.filter((c) => won.has(c.id)).sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
+    if (fresh.length === 0) return;
 
     const items = fresh.map((e) => ({
       emailId: e.id,
@@ -284,6 +350,7 @@ export class Pipeline {
     this.stats.inc("mail_notified", announced.length);
     this.stats.inc("mail_capped", items.length - announced.length);
     const newest = announced[announced.length - 1]!;
+    const newestReceivedAt = fresh[fresh.length - 1]!.at;
     const payload: PushPayload = fitPayload({
       kind: "email",
       accountLabel: account.email,
@@ -299,9 +366,19 @@ export class Pipeline {
       return;
     }
     const outcomes = await this.sender.sendAll(targets, payload, topicFor(accountId, legacyAccountId));
-    const latencyMs = ev ? Date.now() - ev.at.getTime() : null;
+    const sentAt = Date.now();
     this.ctx.log.info(
-      { accountId, messages: items.length, devices: targets.length, ok: outcomes.filter((o) => o === "ok").length, latencyMs },
+      {
+        accountId,
+        messages: items.length,
+        devices: targets.length,
+        ok: outcomes.filter((o) => o === "ok").length,
+        via: sweep ? "sweep" : "event",
+        // newest message's receivedAt -> push sent (includes the server's clock skew)
+        latencyMs: sentAt - newestReceivedAt,
+        // StateChange arrival -> push sent, when a StateChange triggered this run
+        eventLatencyMs: ev ? sentAt - ev.at.getTime() : null,
+      },
       "push: new mail pushed",
     );
   }

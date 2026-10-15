@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import { pino } from "pino";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { onNewMail, type NewMailEvent } from "../../src/core/hooks.js";
 import { makePushPlugin } from "../../src/features/push/index.js";
@@ -285,16 +286,7 @@ describe("new-mail pipeline", () => {
     const acc = await setup("dev-mail-0004");
     const up = await getUpstream(h.ctx.db, acc.account.id);
     const fa = h.legacy.account(acc.slug);
-    fa.emails.push({
-      id: "dup",
-      threadId: "t",
-      mailboxId: fa.inboxId,
-      from: null,
-      subject: null,
-      preview: null,
-      receivedAt: new Date().toISOString(),
-      keywords: {},
-    });
+    h.legacy.addEmail(acc.slug, { id: "dup", from: null, subject: null, preview: null });
     await Promise.all(
       Array.from({ length: 5 }, () =>
         fetch(`${h.appUrl}/internal/push/jmap/${up!.hookId}`, {
@@ -311,18 +303,64 @@ describe("new-mail pipeline", () => {
     expect(decoded(acc.browser).email).toEqual({ from: "", subject: "", preview: "" });
   });
 
-  it("re-checks when the message is not visible yet", async () => {
+  it("finds new mail with Email/changes from the last processed state", async () => {
     const acc = await setup("dev-mail-0005");
+    expect((await getUpstream(h.ctx.db, acc.account.id))?.emailState).toBe(String(h.legacy.account(acc.slug).state));
+    h.legacy.calls.length = 0;
+    await h.legacy.deliver(acc.slug, { id: "c1" });
+    await until(() => h.pushSvc.requests.length === 1);
+    expect(h.legacy.calls).toContain("Email/changes");
+    expect(h.legacy.calls).not.toContain("Email/query");
+    expect((await getUpstream(h.ctx.db, acc.account.id))?.emailState).toBe(String(h.legacy.account(acc.slug).state));
+    // pages through hasMoreChanges
+    for (let i = 0; i < 3; i++) h.legacy.addEmail(acc.slug, { id: `page${i}` });
+    await h.legacy.deliver(acc.slug, { id: "page3" });
+    await until(() => events.length === 5);
+    expect(events.map((e) => e.event.emailId)).toEqual(["c1", "page0", "page1", "page2", "page3"]);
+  });
+
+  it("logs push latency from receivedAt and from the StateChange", async () => {
+    const acc = await setup("dev-mail-0013");
+    const lines: Record<string, unknown>[] = [];
+    const saved = h.ctx.log;
+    h.ctx.log = pino({ level: "info" }, { write: (l: string) => void lines.push(JSON.parse(l) as Record<string, unknown>) });
+    try {
+      await h.legacy.deliver(acc.slug, { id: "lat1", receivedAt: new Date(Date.now() - 1500).toISOString() });
+      await until(() => lines.some((l) => l.msg === "push: new mail pushed"));
+    } finally {
+      h.ctx.log = saved;
+    }
+    const line = lines.find((l) => l.msg === "push: new mail pushed")!;
+    expect(line).toMatchObject({ via: "event", messages: 1, devices: 1, ok: 1 });
+    expect(line.latencyMs).toBeGreaterThanOrEqual(1500);
+    expect(line.eventLatencyMs).toEqual(expect.any(Number));
+    expect(JSON.stringify(line)).not.toContain("Hello"); // no subject or preview in logs
+  });
+
+  it("falls back to a query when the server cannot calculate changes", async () => {
+    const acc = await setup("dev-mail-0010");
+    h.legacy.changesMode = "cannot";
+    await h.legacy.deliver(acc.slug, { id: "fb1" });
+    await until(() => h.pushSvc.requests.length === 1);
+    expect(decoded(acc.browser).emailIds).toEqual(["fb1"]);
+    expect(h.rt.stats.get("pipeline_changes_fallback")).toBe(1);
+  });
+
+  it("ignores created messages outside the Inbox", async () => {
+    const acc = await setup("dev-mail-0011");
+    await h.legacy.deliver(acc.slug, { id: "filed", mailboxId: "mb-elsewhere" });
+    await until(() => h.rt.stats.get("mail_skipped_not_inbox") === 1);
+    await h.rt.idle();
+    expect(h.pushSvc.requests).toHaveLength(0);
+  });
+
+  it("leaves mail the server did not report to the sweep (no timing workarounds)", async () => {
+    const acc = await setup("dev-mail-0012");
     const up = await getUpstream(h.ctx.db, acc.account.id);
     const fa = h.legacy.account(acc.slug);
-    await fetch(`${h.appUrl}/internal/push/jmap/${up!.hookId}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ "@type": "StateChange", changed: { [fa.legacyAccountId]: { EmailDelivery: "late" } } }),
-    });
-    await sleep(15);
+    // A server that announces EmailDelivery but whose Email/changes misses the message.
     fa.emails.push({
-      id: "late",
+      id: "unlogged",
       threadId: "t",
       mailboxId: fa.inboxId,
       from: null,
@@ -331,20 +369,27 @@ describe("new-mail pipeline", () => {
       receivedAt: new Date().toISOString(),
       keywords: {},
     });
-    await until(() => h.pushSvc.requests.length === 1);
-    expect(decoded(acc.browser).emailIds).toEqual(["late"]);
-    expect(h.rt.stats.get("pipeline_recheck")).toBeGreaterThan(0);
+    await fetch(`${h.appUrl}/internal/push/jmap/${up!.hookId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ "@type": "StateChange", changed: { [fa.legacyAccountId]: { EmailDelivery: "late" } } }),
+    });
+    await until(() => h.rt.stats.get("pipeline_changes") >= 1);
+    await sleep(100);
+    await h.rt.idle();
+    expect(h.pushSvc.requests).toHaveLength(0);
+    await h.rt.tick(); // the reconcile sweep queries and finds it
+    await h.rt.idle();
+    expect(h.pushSvc.requests).toHaveLength(1);
+    expect(decoded(acc.browser).emailIds).toEqual(["unlogged"]);
   });
 
   it("caps a flood at 10 ids, newest last, and keeps the payload small", async () => {
     const acc = await setup("dev-mail-0006");
-    const fa = h.legacy.account(acc.slug);
     const base = Date.now();
     for (let i = 0; i < 14; i++) {
-      fa.emails.push({
+      h.legacy.addEmail(acc.slug, {
         id: `f${String(i).padStart(2, "0")}`,
-        threadId: "t",
-        mailboxId: fa.inboxId,
         from: [{ name: "\u{1F600}".repeat(100), email: "x@example.com" }],
         subject: "\u{1F600}".repeat(300),
         preview: "\u00e4".repeat(400),
