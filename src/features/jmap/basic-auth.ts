@@ -7,7 +7,7 @@ import { getGandiPassword, normalizeEmail, setGandiPassword, upsertAccount } fro
 import type { Principal } from "../../core/auth-context.js";
 import type { AppContext } from "../../types.js";
 import { FixedWindowLimiter, Semaphore, type Bucket, type Clock } from "./limiter.js";
-import type { Upstream } from "./upstream.js";
+import type { LegacyUpstream } from "../../core/upstream/index.js";
 
 /** Thrown by the authenticator when the request is ours but must not get a plain 401. */
 export class AuthHttpError extends Error {
@@ -41,7 +41,7 @@ export class BasicAuth {
 
   constructor(
     private readonly ctx: AppContext,
-    private readonly upstream: Upstream,
+    private readonly upstream: LegacyUpstream,
     private readonly now: Clock = Date.now,
   ) {
     const rl = ctx.config.jmap.rateLimit;

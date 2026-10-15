@@ -1,6 +1,7 @@
 // JMAP API request handling: validation and the PushSubscription batch split
 // (design/jmap.md section 6). Pure logic; transport is injected.
 import { JmapMethodError } from "../../core/hooks.js";
+import { LEGACY_CAPABILITIES } from "../../core/upstream/index.js";
 import { harvestCreatedIds, RefError, resolveArgs, type Args, type CreatedIds, type MethodResponse, type Prior } from "./refs.js";
 
 export interface Envelope {
@@ -15,17 +16,8 @@ export interface ResponseEnvelope {
   createdIds?: Record<string, string>;
 }
 
-/** Capabilities legacy-proxy accepts in `using` (its src/jmap/capabilities.ts KNOWN_CAPABILITIES). */
-export const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set([
-  "urn:ietf:params:jmap:core",
-  "urn:ietf:params:jmap:mail",
-  "urn:ietf:params:jmap:submission",
-  "urn:ietf:params:jmap:vacationresponse",
-  "urn:bulwark:params:jmap:sieve",
-  "urn:ietf:params:jmap:contacts",
-  "https://bulwarkmail.com/ns/jmap/keywords",
-  "urn:ietf:params:jmap:emailpush",
-]);
+/** Capabilities legacy-proxy accepts in `using` (the legacy upstream's set). */
+export const KNOWN_CAPABILITIES: ReadonlySet<string> = LEGACY_CAPABILITIES;
 
 const CORE = "urn:ietf:params:jmap:core";
 
@@ -38,8 +30,11 @@ export type Validation =
 
 const isObj = (v: unknown): v is Args => !!v && typeof v === "object" && !Array.isArray(v);
 
-/** RFC 8620 section 3.3 Request shape, call count, and (when `checkUsing`) known capabilities. */
-export function validateEnvelope(body: unknown, maxCalls: number, checkUsing: boolean): Validation {
+/**
+ * RFC 8620 section 3.3 Request shape, call count, and known capabilities:
+ * `known` is the upstream's set, `true` the legacy set, `false` no check.
+ */
+export function validateEnvelope(body: unknown, maxCalls: number, known: boolean | ReadonlySet<string>): Validation {
   const notRequest = { ok: false as const, status: 400, type: "urn:ietf:params:jmap:error:notRequest" };
   if (!isObj(body)) return notRequest;
   const { using, methodCalls, createdIds } = body;
@@ -56,8 +51,9 @@ export function validateEnvelope(body: unknown, maxCalls: number, checkUsing: bo
   if (methodCalls.length > maxCalls) {
     return { ok: false, status: 400, type: "urn:ietf:params:jmap:error:limit", extra: { limit: "maxCallsInRequest" } };
   }
-  if (checkUsing) {
-    const bad = (using as string[]).find((u) => !KNOWN_CAPABILITIES.has(u));
+  if (known !== false) {
+    const set = known === true ? KNOWN_CAPABILITIES : known;
+    const bad = (using as string[]).find((u) => !set.has(u));
     if (bad !== undefined) {
       return { ok: false, status: 400, type: "urn:ietf:params:jmap:error:unknownCapability", extra: { detail: `Unknown capability: ${bad}` } };
     }

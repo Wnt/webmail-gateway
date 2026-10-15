@@ -1,5 +1,6 @@
 // JMAP proxy (design/jmap.md). Every Bulwark JMAP request passes through here
-// on its way to legacy-proxy, authenticated with a minted legacy-proxy token.
+// on its way to the upstream (core/upstream: legacy-proxy with a minted token,
+// or a native JMAP server with the account's sealed credential).
 import { createHash, randomInt } from "node:crypto";
 import { pipeline } from "node:stream";
 import type { FastifyReply, FastifyRequest } from "fastify";
@@ -12,7 +13,14 @@ import { AuthHttpError, BasicAuth } from "./basic-auth.js";
 import { copyResponseHeaders, forwardHeaders, JMAP_ERR, retryAfter, sendProblem } from "./http.js";
 import { isSession, rewriteSession, templateDrift } from "./session.js";
 import { ByteCounter, SizeLimitError, SseRegistry, type SseHandle } from "./streams.js";
-import { Upstream, UpstreamError, type UpstreamRequest, type UpstreamResponse } from "./upstream.js";
+import {
+  getUpstream,
+  LegacyUpstream,
+  UpstreamError,
+  type Target,
+  type UpstreamRequest,
+  type UpstreamResponse,
+} from "../../core/upstream/index.js";
 
 const ACCOUNT_CACHE_MS = 60_000;
 const REQUIRED_SCOPE = "mail"; // D7
@@ -22,20 +30,24 @@ const UPLOAD_PATH = /^\/jmap\/upload\/([^/?#]+)$/;
 const EVENTSOURCE_PATH = /^\/jmap\/eventsource(\?[^#]*)?$/;
 
 /**
- * No `.`/`..` segment, raw or percent-encoded, may reach legacy-proxy. An
- * encoded `/` is fine: the {type} segment carries one (`text%2Fplain`), and
- * legacy-proxy routes on the raw path.
+ * Decode the path segments of a download or upload URL. No `.`/`..` segment,
+ * raw or percent-encoded, may reach the upstream (null). An encoded `/` is
+ * fine: the {type} segment carries one (`text%2Fplain`); the upstream gets it
+ * re-encoded into its own template.
  */
-function safeSegments(segments: string[]): boolean {
-  return segments.every((s) => {
+function decodeSegments(segments: string[]): string[] | null {
+  const out: string[] = [];
+  for (const s of segments) {
     let d: string;
     try {
       d = decodeURIComponent(s);
     } catch {
-      return false;
+      return null;
     }
-    return d !== "." && d !== "..";
-  });
+    if (d === "." || d === "..") return null;
+    out.push(d);
+  }
+  return out;
 }
 
 interface Gate {
@@ -45,8 +57,10 @@ interface Gate {
 
 export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
   const cfg = ctx.config.jmap;
-  const upstream = new Upstream(ctx);
-  const basic = cfg.passwordMode ? new BasicAuth(ctx, upstream) : null;
+  const upstream = getUpstream(ctx);
+  // Password mode needs an upstream that verifies the Basic credentials itself (legacy-proxy against Gandi).
+  const basic = cfg.passwordMode && upstream instanceof LegacyUpstream ? new BasicAuth(ctx, upstream) : null;
+  if (cfg.passwordMode && !basic) ctx.log.warn({ upstream: upstream.kind }, "JMAP_PASSWORD_MODE ignored: not supported by this upstream");
   const unregister = basic ? registerAuthenticator(basic.authenticate) : null;
   const sse = new SseRegistry(cfg.sse.maxPerAccount, cfg.sse.maxTotal);
   const accounts = new Map<string, { account: Account; at: number }>();
@@ -54,10 +68,10 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
   const meta = new WeakMap<FastifyRequest, Record<string, unknown>>();
   const jsonParser = app.getDefaultJsonParser("error", "error");
 
-  upstream.onAuthLost = (id) => {
+  const offAuthLost = upstream.onAuthLost((id) => {
     basic?.invalidateAccount(id);
     accounts.delete(id);
-  };
+  });
 
   // D8: a revoked grant's streams close at once (the 1 h max age is the backstop).
   const offRevoked = onTokenRevoked((e) => sse.endTokens(e.accountId, new Set(e.tokenIds), "revoked"));
@@ -65,8 +79,8 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
   app.addHook("preClose", async () => sse.endAll("shutdown"));
   app.addHook("onClose", async () => {
     offRevoked();
+    offAuthLost();
     unregister?.();
-    await upstream.close();
   });
 
   // One line per request. Fastify's own request logging is silenced on these
@@ -178,8 +192,8 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
 
   async function fetchSession(req: FastifyRequest, reply: FastifyReply, account: Account) {
     const res = await call(req, reply, account, {
+      target: { kind: "session" },
       method: "GET",
-      path: "/jmap/session",
       headers: forwardHeaders(req, { acceptEncoding: false }),
       replayable: true,
       headersTimeout: 30_000,
@@ -195,8 +209,10 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
       sendProblem(reply, 502);
       return null;
     }
-    const drift = templateDrift(body);
-    if (drift.length > 0) ctx.log.warn({ fields: drift }, "legacy-proxy session URL templates changed");
+    if (upstream.kind === "legacy") {
+      const drift = templateDrift(body);
+      if (drift.length > 0) ctx.log.warn({ fields: drift }, "legacy-proxy session URL templates changed");
+    }
     if (typeof body["state"] === "string") sessionStates.set(account.id, body["state"]);
     return body;
   }
@@ -239,14 +255,15 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
     }
     const calls = (parsed as { methodCalls?: unknown } | null)?.methodCalls;
     const hasPush = Array.isArray(calls) && calls.some((c) => Array.isArray(c) && typeof c[0] === "string" && isPushCall(c[0]));
-    const v = validateEnvelope(parsed, cfg.maxCallsInRequest, hasPush);
+    // Split path only: every forwarded segment must be acceptable to the upstream.
+    const v = validateEnvelope(parsed, cfg.maxCallsInRequest, hasPush ? await upstream.knownCapabilities(g.account) : false);
     if (!v.ok) return sendProblem(reply, v.status, v.type, v.extra);
     note(req, { calls: v.env.methodCalls.map((c) => c[0]), path: hasPush ? "split" : "fast" });
 
     if (!hasPush) {
       const res = await call(req, reply, g.account, {
+        target: { kind: "api" },
         method: "POST",
-        path: "/jmap",
         headers: { ...forwardHeaders(req, { acceptEncoding: true }), "content-type": "application/json", "content-length": String(raw.length) },
         body: raw,
         replayable: true,
@@ -264,8 +281,8 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
       const out = await runSplit(v.env, {
         forward: async (sub) => {
           const r = await upstream.request(g.account, {
+            target: { kind: "api" },
             method: "POST",
-            path: "/jmap",
             headers: { "content-type": "application/json", "accept-encoding": "identity", "x-request-id": String(req.id) },
             body: JSON.stringify(sub),
             replayable: true,
@@ -286,8 +303,8 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
           const known = sessionStates.get(g.account.id);
           if (known) return known;
           const r = await upstream.request(g.account, {
+            target: { kind: "session" },
             method: "GET",
-            path: "/jmap/session",
             headers: { "accept-encoding": "identity" },
             replayable: true,
             headersTimeout: 30_000,
@@ -315,14 +332,17 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
   // attachment names can be longer. The path is validated and forwarded raw.
   app.get("/jmap/download/*", { logLevel: "silent" }, async (req, reply) => {
     const m = DOWNLOAD_PATH.exec(req.raw.url ?? "");
-    if (!m || !safeSegments(m.slice(1, 5) as string[])) return sendProblem(reply, 404);
+    const seg = m ? decodeSegments(m.slice(1, 5) as string[]) : null;
+    if (!m || !seg) return sendProblem(reply, 404);
     const g = await gate(req, reply);
     if (!g) return reply;
 
+    const [accountId, blobId, type, name] = seg as [string, string, string, string];
+    const target: Target = { kind: "download", accountId, blobId, type, name, ...(m[5] ? { query: m[5].slice(1) } : {}) };
     const ac = new AbortController();
     const res = await call(req, reply, g.account, {
+      target,
       method: "GET",
-      path: req.raw.url!,
       headers: forwardHeaders(req, { acceptEncoding: true }),
       replayable: true,
       signal: ac.signal,
@@ -352,7 +372,8 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
     sub.addContentTypeParser("*", (_req, _payload, done) => done(null));
     sub.post("/jmap/upload/:accountId", { logLevel: "silent" }, async (req, reply) => {
       const m = UPLOAD_PATH.exec(req.raw.url ?? "");
-      if (!m || !safeSegments([m[1]!])) return sendProblem(reply.header("connection", "close"), 404);
+      const seg = m ? decodeSegments([m[1]!]) : null;
+      if (!seg) return sendProblem(reply.header("connection", "close"), 404);
       const g = await gate(req, reply);
       if (!g) return reply.header("connection", "close");
 
@@ -380,8 +401,8 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
       let res: UpstreamResponse | null;
       try {
         res = await call(req, reply, g.account, {
+          target: { kind: "upload", accountId: seg[0]! },
           method: "POST",
-          path: req.raw.url!,
           headers,
           body: counter,
           replayable: false,
@@ -424,9 +445,15 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
 
     let res: UpstreamResponse | null;
     try {
+      const q = new URLSearchParams(url.includes("?") ? url.slice(url.indexOf("?") + 1) : "");
+      const target: Target = { kind: "eventsource" };
+      for (const k of ["types", "closeafter", "ping"] as const) {
+        const v = q.get(k);
+        if (v !== null) target[k] = v;
+      }
       res = await call(req, reply, g.account, {
+        target,
         method: "GET",
-        path: url,
         headers: { accept: "text/event-stream", "accept-encoding": "identity", "x-request-id": String(req.id) },
         replayable: true,
         signal: ac.signal,

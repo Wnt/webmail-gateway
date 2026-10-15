@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { pino } from "pino";
 import type { Config } from "./config.js";
+import { closeUpstream } from "./core/upstream/index.js";
 import { authPlugin } from "./features/auth/index.js";
 import { jmapPlugin } from "./features/jmap/index.js";
 import { pushPlugin } from "./features/push/index.js";
@@ -15,6 +16,8 @@ export async function buildApp(config: Config, deps: AppDeps): Promise<FastifyIn
   const ctx: AppContext = { config, db: deps.db, log, fetch: deps.fetch ?? fetch };
 
   const app = Fastify({ loggerInstance: log, trustProxy: true });
+  // The upstream (core/upstream) is shared by every feature; its connections close with the app.
+  app.addHook("onClose", async () => closeUpstream(ctx));
 
   // Liveness: the process is up. No dependencies on purpose.
   app.get("/healthz", async () => ({ status: "ok" }));

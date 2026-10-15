@@ -1,6 +1,7 @@
 import { loadConfig } from "./config.js";
 import { migrate } from "./db/migrate.js";
 import { createPgDb } from "./db/pool.js";
+import { closeUpstream } from "./core/upstream/index.js";
 import { authCliCommands } from "./features/auth/index.js";
 import { jmapCliCommands } from "./features/jmap/index.js";
 import { pushCliCommands } from "./features/push/index.js";
@@ -35,6 +36,7 @@ try {
   console.error(err instanceof Error ? err.message : err);
   code = 1;
 } finally {
+  await closeUpstream(ctx);
   await db.close();
 }
 process.exit(code);

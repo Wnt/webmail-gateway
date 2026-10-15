@@ -1,11 +1,20 @@
-// Session object rewrite (design/jmap.md section 4). URLs come from fixed
-// templates on PUBLIC_BASE_URL, never from legacy-proxy's PUBLIC_URL; IDs and
-// state pass through unchanged (P2).
+// Session object rewrite (design/jmap.md section 4). The public URLs come from
+// fixed templates on PUBLIC_BASE_URL, whatever the upstream's own templates are
+// (core/upstream maps each public request onto them); IDs and state pass
+// through unchanged (P2).
 
 export const CORE = "urn:ietf:params:jmap:core";
-const WEBSOCKET = "urn:ietf:params:jmap:websocket";
+/**
+ * Capabilities that do not work through the gateway, so they are never
+ * advertised: WebSocket (not proxied), and emailpush (PushSubscription is
+ * answered by the gateway's push feature, which does not implement it, D5).
+ */
+export const UNSUPPORTED_CAPABILITIES: ReadonlySet<string> = new Set([
+  "urn:ietf:params:jmap:websocket",
+  "urn:ietf:params:jmap:emailpush",
+]);
 
-/** The paths legacy-proxy uses. If an upgrade changes them, `templateDrift` reports it. */
+/** The public URL templates. They equal legacy-proxy's; if a legacy upgrade changes those, `templateDrift` reports it. */
 export const TEMPLATES = {
   apiUrl: "/jmap",
   downloadUrl: "/jmap/download/{accountId}/{blobId}/{type}/{name}",
@@ -59,7 +68,7 @@ export function rewriteSession(s: Obj, o: RewriteOptions): Obj {
   out["username"] = o.email;
 
   const caps: Obj = { ...(s["capabilities"] as Obj) };
-  delete caps[WEBSOCKET];
+  for (const c of UNSUPPORTED_CAPABILITIES) delete caps[c];
   const core: Obj = isObj(caps[CORE]) ? { ...caps[CORE] } : {};
   core["maxSizeUpload"] = clamp(core["maxSizeUpload"], o.maxSizeUpload);
   core["maxSizeRequest"] = clamp(core["maxSizeRequest"], o.maxSizeRequest);
@@ -69,7 +78,19 @@ export function rewriteSession(s: Obj, o: RewriteOptions): Obj {
 
   const accounts: Obj = {};
   for (const [id, a] of Object.entries(s["accounts"] as Obj)) {
-    accounts[id] = isObj(a) ? { ...a, name: o.email } : a;
+    if (!isObj(a)) {
+      accounts[id] = a;
+      continue;
+    }
+    const out: Obj = { ...a };
+    // Shared accounts (isPersonal: false, e.g. on Fastmail) keep their own names.
+    if (a["isPersonal"] !== false) out["name"] = o.email;
+    if (isObj(a["accountCapabilities"])) {
+      const ac: Obj = { ...a["accountCapabilities"] };
+      for (const c of UNSUPPORTED_CAPABILITIES) delete ac[c];
+      out["accountCapabilities"] = ac;
+    }
+    accounts[id] = out;
   }
   out["accounts"] = accounts;
   return out;

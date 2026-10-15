@@ -1,3 +1,4 @@
+import { hkdfSync } from "node:crypto";
 import { open, seal } from "./crypto.js";
 import type { CoreContext } from "../types.js";
 
@@ -80,4 +81,44 @@ export async function getGandiPassword(ctx: Ctx, accountId: string): Promise<str
   const secret = rows[0]?.gandi_secret;
   if (!secret) return null;
   return open(secret, ctx.config.encKey, accountId).toString("utf8");
+}
+
+/** A native JMAP upstream credential (src/core/upstream/jmap.ts). Never logged or returned to clients. */
+export interface UpstreamCredential {
+  /** How it is sent: `Authorization: Bearer <secret>` or `Basic <username:secret>`. */
+  auth: "bearer" | "basic";
+  /** The upstream login name for Basic. */
+  username: string;
+  secret: string;
+}
+
+// A6: a purpose key derived from GATEWAY_ENC_KEY, so these values cannot be opened as anything else.
+const upstreamKeys = new WeakMap<Buffer, Buffer>();
+function upstreamKey(encKey: Buffer): Buffer {
+  let k = upstreamKeys.get(encKey);
+  if (!k) {
+    k = Buffer.from(hkdfSync("sha256", encKey, Buffer.alloc(0), "webmail-gateway/upstream-credential", 32));
+    upstreamKeys.set(encKey, k);
+  }
+  return k;
+}
+
+/** Seal and store the account's upstream credential (replacing any previous one). */
+export async function setUpstreamCredential(ctx: Ctx, accountId: string, cred: UpstreamCredential): Promise<void> {
+  const sealed = seal(JSON.stringify({ v: 1, ...cred }), upstreamKey(ctx.config.encKey), accountId);
+  const res = await ctx.db.query("UPDATE account SET upstream_secret = $2 WHERE id = $1", [accountId, sealed]);
+  if (!res.rowCount) throw new Error("no such account");
+}
+
+/** The account's upstream credential, or null when none is stored (or the account does not exist). */
+export async function getUpstreamCredential(ctx: Ctx, accountId: string): Promise<UpstreamCredential | null> {
+  const { rows } = await ctx.db.query<{ upstream_secret: Uint8Array | null }>(
+    "SELECT upstream_secret FROM account WHERE id = $1",
+    [accountId],
+  );
+  const sealed = rows[0]?.upstream_secret;
+  if (!sealed) return null;
+  const v = JSON.parse(open(sealed, upstreamKey(ctx.config.encKey), accountId).toString("utf8")) as Partial<UpstreamCredential>;
+  if ((v.auth !== "bearer" && v.auth !== "basic") || typeof v.secret !== "string" || typeof v.username !== "string") return null;
+  return { auth: v.auth, username: v.username, secret: v.secret };
 }
