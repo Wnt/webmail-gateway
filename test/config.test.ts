@@ -8,6 +8,7 @@ const base = () => ({
   GATEWAY_ENC_KEY: b64(),
   LEGACY_SESSION_HMAC_KEY: b64(),
   LEGACY_PROXY_URL: "http://legacy-proxy:8080/",
+  PUBLIC_BASE_URL: "https://mail.example.test/",
 });
 
 describe("loadConfig", () => {
@@ -17,6 +18,8 @@ describe("loadConfig", () => {
     expect(c.legacyProxyUrl).toBe("http://legacy-proxy:8080");
     expect(c.encKey).toHaveLength(32);
     expect(c.legacyHmacKey).toHaveLength(32);
+    expect(c.publicBaseUrl).toBe("https://mail.example.test");
+    expect(c.legacyProvider).toBe("gandi");
     expect(c.jmap).toEqual({});
     expect(c.auth).toEqual({});
     expect(c.push).toEqual({});

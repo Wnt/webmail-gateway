@@ -67,14 +67,14 @@ export function registerPushSubscriptionHandler(fn: PushSubscriptionHandler): ()
 
 /**
  * Called by the JMAP proxy instead of forwarding `PushSubscription/*` to legacy-proxy.
- * Throws `JmapMethodError("unknownMethod")` when no push feature is registered.
+ * Throws `JmapMethodError("forbidden")` when no push feature is registered (D6).
  */
 export async function handlePushSubscription(
   principal: Principal,
   method: string,
   args: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  if (!pushHandler) throw new JmapMethodError("unknownMethod", `${method} is not available`);
+  if (!pushHandler) throw new JmapMethodError("forbidden", `${method} is not available`);
   return pushHandler(principal, method, args);
 }
 

@@ -53,9 +53,9 @@ describe("new-mail bus", () => {
 });
 
 describe("PushSubscription handler", () => {
-  it("answers unknownMethod when nothing is registered", async () => {
+  it("answers forbidden when nothing is registered", async () => {
     await expect(handlePushSubscription(principal, "PushSubscription/get", {})).rejects.toMatchObject({
-      type: "unknownMethod",
+      type: "forbidden",
     });
     await expect(handlePushSubscription(principal, "PushSubscription/get", {})).rejects.toBeInstanceOf(JmapMethodError);
   });
@@ -68,7 +68,7 @@ describe("PushSubscription handler", () => {
     expect(h).toHaveBeenCalledWith(principal, "PushSubscription/get", { ids: null });
   });
 
-  it("propagates handler JMAP errors; unregister restores unknownMethod", async () => {
+  it("propagates handler JMAP errors; unregister restores forbidden", async () => {
     const off = registerPushSubscriptionHandler(async () => {
       throw new JmapMethodError("invalidArguments", "bad");
     });
@@ -78,7 +78,7 @@ describe("PushSubscription handler", () => {
     });
     off();
     await expect(handlePushSubscription(principal, "PushSubscription/set", {})).rejects.toMatchObject({
-      type: "unknownMethod",
+      type: "forbidden",
     });
   });
 });

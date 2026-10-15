@@ -70,6 +70,11 @@ const relogins = new Map<string, Promise<boolean>>();
  * request makes it verify the Gandi credentials against IMAP and store them.
  * Returns false when we have no stored password or legacy-proxy rejects it.
  */
+export function relogin(ctx: Ctx, account: LegacyAccount): Promise<boolean> {
+  return reloginWithBasic(ctx, account);
+}
+
+// Shared by `relogin` and the 401 path of `legacyFetch`.
 function reloginWithBasic(ctx: Ctx, account: LegacyAccount): Promise<boolean> {
   const inflight = relogins.get(account.id);
   if (inflight) return inflight;

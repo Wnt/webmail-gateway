@@ -8,8 +8,10 @@ Where the skeleton differs from or extends `COORDINATION.md` (the contract file 
 
 - **State is passed in, not global.** The contract lists names only. Every function that touches state takes a leading context: `ctx: { config, db }` (a full `AppContext` works) for `accounts.*` and `legacy*`. `mintLegacyToken(slug, username, key?, nowSec?)` has two optional trailing arguments; the key defaults to `LEGACY_SESSION_HMAC_KEY` from the environment, and the gateway itself passes `config.legacyHmacKey`.
 - **`hooks` and `auth-context` are process-wide registries** (as the contract's free functions imply). `registerAuthenticator`, `onNewMail` and `registerPushSubscriptionHandler` return an unregister function; `resetAuthenticators()` and `resetHooks()` exist for tests.
-- **`handlePushSubscription`** returns the method's response arguments, and throws `JmapMethodError(type, description)` (for example `unknownMethod` when no push feature is registered). The JMAP proxy turns that into `["error", {type, description}, callId]`.
+- **`handlePushSubscription`** returns the method's response arguments, and throws `JmapMethodError(type, description)` (`forbidden` when no push feature is registered, per D6). The JMAP proxy turns that into `["error", {type, description}, callId]`.
 - **Additions:** `src/types.ts` (`AppContext`, `FeaturePlugin`, `CliCommand`); each feature's `index.ts` exports `<feature>Plugin` and `<feature>CliCommands` (merged into `src/cli.ts`); `parse<Feature>Config(env)` in each feature's `config.ts`; `src/core/token.ts` (the raw HMAC token code); `test/helpers.ts` and `test/fake-legacy.ts` for feature tests.
+- **`relogin(ctx, account)`** is exported from `core/legacy` (D2): the Basic re-login that `legacyFetch` does on 401, for callers that stream and cannot use `legacyFetch`'s retry.
+- **Core config** adds `PUBLIC_BASE_URL` (required) and `LEGACY_PROVIDER` (default `gandi`) as `config.publicBaseUrl` / `config.legacyProvider` (D1, P4).
 - **Image tags** are `ghcr.io/wnt/webmail-gateway:sha-<full 40-char commit sha>` and `:main`.
 
 ## What and why
