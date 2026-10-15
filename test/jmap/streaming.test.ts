@@ -239,6 +239,21 @@ describe("EventSource", () => {
     expect(gw.logs.join("\n")).toContain('"closeReason":"revoked"');
   });
 
+  it("ends the streams of a revoked token only (hooks.onTokenRevoked)", async () => {
+    const { createHash } = await import("node:crypto");
+    const { emitTokenRevoked } = await import("../../src/core/hooks.js");
+    const { res } = await open();
+    const it = res.body[Symbol.asyncIterator]();
+    await it.next();
+    await emitTokenRevoked({ grantId: "g", accountId: account.id, tokenIds: ["0".repeat(64)] });
+    expect(eventSourceStreamCount(account.id)).toBe(1);
+    await emitTokenRevoked({ grantId: "g", accountId: account.id, tokenIds: [createHash("sha256").update("client").digest("hex")] });
+    let done = false;
+    for (let i = 0; i < 5 && !done; i++) done = !!(await it.next()).done;
+    expect(done).toBe(true);
+    expect(eventSourceStreamCount(account.id)).toBe(0);
+  });
+
   it("closes after the maximum age", async () => {
     const short = await startGateway(db, fake.url, { JMAP_SSE_MAX_AGE_SEC: "1" });
     try {

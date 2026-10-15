@@ -24,6 +24,8 @@ export class ByteCounter extends Transform {
 
 export interface SseHandle {
   accountId: string;
+  /** sha256 hex of the client's bearer token, when it used one (matches hooks' TokenRevokedEvent.tokenIds). */
+  tokenId?: string;
   /** End the stream cleanly (max age, shutdown, revocation). */
   end(reason: string): void;
 }
@@ -57,6 +59,13 @@ export class SseRegistry {
   /** End every stream of one account (for revocation, D8). */
   endAccount(accountId: string, reason: string): void {
     for (const h of [...(this.byAccount.get(accountId) ?? [])]) h.end(reason);
+  }
+
+  /** End the streams opened with one of these tokens (an OAuth grant was revoked, D8). */
+  endTokens(accountId: string, tokenIds: ReadonlySet<string>, reason: string): void {
+    for (const h of [...(this.byAccount.get(accountId) ?? [])]) {
+      if (h.tokenId !== undefined && tokenIds.has(h.tokenId)) h.end(reason);
+    }
   }
 
   endAll(reason: string): void {

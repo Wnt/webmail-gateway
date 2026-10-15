@@ -45,8 +45,14 @@ describe("health endpoints", () => {
   });
 
   it("feature stubs register no routes", async () => {
-    for (const url of ["/jmap/session", "/.well-known/jmap", "/oauth/token", "/auth/login", "/relay/api/push/vapid-public-key"]) {
+    for (const url of ["/oauth/token", "/auth/login", "/relay/api/push/vapid-public-key"]) {
       expect((await app.inject(url)).statusCode).toBe(404);
+    }
+  });
+
+  it("jmap routes exist and require authentication", async () => {
+    for (const url of ["/jmap/session", "/.well-known/jmap"]) {
+      expect((await app.inject(url)).statusCode).toBe(401);
     }
   });
 });

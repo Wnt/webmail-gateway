@@ -1,11 +1,11 @@
 // JMAP proxy (design/jmap.md). Every Bulwark JMAP request passes through here
 // on its way to legacy-proxy, authenticated with a minted legacy-proxy token.
-import { randomInt } from "node:crypto";
+import { createHash, randomInt } from "node:crypto";
 import { pipeline } from "node:stream";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { getAccountById, type Account } from "../../core/accounts.js";
 import { authenticate, registerAuthenticator, type Principal } from "../../core/auth-context.js";
-import { handlePushSubscription } from "../../core/hooks.js";
+import { handlePushSubscription, onTokenRevoked } from "../../core/hooks.js";
 import type { CliCommand, FeaturePlugin } from "../../types.js";
 import { ForwardRequestError, isPushCall, runSplit, validateEnvelope, type ResponseEnvelope } from "./api.js";
 import { AuthHttpError, BasicAuth } from "./basic-auth.js";
@@ -59,8 +59,12 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
     accounts.delete(id);
   };
 
+  // D8: a revoked grant's streams close at once (the 1 h max age is the backstop).
+  const offRevoked = onTokenRevoked((e) => sse.endTokens(e.accountId, new Set(e.tokenIds), "revoked"));
+
   app.addHook("preClose", async () => sse.endAll("shutdown"));
   app.addHook("onClose", async () => {
+    offRevoked();
     unregister?.();
     await upstream.close();
   });
@@ -407,7 +411,12 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
 
     const ac = new AbortController();
     let endStream: (reason: string) => void = () => ac.abort();
-    const handle: SseHandle = { accountId: g.account.id, end: (reason) => endStream(reason) };
+    const bearer = /^bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
+    const handle: SseHandle = {
+      accountId: g.account.id,
+      ...(bearer ? { tokenId: createHash("sha256").update(bearer).digest("hex") } : {}),
+      end: (reason) => endStream(reason),
+    };
     if (!sse.add(handle)) {
       retryAfter(reply, 30);
       return sendProblem(reply, 429);
