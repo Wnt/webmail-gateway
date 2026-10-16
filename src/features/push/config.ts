@@ -83,6 +83,13 @@ export const pushConfigSchema = z
     SUMMARY_API_KEY: opt(z.string().trim().min(1)),
     /** Give up on one summary after this long; the preview then stays (a CPU-only 4B model takes 30-100 s). */
     SUMMARY_TIMEOUT_MS: posInt(120_000),
+    /**
+     * Apple's push service (Safari, iOS Home Screen web apps) only: send the
+     * summary no sooner than this after the preview. WebKit refuses to close a
+     * notification younger than 30 s, and on WebKit the service worker has to
+     * close the preview itself (a tag does not replace there). 0 = no wait.
+     */
+    SUMMARY_APPLE_MIN_GAP_MS: z.coerce.number().int().min(0).max(120_000).default(35_000),
   })
   .superRefine((c, ctx) => {
     const n = [c.PUSH_VAPID_PUBLIC_KEY, c.PUSH_VAPID_PRIVATE_KEY].filter(Boolean).length;
@@ -117,6 +124,8 @@ export interface SummaryConfig {
   model: string;
   apiKey: string | null;
   timeoutMs: number;
+  /** Earliest summary push to an Apple endpoint after its preview push (ms). */
+  appleMinGapMs: number;
 }
 
 export interface PushConfig {
@@ -160,6 +169,7 @@ export function parsePushConfig(env: NodeJS.ProcessEnv): PushConfig {
             model: c.SUMMARY_MODEL,
             apiKey: c.SUMMARY_API_KEY ?? null,
             timeoutMs: c.SUMMARY_TIMEOUT_MS,
+            appleMinGapMs: c.SUMMARY_APPLE_MIN_GAP_MS,
           }
         : null,
   };

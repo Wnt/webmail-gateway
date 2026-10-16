@@ -45,6 +45,34 @@ export interface SummaryJob {
   /** The preview push as it was sent; must carry `email`. */
   payload: PushPayload;
   topic: string;
+  /** When the preview push went out (ms since the epoch); unknown for a replayed job. */
+  pushedAt?: number;
+}
+
+/** Apple's web push service (Safari, iOS Home Screen web apps: WebKit). */
+export function isApplePushEndpoint(endpoint: string): boolean {
+  try {
+    const host = new URL(endpoint).hostname.toLowerCase();
+    return host === "push.apple.com" || host.endsWith(".push.apple.com");
+  } catch {
+    return false;
+  }
+}
+
+/** Resolves after `ms`, or rejects as soon as `signal` aborts. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const t = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /** What the summarizer needs from the mail upstream (the pipeline implements it). */
@@ -291,11 +319,43 @@ export class Summarizer {
 
     const payload = fitPayload({ ...job.payload, renotify: false, email: { ...email, summary } });
     if (!payload.email?.summary) return "error";
-    const targets = await targetsForAccount(db, job.accountId);
+    let targets = await targetsForAccount(db, job.accountId);
     if (targets.length === 0 || !this.sender.enabled) return "no_devices";
-    const outcomes = await this.sender.sendAll(targets, payload, job.topic);
+
+    // WebKit shows the summary as a new notification and the service worker
+    // closes the preview, which WebKit allows only once the preview is 30 s
+    // old. So Apple endpoints get the summary no sooner than appleMinGapMs
+    // after the preview; the others get it now. (The wait holds the queue,
+    // at most appleMinGapMs, and a newer message for the account cuts it short.)
+    const waitMs = job.pushedAt === undefined ? 0 : job.pushedAt + this.cfg.appleMinGapMs - Date.now();
+    const outcomes: Awaited<ReturnType<Sender["sendAll"]>> = [];
+    let appleWaitMs = 0;
+    if (waitMs > 0 && targets.some((t) => isApplePushEndpoint(t.endpoint))) {
+      const now = targets.filter((t) => !isApplePushEndpoint(t.endpoint));
+      if (now.length > 0) outcomes.push(...(await this.sender.sendAll(now, payload, job.topic)));
+      this.stats.inc("summary_apple_wait");
+      try {
+        await sleep(waitMs, signal);
+      } catch {
+        return "aborted";
+      }
+      appleWaitMs = waitMs;
+      if (this.isStale(job)) return "stale";
+      if (!(await this.source.stillNotifiable(job))) return "not_notifiable";
+      if (this.isStale(job) || signal.aborted) return "stale";
+      targets = (await targetsForAccount(db, job.accountId)).filter((t) => isApplePushEndpoint(t.endpoint));
+    }
+    if (targets.length > 0) outcomes.push(...(await this.sender.sendAll(targets, payload, job.topic)));
     log.info(
-      { accountId: job.accountId, devices: targets.length, ok: outcomes.filter((o) => o === "ok").length, modelMs, flagged, chars: summary.length },
+      {
+        accountId: job.accountId,
+        devices: outcomes.length,
+        ok: outcomes.filter((o) => o === "ok").length,
+        modelMs,
+        appleWaitMs,
+        flagged,
+        chars: summary.length,
+      },
       "push: summary pushed",
     );
     return "pushed";

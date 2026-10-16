@@ -210,7 +210,12 @@ describe("summary config", () => {
       model: "qwen",
       apiKey: null,
       timeoutMs: 120_000,
+      appleMinGapMs: 35_000,
     });
+    const on = { ...base, SUMMARY_ENABLED: "true", SUMMARY_API_URL: "http://llm:8080/v1", SUMMARY_MODEL: "qwen" };
+    expect(parsePushConfig({ ...on, SUMMARY_APPLE_MIN_GAP_MS: "0" }).summary!.appleMinGapMs).toBe(0);
+    expect(() => parsePushConfig({ ...on, SUMMARY_APPLE_MIN_GAP_MS: "-1" })).toThrow();
+    expect(() => parsePushConfig({ ...on, SUMMARY_APPLE_MIN_GAP_MS: "600000" })).toThrow();
   });
 
   it("accepts a full endpoint URL", () => {

@@ -4,7 +4,9 @@ import { getCachedSummary, type SummaryJob, type SummaryOutcome } from "../../sr
 import { INJECTION_NOTICE, RESPONSE_FORMAT, SYSTEM_PROMPT } from "../../src/features/push/summary-text.js";
 import type { FakeBrowser } from "./fakes.js";
 import { DEFAULT_SUMMARY, json, startFakeLlm, type FakeLlm, type LlmRequest } from "./fake-llm.js";
-import { makeHarness, until, type Harness } from "./harness.js";
+import { APPLE_PUSH_HOST, makeHarness, until, type Harness } from "./harness.js";
+import { isApplePushEndpoint } from "../../src/features/push/summarizer.js";
+import { makeBrowser } from "./fakes.js";
 
 // AI summaries (Phase 5) end to end inside the process: fake legacy-proxy,
 // fake OpenAI-compatible model server, fake push service; every push is
@@ -18,7 +20,7 @@ beforeAll(async () => {
   llm = await startFakeLlm();
   h = await makeHarness(
     { summarizer: { onOutcome: (job, outcome) => outcomes.push({ job, outcome }) } },
-    { SUMMARY_ENABLED: "true", SUMMARY_API_URL: llm.url, SUMMARY_MODEL: "tiny-test-model", SUMMARY_TIMEOUT_MS: "1500", SUMMARY_API_KEY: "sk-test" },
+    { SUMMARY_ENABLED: "true", SUMMARY_API_URL: llm.url, SUMMARY_MODEL: "tiny-test-model", SUMMARY_TIMEOUT_MS: "1500", SUMMARY_API_KEY: "sk-test", SUMMARY_APPLE_MIN_GAP_MS: "700" },
   );
 });
 afterAll(async () => {
@@ -328,6 +330,71 @@ describe("AI summary replacement push", () => {
     expect(llm.requests).toHaveLength(0);
     expect(pushes(browser)).toHaveLength(2); // preview + the first replacement only
     expect(outcomes.map((o) => o.outcome)).toEqual(["pushed", "not_notifiable"]);
+  });
+});
+
+describe("AI summary on Apple's push service (WebKit)", () => {
+  // WebKit does not replace by tag; the service worker closes the preview
+  // itself, which WebKit allows only once it is 30 s old (here: 700 ms).
+  const at = (id: string) => h.pushSvc.requests.filter((r) => r.id === id);
+
+  it("recognises Apple endpoints only", () => {
+    expect(isApplePushEndpoint("https://web.push.apple.com/QGx0")).toBe(true);
+    expect(isApplePushEndpoint("https://api.push.apple.com/x")).toBe(true);
+    expect(isApplePushEndpoint("https://fcm.googleapis.com/fcm/send/x")).toBe(false);
+    expect(isApplePushEndpoint("https://push.apple.com.evil.example/x")).toBe(false);
+    expect(isApplePushEndpoint("not a url")).toBe(false);
+  });
+
+  it("sends the summary to an Apple device no sooner than the minimum gap, to others at once", async () => {
+    const { principal, slug } = await setup("dev-sum-0101");
+    const iphone = makeBrowser();
+    await h.enable(principal, "dev-sum-0102", iphone, APPLE_PUSH_HOST);
+    await h.legacy.deliver(slug, { id: "ap1" });
+    await h.rt.idle();
+    const apple = at("dev-sum-0102");
+    expect(apple).toHaveLength(2);
+    expect(at("dev-sum-0101")).toHaveLength(2);
+    const decrypted = apple.map((r) => JSON.parse(iphone.decrypt(r.body)) as PushPayload);
+    expect(decrypted[0]!.email!.summary).toBeUndefined();
+    expect(decrypted[1]!.email!.summary).toBe(DEFAULT_SUMMARY);
+    const [applePreview, appleSummary] = apple.map((r) => r.at);
+    const otherSummary = at("dev-sum-0101")[1]!.at;
+    expect(appleSummary! - applePreview!).toBeGreaterThanOrEqual(650);
+    expect(otherSummary).toBeLessThan(appleSummary!);
+    expect(otherSummary - applePreview!).toBeLessThan(600);
+    expect(outcomes.map((o) => o.outcome)).toEqual(["pushed"]);
+    expect(h.rt.stats.get("summary_apple_wait")).toBe(1);
+  });
+
+  it("does not send the Apple device a summary for mail read during the wait", async () => {
+    const { principal, slug } = await setup("dev-sum-0103");
+    const iphone = makeBrowser();
+    await h.enable(principal, "dev-sum-0104", iphone, APPLE_PUSH_HOST);
+    llm.answer = () => {
+      // read on another device while the gateway waits for the gap
+      setTimeout(() => (h.legacy.account(slug).emails.find((e) => e.id === "ap2")!.keywords.$seen = true), 100);
+      return { content: json(DEFAULT_SUMMARY) };
+    };
+    await h.legacy.deliver(slug, { id: "ap2" });
+    await h.rt.idle();
+    expect(at("dev-sum-0104")).toHaveLength(1);
+    expect(outcomes.map((o) => o.outcome)).toEqual(["not_notifiable"]);
+  });
+
+  it("a newer message cuts the wait short; only the newest is summarised to the Apple device", async () => {
+    const { principal, slug } = await setup("dev-sum-0105");
+    const iphone = makeBrowser();
+    await h.enable(principal, "dev-sum-0106", iphone, APPLE_PUSH_HOST);
+    await h.legacy.deliver(slug, { id: "ap3" });
+    await until(() => h.rt.stats.get("summary_apple_wait") === 1);
+    await h.legacy.deliver(slug, { id: "ap4", receivedAt: new Date(Date.now() + 1000).toISOString() });
+    await h.rt.idle();
+    expect(outcomes.map((o) => [o.job.emailId, o.outcome])).toEqual([["ap3", "aborted"], ["ap4", "pushed"]]);
+    const summaries = at("dev-sum-0106")
+      .map((r) => JSON.parse(iphone.decrypt(r.body)) as PushPayload)
+      .filter((p) => p.email?.summary);
+    expect(summaries.map((p) => p.emailIds.at(-1))).toEqual(["ap4"]);
   });
 });
 

@@ -332,6 +332,8 @@ export interface PushRequest {
   id: string;
   headers: Record<string, string | string[] | undefined>;
   body: Buffer;
+  /** When it arrived (ms since the epoch). */
+  at: number;
 }
 
 export interface FakePushService {
@@ -356,7 +358,7 @@ export async function startFakePushService(): Promise<FakePushService> {
     close: () => app.close(),
   };
   app.post<{ Params: { id: string } }>("/push/:id", async (req, reply) => {
-    svc.requests.push({ id: req.params.id, headers: req.headers, body: req.body as Buffer });
+    svc.requests.push({ id: req.params.id, headers: req.headers, body: req.body as Buffer, at: Date.now() });
     const next = svc.script.get(req.params.id)?.shift();
     if (next) {
       for (const [k, v] of Object.entries(next.headers ?? {})) reply.header(k, v);

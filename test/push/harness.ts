@@ -11,6 +11,8 @@ import { makeBrowser, startFakeLegacyPush, startFakePushService, type FakeBrowse
 
 /** Push endpoints in tests are https://push.example.test/...; the app's fetch reroutes them to the fake push service. */
 export const PUSH_HOST = "push.example.test";
+/** Apple's web push host (WebKit devices); rerouted to the same fake push service. */
+export const APPLE_PUSH_HOST = "web.push.apple.com";
 export const PUBLIC = "https://mail.example.test";
 
 export interface Harness {
@@ -26,7 +28,7 @@ export interface Harness {
   /** A gateway account that legacy-proxy knows, with a stored Gandi password. */
   newAccount(): Promise<{ account: Account; principal: Principal; slug: string }>;
   /** Bulwark's enableWebPush: register with the relay, create, poll verify, verify. Returns the JMAP sub id. */
-  enable(principal: Principal, relayId: string, browser?: FakeBrowser): Promise<{ subId: string; browser: FakeBrowser }>;
+  enable(principal: Principal, relayId: string, browser?: FakeBrowser, host?: string): Promise<{ subId: string; browser: FakeBrowser }>;
   jmap(principal: Principal, method: string, args: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 
@@ -43,13 +45,16 @@ export async function makeHarness(opts: PushTestOptions = {}, env: Record<string
     PUSH_VAPID_PRIVATE_KEY: vapid.privateKey,
     PUSH_VAPID_SUBJECT: "mailto:ops@example.test",
     PUSH_WORKER_ENABLED: "false",
-    PUSH_ENDPOINT_HOSTS: PUSH_HOST,
+    PUSH_ENDPOINT_HOSTS: `${PUSH_HOST},${APPLE_PUSH_HOST}`,
     ...env,
   });
   ctx.fetch = (input, init) => {
     const url = String(input instanceof Request ? input.url : input);
-    const prefix = `https://${PUSH_HOST}`;
-    return fetch(url.startsWith(prefix) ? pushSvc.url + url.slice(prefix.length) : input, init);
+    for (const host of [PUSH_HOST, APPLE_PUSH_HOST]) {
+      const prefix = `https://${host}`;
+      if (url.startsWith(prefix)) return fetch(pushSvc.url + url.slice(prefix.length), init);
+    }
+    return fetch(input, init);
   };
 
   resetHooks();
@@ -110,7 +115,7 @@ export async function makeHarness(opts: PushTestOptions = {}, env: Record<string
       return { account, slug: account.legacySlug, principal: { accountId: account.id, email, scopes: ["mail"], via: "oauth" } };
     },
     jmap: (principal, method, args) => handlePushSubscription(principal, method, args),
-    async enable(principal, relayId, browser = makeBrowser()) {
+    async enable(principal, relayId, browser = makeBrowser(), host = PUSH_HOST) {
       // Each enable is another browser, so the per-IP write limiter does not add up across a test file.
       const n = ++enables;
       const reg = await app.inject({
@@ -119,7 +124,7 @@ export async function makeHarness(opts: PushTestOptions = {}, env: Record<string
         remoteAddress: `198.18.${(n >> 8) & 255}.${n & 255}`,
         payload: {
           subscriptionId: relayId,
-          subscription: { endpoint: `https://${PUSH_HOST}/push/${relayId}`, keys: browser.keys },
+          subscription: { endpoint: `https://${host}/push/${relayId}`, keys: browser.keys },
           accountLabel: principal.email,
         },
       });

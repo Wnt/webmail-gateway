@@ -443,7 +443,7 @@ export class Pipeline implements SummarySource {
     const sentAt = Date.now();
     // Phase 5: summarise the newest message and replace the preview quietly (same topic, same tag).
     if (this.summarizer && payload.email) {
-      this.summarizer.enqueue({ accountId, legacyAccountId, emailId: newest.emailId, payload, topic });
+      this.summarizer.enqueue({ accountId, legacyAccountId, emailId: newest.emailId, payload, topic, pushedAt: sentAt });
     }
     this.ctx.log.info(
       {
