@@ -11,6 +11,12 @@ export const CODE_TTL_MS = 60_000;
 export const ACCESS_TTL_MS = 3600_000;
 export const REFRESH_TTL_MS = 30 * 86400_000;
 export const GRANT_TTL_MS = 180 * 86400_000;
+/**
+ * How long past its grant's expiry an expired refresh token is kept, only so
+ * that /oauth/revoke can still find the grant: push subscriptions outlive
+ * their grant by up to 90 days (push MAX_EXPIRES_MS) and revoking it ends them.
+ */
+export const REVOCABLE_AFTER_GRANT_MS = 90 * 86400_000;
 /** A10: a refresh token presented again within this window gets the same successor pair. */
 export const REFRESH_GRACE_MS = 30_000;
 const CACHE_TTL_MS = 30_000;
@@ -437,7 +443,13 @@ export class TokenStore {
       new Date(t - REFRESH_GRACE_MS),
     ]);
     // Used refresh tokens stay until they expire: reuse detection needs them.
-    await db.query("DELETE FROM oauth_refresh_token WHERE expires_at <= $1", [new Date(t)]);
+    // Expired ones stay while their grant may still back push subscriptions:
+    // presented to /oauth/revoke, they revoke the grant (and its pushes).
+    await db.query(
+      `DELETE FROM oauth_refresh_token rt USING oauth_grant g
+       WHERE g.id = rt.grant_id AND rt.expires_at <= $1 AND g.expires_at <= $2`,
+      [new Date(t), new Date(t - REVOCABLE_AFTER_GRANT_MS)],
+    );
     await db.query(
       "UPDATE oauth_grant SET revoked_at = $1, revoked_reason = 'expired' WHERE revoked_at IS NULL AND expires_at <= $1",
       [new Date(t)],

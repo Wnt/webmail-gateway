@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { resetAccountAuth } from "../../src/features/auth/generation.js";
 import { createAuthState } from "../../src/features/auth/state.js";
-import { ACCESS_TTL_MS, GRANT_TTL_MS, TokenStore } from "../../src/features/auth/tokens.js";
+import { ACCESS_TTL_MS, GRANT_TTL_MS, REFRESH_TTL_MS, REVOCABLE_AFTER_GRANT_MS, TokenStore } from "../../src/features/auth/tokens.js";
 import { deletePasskey } from "../../src/features/auth/webauthn.js";
 import { addTestPasskey } from "../helpers.js";
 import { makeHarness, PUBLIC, type Harness } from "./harness.js";
@@ -153,6 +153,18 @@ describe("push stops when access is revoked (gateway-data-1)", () => {
       grants: 0,
     });
     expect(await deliver(slug, ["unbound-device"])).toEqual({ "unbound-device": 0 });
+  });
+
+  it("by /oauth/revoke with a refresh token long expired, as long as the grant can back push", async () => {
+    const { account, slug } = await newAccount();
+    const { grant, principal } = await signIn(account.id);
+    await h.enable(principal, "expired-token-device");
+    now += REFRESH_TTL_MS + 1;
+    await tokens().prune();
+    expect(await tokens().refresh({ refreshToken: grant.refreshToken, clientId: "bulwark" })).toBeNull();
+    expect(await deliver(slug, ["expired-token-device"])).toEqual({ "expired-token-device": 1 }); // expiry alone keeps push
+    await tokens().revokeToken(grant.refreshToken, "bulwark");
+    expect(await deliver(slug, ["expired-token-device"])).toEqual({ "expired-token-device": 0 });
   });
 
   it("before a queued retry that was waiting when the grant was revoked", async () => {

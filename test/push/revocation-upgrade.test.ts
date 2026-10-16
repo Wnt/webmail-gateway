@@ -22,11 +22,25 @@ it("carries revocations made before the upgrade over to subscriptions without a 
     if (!/^(101|202)_/.test(f)) await copyFile(path.join(DEFAULT_MIGRATIONS_DIR, f), path.join(dir, f));
   }
   await migrate(db, dir);
-  const account = async (email: string) =>
-    (await db.query<{ id: string }>("INSERT INTO account (email, legacy_slug) VALUES ($1, $1) RETURNING id", [email])).rows[0]!.id;
+  /** An account whose passkey was enrolled at `enrolled` (none: null). */
+  const account = async (email: string, enrolled: string | null = "2026-09-01T00:00:00Z") => {
+    const id = (await db.query<{ id: string }>("INSERT INTO account (email, legacy_slug) VALUES ($1, $1) RETURNING id", [email])).rows[0]!.id;
+    if (enrolled) {
+      await db.query("INSERT INTO passkey (id, account_id, public_key, name, created_at) VALUES ($1, $2, 'k', 'p', $3)", [
+        Buffer.from(email),
+        id,
+        enrolled,
+      ]);
+    }
+    return id;
+  };
   const revokedGrant = await account("revoked@example.test");
   const reset = await account("reset@example.test");
   const untouched = await account("untouched@example.test");
+  // A reset that left no record (its audit write failed, its grants had expired): the passkey enrolled after it tells.
+  const unrecordedReset = await account("unrecorded@example.test", "2026-10-04T00:00:00Z");
+  // No passkey at all: a reset may just have happened.
+  const noPasskey = await account("nopasskey@example.test", null);
   const sub = async (accountId: string, relayId: string, createdAt: string) => {
     await db.query("INSERT INTO push_relay_sub (relay_id, endpoint, p256dh, auth) VALUES ($1, $2, 'k', 'a')", [
       relayId,
@@ -51,10 +65,15 @@ it("carries revocations made before the upgrade over to subscriptions without a 
   await sub(reset, "before-reset", "2026-10-01T00:00:00Z");
   await db.query("INSERT INTO auth_audit (at, event, account_id, details) VALUES ('2026-10-02', 'bootstrap', $1, '{\"reset\":true}')", [reset]);
   await sub(untouched, "never-revoked", "2026-10-01T00:00:00Z");
+  await sub(unrecordedReset, "before-unrecorded-reset", "2026-10-01T00:00:00Z");
+  await sub(unrecordedReset, "after-reenrolment", "2026-10-05T00:00:00Z");
+  await sub(noPasskey, "no-passkey", "2026-10-01T00:00:00Z");
 
   await migrate(db);
   const relays = async (id: string) => (await targetsForAccount(db, id)).map((t) => t.relayId);
   expect(await relays(revokedGrant)).toEqual(["after-signout"]);
   expect(await relays(reset)).toEqual([]);
   expect(await relays(untouched)).toEqual(["never-revoked"]);
+  expect(await relays(unrecordedReset)).toEqual(["after-reenrolment"]);
+  expect(await relays(noPasskey)).toEqual([]);
 });

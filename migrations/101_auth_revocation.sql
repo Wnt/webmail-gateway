@@ -11,10 +11,16 @@ ALTER TABLE account ADD COLUMN auth_generation integer NOT NULL DEFAULT 0;
 -- (password mode, or from before migration 202) stop at the next one.
 ALTER TABLE account ADD COLUMN auth_revoked_at timestamptz;
 -- Carried over from before this migration: the last deliberate grant
--- revocation, `bootstrap --reset` or passkey deletion on record.
+-- revocation, `bootstrap --reset` or passkey deletion on record, and at
+-- least the creation of the account's oldest passkey. A reset deletes every
+-- passkey, so whatever survives was enrolled after the last one, recorded or
+-- not; with no passkey left, a reset may have just happened and nothing from
+-- before now counts.
 UPDATE account a SET auth_revoked_at = (
   SELECT max(t) FROM (
-    SELECT max(g.revoked_at) AS t FROM oauth_grant g
+    SELECT coalesce(min(p.created_at), now()) AS t FROM passkey p WHERE p.account_id = a.id
+    UNION ALL
+    SELECT max(g.revoked_at) FROM oauth_grant g
      WHERE g.account_id = a.id AND g.revoked_at IS NOT NULL AND g.revoked_reason <> 'expired'
     UNION ALL
     SELECT max(e.at) FROM auth_audit e
