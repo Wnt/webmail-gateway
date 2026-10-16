@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { PushPayload } from "../../src/features/push/payload.js";
-import { getCachedSummary, type SummaryJob, type SummaryOutcome } from "../../src/features/push/summarizer.js";
+import { getCachedSummary, putCachedSummary, type SummaryJob, type SummaryOutcome } from "../../src/features/push/summarizer.js";
 import { SYSTEM_PROMPT } from "../../src/features/push/summary-text.js";
 import type { FakeBrowser } from "./fakes.js";
 import { DEFAULT_SUMMARY, startFakeLlm, type FakeLlm } from "./fake-llm.js";
@@ -179,6 +179,61 @@ describe("AI summary replacement push", () => {
     await h.rt.idle();
     expect(pushes(browser)).toHaveLength(2); // just the second preview
     expect(outcomes.map((o) => o.outcome)).toEqual(["rejected", "rejected"]);
+  });
+
+  it("rejects a link revealed by output normalization before caching or pushing it (gateway-data-4)", async () => {
+    const { account, slug, browser } = await setup("dev-sum-audit");
+    // A deterministic model-output fixture tests the validator, not whether a live model would obey an injection.
+    llm.answer = () => ({ content: "Please visit pay.\u200bexample to continue." });
+    h.legacy.addEmail(slug, {
+      id: "audit-summary-link", subject: "Account notice",
+      body: [{ type: "text/plain", value: "An account notice from an untrusted sender." }],
+    });
+    await h.rt.tick();
+    await h.rt.idle();
+    expect(llm.requests).toHaveLength(1);
+    const summaries = pushes(browser).flatMap((p) => (p.payload.email?.summary ? [p.payload.email.summary] : []));
+    expect(summaries, "normalization must not turn accepted output into a prohibited destination").toEqual([]);
+    expect(await getCachedSummary(h.ctx.db, h.ctx.config.encKey, account.id, "audit-summary-link")).toEqual({ status: "rejected" });
+  });
+
+  it("rejects a one-character host label revealed by normalization (gateway-data-4)", async () => {
+    const { account, slug, browser } = await setup("dev-sum-audit2");
+    llm.answer = () => ({ content: "Please visit x.\u200bexample to continue." });
+    await h.legacy.deliver(slug, { id: "audit-summary-x" });
+    await h.rt.idle();
+    expect(llm.requests).toHaveLength(1);
+    expect(pushes(browser).filter((p) => p.payload.email?.summary)).toEqual([]);
+    expect(await getCachedSummary(h.ctx.db, h.ctx.config.encKey, account.id, "audit-summary-x")).toEqual({ status: "rejected" });
+  });
+
+  it("rejects a percent-encoded URL revealed by normalization (gateway-data-4)", async () => {
+    const { account, slug, browser } = await setup("dev-sum-audit3");
+    llm.answer = () => ({ content: "Please visit h\u200bttps://%65vil%2eexample/ to continue." });
+    await h.legacy.deliver(slug, { id: "audit-summary-idn" });
+    await h.rt.idle();
+    expect(llm.requests).toHaveLength(1);
+    expect(pushes(browser).filter((p) => p.payload.email?.summary)).toEqual([]);
+    expect(await getCachedSummary(h.ctx.db, h.ctx.config.encKey, account.id, "audit-summary-idn")).toEqual({ status: "rejected" });
+  });
+
+  it("checks a cached summary again before sending it, and marks a failing one rejected (gateway-data-4)", async () => {
+    const { account, slug, browser } = await setup("dev-sum-cache");
+    // Cached by an earlier, weaker output check.
+    const old = ["Please visit x.example to continue.", "Please visit pay.भारत...today.", "Please visit https://%65vil%2eexample/ to continue."];
+    for (const [i, summary] of old.entries()) {
+      await putCachedSummary(h.ctx.db, h.ctx.config.encKey, account.id, `old-c${i}`, "tiny-test-model", { status: "ok", summary });
+    }
+    for (const i of old.keys()) {
+      await h.legacy.deliver(slug, { id: `old-c${i}` });
+      await h.rt.idle();
+    }
+    expect(llm.requests).toHaveLength(0);
+    expect(pushes(browser).filter((p) => p.payload.email?.summary)).toEqual([]);
+    expect(outcomes.map((o) => o.outcome)).toEqual(["rejected", "rejected", "rejected"]);
+    for (const i of old.keys()) {
+      expect(await getCachedSummary(h.ctx.db, h.ctx.config.encKey, account.id, `old-c${i}`)).toEqual({ status: "rejected" });
+    }
   });
 
   it("summarises only the newest message of a burst", async () => {

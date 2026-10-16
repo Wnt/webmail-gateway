@@ -6,6 +6,7 @@ import {
   INPUT_MAX_CHARS,
   sanitizeSummary,
   stripQuotesAndSignature,
+  summaryViolation,
   userMessage,
 } from "../../src/features/push/summary-text.js";
 
@@ -74,7 +75,7 @@ describe("model output checks", () => {
   };
 
   it("accepts plain summaries in Finnish and English", () => {
-    expect(ok("Lasku 1234567 erääntyy perjantaina 16.10., summa 42,50 €.")).toBe("Lasku 1234567 erääntyy perjantaina 16.10., summa 42,50 €.");
+    expect(ok("Lasku 1234567 erääntyy perjantaina 16.10. ja summa on 42,50 €.")).toBe("Lasku 1234567 erääntyy perjantaina 16.10. ja summa on 42,50 €.");
     expect(ok("Bob asks if you can join the meeting at 10.30 on Friday.")).toBe("Bob asks if you can join the meeting at 10.30 on Friday.");
   });
 
@@ -104,6 +105,81 @@ describe("model output checks", () => {
       "Confirm at hxxps://evil.example",
     ]) {
       expect(reason(s), s).toBe("link");
+    }
+  });
+
+  it("rejects a link that only cleaning or folding would reveal (gateway-data-4)", () => {
+    for (const s of [
+      "Please visit pay.\u200bexample to continue.", // zero-width space, removed by cleanText
+      "Please visit pay.\u200dexample to continue.", // zero-width joiner, kept but invisible
+      "Please visit pay.\u2060example to continue.", // word joiner
+      "Please visit pay.**example** to continue.",
+      "Please visit pay.`example` to continue.",
+      "Please visit pay\uff0eexample to continue.", // fullwidth full stop
+      "Please visit pay\u3002example to continue.", // ideographic full stop, a label separator to URL parsers
+      "Please visit ｐａｙ.ｅｘａｍｐｌｅ to continue.", // fullwidth letters
+      "Mail billing\u200b@pay.example today.",
+      "Open www\u200b.pay.example today.",
+      "Please visit x.\u200bexample to continue.", // one-character label
+      "Please visit x.example to continue.",
+      "Please visit ｘ．ｅｘａｍｐｌｅ to continue.",
+      "Please visit 1.\u200bexample/pay to continue.",
+      "Please visit pää.example to continue.", // IDN label
+      "Please visit пример.рф to continue.", // IDN TLD
+      "Please visit 203.0.113.5 to continue.", // IPv4 address
+      "Please visit 203.0.113.\u200b5 to continue.",
+      "Please visit pay.\u200bभारत to continue.", // IDN TLD with combining marks
+      "Please visit pay.भारत to continue.",
+      "Please visit pay.বাংলা now.",
+      "Please visit pay.சிங்கப்பூர் now.",
+      "Please visit सरकार.भारत/login now.",
+      "Please visit pay。example now.",
+      "Write to billing@pay.भारत today.",
+      "Open pay.example:8443 today.",
+      "(see pay.example)",
+      "Please visit pay.\u200bभारत…today.", // an ellipsis after the host
+      "Please visit pay.भारत...today.",
+      "Please visit pay.भारत..",
+      "Please visit pay.भारत.—now",
+      "Please visit ok_pay.भारत now.",
+      "Please visit xn--.pay.भारत now.", // an invalid label before a valid host
+    ]) {
+      expect(reason(s), JSON.stringify(s)).toBe("link");
+    }
+    expect(summaryViolation("Please visit pay.example to continue.")).toBe("link");
+    expect(summaryViolation("The parcel arrives tomorrow.")).toBeNull();
+    // decimals and clock times stay acceptable ...
+    for (const t of ["The meeting is at 9.30 tomorrow.", "Kokous klo 10.30, esim. huoneessa 2.", "Price 5.50 € incl. VAT.",
+      "Version 2.1 ships on Friday.", "Lasku erääntyy 15.11. ja summa on 1.234,50 €.", "Meeting moved. New time is 10.", "Call at 12:30 today."]) {
+      expect(summaryViolation(t), t).toBeNull();
+    }
+    // ... while anything joined by a dot, colon, slash or @ falls back to the preview, by design
+    for (const t of ["E.g. the meeting is at 9.30.", "Bring the forms and/or receipts.", "Meet on 15.11.2026.", "Server 10.0.0.1 is down.",
+      "Ratio 3:2:1 agreed.", "Version v2.0 ships.", "Read the docs\\setup today.", "The 1.5x speed-up landed.",
+      "Kokous siirtyy (klo 14.)", 'Hän sanoi "kyllä."', "Lasku erääntyy perjantaina 16.10., summa 42,50 €.", "Vastaa ke/to mennessä.", "Lomalla 1.–15.11."]) {
+      expect(summaryViolation(t), t).toBe("link");
+    }
+  });
+
+  it("rejects separators between any two non-space characters, and URL schemes", () => {
+    for (const t of [
+      "Please visit https://%65vil%2eexample/ to continue.", // percent-encoded host
+      "Please visit %65vil%2eexample/pay to continue.",
+      "Please visit https://🔒.example/ to continue.", // emoji label
+      "Please visit 🔒.example now.",
+      "Please visit 🔒.\u200bexample now.",
+      "Please visit https://[::1]/ to continue.", // IPv6 literal
+      "Please visit [2001:db8::1] now.",
+      "Please visit https:// pay now.", // a scheme alone
+      "Please visit http:\\\\pay now.",
+      "Please visit pay.(example) now.",
+      "Mail -@pay now.",
+    ]) {
+      expect(summaryViolation(t), JSON.stringify(t)).toBe("link");
+      expect(reason(t), JSON.stringify(t)).toBe("link");
+    }
+    for (const t of ["Odota hetki...", "Huom: muutos aikatauluun.", "Tapaaminen klo 12.30–13.00.", "Price is $1,234.50.", "Alennus 12,5 % voimassa."]) {
+      expect(summaryViolation(t), t).toBeNull();
     }
   });
 

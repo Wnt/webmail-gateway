@@ -7,7 +7,7 @@ import { fitPayload, type PushPayload } from "./payload.js";
 import type { Sender } from "./sender.js";
 import type { PushStats } from "./stats.js";
 import { targetsForAccount } from "./store.js";
-import { bodyForSummary, sanitizeSummary, SYSTEM_PROMPT, userMessage, type BodyPart } from "./summary-text.js";
+import { bodyForSummary, sanitizeSummary, summaryViolation, SYSTEM_PROMPT, userMessage, type BodyPart } from "./summary-text.js";
 
 /**
  * AI summaries (Phase 5). After the normal preview push, the newest message of
@@ -231,6 +231,13 @@ export class Summarizer {
     const cached = await getCachedSummary(db, config.encKey, job.accountId, job.emailId);
     if (cached?.status === "rejected") return "rejected";
     if (cached) {
+      // Cached under an older (weaker) output check? Check it again with the current one.
+      const bad = summaryViolation(cached.summary);
+      if (bad) {
+        log.info({ accountId: job.accountId, reason: bad }, "push: cached summary rejected");
+        await putCachedSummary(db, config.encKey, job.accountId, job.emailId, this.cfg.model, { status: "rejected" });
+        return "rejected";
+      }
       summary = cached.summary;
       this.stats.inc("summary_cache_hit");
     } else {
@@ -278,6 +285,8 @@ export class Summarizer {
 
     const payload = fitPayload({ ...job.payload, renotify: false, email: { ...email, summary } });
     if (!payload.email?.summary) return "error";
+    // fitPayload may shorten it: check the exact text that is sent.
+    if (summaryViolation(payload.email.summary)) return "rejected";
     const targets = await targetsForAccount(db, job.accountId);
     if (targets.length === 0 || !this.sender.enabled) return "no_devices";
     const outcomes = await this.sender.sendAll(targets, payload, job.topic);

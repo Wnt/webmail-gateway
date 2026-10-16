@@ -138,15 +138,36 @@ export function userMessage(from: string, subject: string, body: string): string
 
 // ------------------------------------------------------------------ output
 
-/** Links, bare host names (`evil.example/x`, `pay.example.com`), e-mail addresses. */
-const LINK_RES = [
-  /\b(?:https?|ftp|hxxps?):\/\//i,
-  /\bwww\d?\./i,
-  /\bmailto:/i,
-  /[^\s@]+@[^\s@]+\.[a-z]{2,}/i,
-  /\b[a-z0-9-]{2,63}(?:\.[a-z0-9-]{1,63})*\.[a-z]{2,24}(?:\/|\b)/i,
-  /\[[^\]]*\]\([^)]*\)/, // markdown link
-];
+/** Dots, colons, slashes, backslashes and at signs, and their Unicode look-alikes that NFKC keeps. */
+const SEP = "\\.:/\\\\@\\u0589\\u06d4\\u2024\\u2044\\u2215\\u2236\\u29f8\\u3002\\ufe52\\ufe55\\ufe6b\\uff0e\\uff0f\\uff1a\\uff20\\uff3c\\uff61";
+/**
+ * The link rule (gateway-data-4), strict on purpose: after NFKC folding and
+ * removing every format character (zero-width spaces and joiners, bidi
+ * marks), a summary is rejected if a separator sits between two non-space
+ * characters, whatever they are (letters, digits, `%`, emoji, brackets), or if
+ * it contains a URL scheme (`https://`, `https:\\`). That rejects URLs
+ * (percent-encoded too), host names in any script, punycode, IPv4 and IPv6
+ * literals and e-mail addresses without listing their shapes. Only a plain
+ * decimal (`9.30`, `1.234,50`) and a clock time (`12:30`) are exempt. The
+ * preview line is sent either way; a rejected summary just leaves it there.
+ */
+const JOINED_RE = new RegExp(`[^\\s${SEP}][${SEP}]+[^\\s${SEP}]`, "u");
+/**
+ * The raw answer still has its markup (`**Summary:**`), so it is checked for
+ * separators between letters and digits only; the strict rule applies to the
+ * cleaned text, which is what is cached and sent.
+ */
+const RAW_JOINED_RE = new RegExp(`[\\p{L}\\p{N}\\p{M}][${SEP}]+[\\p{L}\\p{N}\\p{M}]`, "u");
+const SCHEME_RE = /[a-z][a-z0-9+.-]*:[/\\]/i;
+/** `9.30`, `1.5`: one dot between digits, not part of a longer dotted or word run (so not an IPv4 address). */
+const DECIMAL_RE = /(?<![\p{L}\p{N}\p{M}]|\p{N}[.])\p{N}+\.\p{N}+(?![\p{L}\p{N}\p{M}]|\.\p{N})/gu;
+/** `12:30` */
+const TIME_RE = /(?<![\p{L}\p{N}\p{M}:.])\p{N}{1,2}:\p{N}{2}(?![\p{L}\p{N}\p{M}:])/gu;
+
+function hasLink(text: string, joined = JOINED_RE): boolean {
+  const t = text.normalize("NFKC").replace(/\p{Cf}/gu, "");
+  return SCHEME_RE.test(t) || joined.test(t.replace(DECIMAL_RE, "0").replace(TIME_RE, "0"));
+}
 
 /** Prompt-injection markers, role or template tokens, echoes of our own prompt. */
 const INJECTION_RES = [
@@ -183,6 +204,32 @@ function stripMarkup(s: string): string {
     .replace(/^\s*(?:summary|tiivistelmä|yhteenveto|notification|ilmoitus)\s*:\s*/i, "");
 }
 
+/**
+ * The forms a text can take on the device: as given, and NFKC-folded with
+ * invisible format characters (zero-width spaces and joiners, bidi marks)
+ * removed and ideographic full stops read as dots, as a URL parser or a
+ * reader would.
+ */
+function readings(s: string): string[] {
+  const folded = s.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/[\u3002\uff0e\uff61]/g, ".");
+  return folded === s ? [s] : [s, folded];
+}
+
+const matchesAny = (res: RegExp[], s: string): boolean => readings(s).some((t) => res.some((re) => re.test(t)));
+
+
+
+/**
+ * Why `text` must not be shown as a summary, or null. Run on the final text
+ * that is cached and sent, so no later cleaning step can reveal a link.
+ */
+export function summaryViolation(text: string): "link" | "injection" | "refusal" | null {
+  if (hasLink(text)) return "link";
+  if (matchesAny(INJECTION_RES, text)) return "injection";
+  if (matchesAny(REFUSAL_RES, text)) return "refusal";
+  return null;
+}
+
 /** Check and clean a model answer. Anything doubtful gives no summary at all: the preview stays. */
 export function sanitizeSummary(raw: unknown): SummaryVerdict {
   if (typeof raw !== "string") return { ok: false, reason: "empty" };
@@ -191,11 +238,16 @@ export function sanitizeSummary(raw: unknown): SummaryVerdict {
   s = s.trim();
   if (!s) return { ok: false, reason: "empty" };
   if (s.length > OUTPUT_REJECT_CHARS) return { ok: false, reason: "too_long" };
-  if (LINK_RES.some((re) => re.test(s))) return { ok: false, reason: "link" };
-  if (INJECTION_RES.some((re) => re.test(s))) return { ok: false, reason: "injection" };
+  // Raw first: markup stripping must not be what hides a link (e.g. one inside a tag).
+  if (hasLink(s, RAW_JOINED_RE)) return { ok: false, reason: "link" };
+  if (matchesAny(INJECTION_RES, s)) return { ok: false, reason: "injection" };
   s = cleanText(stripMarkup(s));
   s = s.replace(/^["'“”‘’«»„]+|["'“”‘’«»„]+$/g, "").trim();
-  if (REFUSAL_RES.some((re) => re.test(s))) return { ok: false, reason: "refusal" };
+  if (matchesAny(REFUSAL_RES, s)) return { ok: false, reason: "refusal" };
   if (s.length < OUTPUT_MIN_CHARS) return { ok: false, reason: "too_short" };
-  return { ok: true, summary: truncate(s, SUMMARY_MAX) };
+  const out = truncate(s, SUMMARY_MAX);
+  // Then the final text: cleaning and truncation can join what the raw checks saw apart.
+  const bad = summaryViolation(out) ?? summaryViolation(s);
+  if (bad) return { ok: false, reason: bad };
+  return { ok: true, summary: out };
 }
