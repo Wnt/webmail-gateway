@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { JmapMethodError } from "../../src/core/hooks.js";
-import { getRelaySub, getUpstream } from "../../src/features/push/store.js";
+import { sourceKey } from "../../src/features/push/relay-routes.js";
+import { garbageCollect, getRelaySub, getUpstream } from "../../src/features/push/store.js";
 import { makeBrowser } from "./fakes.js";
 import { makeHarness, PUBLIC, PUSH_HOST, type Harness } from "./harness.js";
 
@@ -94,6 +95,139 @@ describe("relay routes", () => {
   });
 });
 
+describe("pending relay registrations (gateway-data-2)", () => {
+  const from = (ip: string, id: string) =>
+    h.app.inject({
+      method: "POST",
+      url: "/relay/api/push/register/web",
+      remoteAddress: ip,
+      payload: { subscriptionId: id, subscription: { endpoint: `https://${PUSH_HOST}/push/${id}`, keys } },
+    });
+  const relayRows = async () => (await h.ctx.db.query<{ relay_id: string }>("SELECT relay_id FROM push_relay_sub ORDER BY relay_id")).rows;
+  const pendingOf = async (id: string) =>
+    (await h.ctx.db.query<{ linked: boolean; source: string | null }>(
+      "SELECT linked_at IS NOT NULL AS linked, pending_source AS source FROM push_relay_sub WHERE relay_id = $1",
+      [id],
+    )).rows[0];
+
+  it("does not retain anonymous, unverified registrations beyond a short pending lifetime", async () => {
+    // More orphan records than an account's whole device quota, each request below the 30/minute per-IP limiter.
+    for (let i = 0; i < 25; i++) {
+      const res = await from("203.0.113.9", `audit-orphan-${i}`);
+      expect([200, 429]).toContain(res.statusCode);
+    }
+    expect((await h.ctx.db.query("SELECT 1 FROM account")).rows).toHaveLength(0);
+    expect((await relayRows()).length).toBe(h.ctx.config.push.relayPendingPerSource);
+    await h.ctx.db.query("UPDATE push_relay_sub SET created_at = now() - interval '1 day', updated_at = now() - interval '1 day'");
+    await garbageCollect(h.ctx.db);
+    expect(await relayRows(), "anonymous registrations never linked to an account must not persist").toEqual([]);
+  });
+
+  it("caps pending registrations per source (IPv6: per /64) and in total; re-registering is never refused", async () => {
+    const perSource = h.ctx.config.push.relayPendingPerSource;
+    for (let i = 0; i < perSource; i++) expect((await from("203.0.113.10", `pending-a-${i}`)).statusCode).toBe(200);
+    const full = await from("203.0.113.10", "pending-a-extra");
+    expect(full.statusCode).toBe(429);
+    expect(full.json()).toEqual({ error: "Too many pending registrations" });
+    expect((await from("203.0.113.10", "pending-a-0")).statusCode).toBe(200); // Bulwark's retry of the same id
+    expect((await from("::ffff:203.0.113.10", "pending-a-mapped")).statusCode).toBe(429);
+    for (let i = 0; i < perSource; i++) expect((await from(`2001:db8:1:2::${i + 1}`, `pending-b-${i}`)).statusCode).toBe(200);
+    expect((await from("2001:db8:1:2:ffff::9", "pending-b-extra")).statusCode).toBe(429);
+    expect((await from("2001:db8:1:3::1", "pending-c-0")).statusCode).toBe(200);
+
+    const saved = h.ctx.config.push.relayPendingMax;
+    h.ctx.config.push.relayPendingMax = 2 * perSource + 1;
+    try {
+      const res = await from("198.51.100.1", "pending-d-0");
+      expect(res.statusCode).toBe(429);
+      expect(h.rt.stats.get("relay_pending_global_full")).toBe(1);
+      // Expired pending records are dropped on the next registration, freeing the quota at once.
+      await h.ctx.db.query("UPDATE push_relay_sub SET updated_at = now() - interval '11 minutes' WHERE relay_id LIKE 'pending-a-%'");
+      expect((await from("198.51.100.1", "pending-d-0")).statusCode).toBe(200);
+      expect((await relayRows()).some((r) => r.relay_id.startsWith("pending-a-"))).toBe(false);
+    } finally {
+      h.ctx.config.push.relayPendingMax = saved;
+    }
+  });
+
+  it("never moves a pending record's quota charge to another source by re-registering it", async () => {
+    const saved = { perSource: h.ctx.config.push.relayPendingPerSource, max: h.ctx.config.push.relayPendingMax };
+    h.ctx.config.push.relayPendingPerSource = 2;
+    h.ctx.config.push.relayPendingMax = 6;
+    try {
+      const A = "192.0.2.21";
+      const B = "192.0.2.22";
+      for (const [ip, id] of [[A, "pending-a1"], [A, "pending-a2"], [B, "pending-b1"], [B, "pending-b2"]] as const) {
+        expect((await from(ip, id)).statusCode).toBe(200);
+      }
+      expect((await from(B, "pending-b3")).statusCode).toBe(429);
+      // B refreshes A's records: allowed (no new row), but they stay charged to A ...
+      expect((await from(B, "pending-a1")).statusCode).toBe(200);
+      expect((await from(B, "pending-a2")).statusCode).toBe(200);
+      expect(await pendingOf("pending-a1")).toEqual({ linked: false, source: A });
+      // ... so A cannot add more, and two sources hold four rows, not six.
+      expect((await from(A, "pending-a3")).statusCode).toBe(429);
+      expect((await relayRows()).length).toBe(4);
+      // Once a record is deleted, "refreshing" it is a new registration and B's quota applies.
+      await h.app.inject({ method: "DELETE", url: "/relay/api/push/register/pending-a1", remoteAddress: "192.0.2.23" });
+      expect((await from(B, "pending-a1")).statusCode).toBe(429);
+      expect(await pendingOf("pending-a1")).toBeUndefined();
+    } finally {
+      h.ctx.config.push.relayPendingPerSource = saved.perSource;
+      h.ctx.config.push.relayPendingMax = saved.max;
+    }
+  });
+
+  it("links a registration once Bulwark's PushSubscription is verified, within the setup window", async () => {
+    const { principal } = await h.newAccount();
+    // register, PushSubscription/set create, poll verify, PushSubscription/set update verificationCode
+    const { subId } = await h.enable(principal, "dev-link-0001");
+    expect(await pendingOf("dev-link-0001")).toEqual({ linked: true, source: null });
+    await h.ctx.db.query("UPDATE push_relay_sub SET created_at = now() - interval '1 day', updated_at = now() - interval '1 day'");
+    await garbageCollect(h.ctx.db);
+    expect(await getRelaySub(h.ctx.db, "dev-link-0001")).not.toBeNull();
+
+    // A linked record does not count against the pending quotas, and re-registering it (daily resync) always works.
+    for (let i = 0; i < h.ctx.config.push.relayPendingPerSource; i++) await from("192.0.2.77", `dev-link-fill-${i}`);
+    expect((await from("192.0.2.77", "dev-link-fill-extra")).statusCode).toBe(429);
+    expect((await from("192.0.2.77", "dev-link-0001")).statusCode).toBe(200);
+    expect(await pendingOf("dev-link-0001")).toEqual({ linked: true, source: null });
+
+    // Destroyed: pending again, so it expires unless verified anew; re-registering it charges no source.
+    await h.jmap(principal, "PushSubscription/set", { destroy: [subId] });
+    expect(await pendingOf("dev-link-0001")).toEqual({ linked: false, source: null });
+    expect((await from("192.0.2.79", "dev-link-0001")).statusCode).toBe(200);
+    expect(await pendingOf("dev-link-0001")).toEqual({ linked: false, source: null });
+    await h.ctx.db.query("UPDATE push_relay_sub SET updated_at = now() - interval '11 minutes'");
+    await garbageCollect(h.ctx.db);
+    expect(await relayRows()).toEqual([]);
+  });
+
+  it("expires never-verified PushSubscriptions after the setup window", async () => {
+    const { principal } = await h.newAccount();
+    await from("192.0.2.78", "dev-unverified-1");
+    const res = await h.jmap(principal, "PushSubscription/set", {
+      create: { a: { deviceClientId: "d", url: relayUrl("dev-unverified-1") } },
+    });
+    expect(res.created).toHaveProperty("a");
+    await h.ctx.db.query("UPDATE push_jmap_sub SET created_at = now() - interval '11 minutes'");
+    await h.ctx.db.query("UPDATE push_relay_sub SET updated_at = now() - interval '11 minutes'");
+    await garbageCollect(h.ctx.db);
+    expect((await h.jmap(principal, "PushSubscription/get", { ids: null })).list).toEqual([]);
+    expect(await relayRows()).toEqual([]);
+  });
+
+  it("keys sources by IPv4 address and IPv6 /64", () => {
+    expect(sourceKey("203.0.113.9")).toBe("203.0.113.9");
+    expect(sourceKey("::ffff:203.0.113.9")).toBe("203.0.113.9");
+    expect(sourceKey("2001:db8:1:2::1")).toBe("2001:db8:1:2::/64");
+    expect(sourceKey("2001:0db8:0001:0002:ffff:0:0:9")).toBe("2001:db8:1:2::/64");
+    expect(sourceKey("2001:db8::1")).toBe("2001:db8:0:0::/64");
+    expect(sourceKey("::1")).toBe("0:0:0:0::/64");
+    expect(sourceKey("64:ff9b::192.0.2.1")).toBe("64:ff9b:0:0::/64");
+  });
+});
+
 describe("PushSubscription emulation", () => {
   it("runs Bulwark's enableWebPush flow end to end", async () => {
     const { principal, account } = await h.newAccount();
@@ -164,6 +298,49 @@ describe("PushSubscription emulation", () => {
     const res = await h.jmap(principal, "PushSubscription/set", { create });
     expect(Object.keys(res.created as object)).toHaveLength(20);
     expect((res.notCreated as Record<string, { type: string }>).k20).toEqual(expect.objectContaining({ type: "overQuota" }));
+  });
+
+  it("gives the slots of abandoned unverified subscriptions back at the next create, even when full", async () => {
+    const { principal } = await h.newAccount();
+    const batch = (prefix: string, n: number) =>
+      Object.fromEntries(Array.from({ length: n }, (_, i) => [`${prefix}${i}`, { deviceClientId: "d", url: relayUrl(`dev-slot-${prefix}${i}`) }]));
+    expect(Object.keys((await h.jmap(principal, "PushSubscription/set", { create: batch("a", 20) })).created as object)).toHaveLength(20);
+    // still within the setup window: full
+    const full = await h.jmap(principal, "PushSubscription/set", { create: batch("b", 1) });
+    expect((full.notCreated as Record<string, { type: string }>).b0).toEqual(expect.objectContaining({ type: "overQuota" }));
+    // twelve of them abandoned (older than the window), eight still in progress
+    await h.ctx.db.query(
+      "UPDATE push_jmap_sub SET created_at = now() - interval '11 minutes' WHERE id IN (SELECT id FROM push_jmap_sub ORDER BY id LIMIT 12)",
+    );
+    const res = await h.jmap(principal, "PushSubscription/set", { create: batch("c", 13) });
+    expect(Object.keys(res.created as object)).toHaveLength(12);
+    expect(Object.keys(res.notCreated as object)).toHaveLength(1);
+    expect((await h.jmap(principal, "PushSubscription/get", { ids: null })).list).toHaveLength(20);
+  });
+
+  it("does not count revoked subscriptions against the quota, nor let them exempt a relay record", async () => {
+    const { principal, account } = await h.newAccount();
+    await h.enable(principal, "dev-revoked-quota");
+    const batch = (prefix: string, n: number) =>
+      Object.fromEntries(Array.from({ length: n }, (_, i) => [`${prefix}${i}`, { deviceClientId: "d", url: relayUrl(`dev-rq-${prefix}${i}`) }]));
+    expect(Object.keys((await h.jmap(principal, "PushSubscription/set", { create: batch("a", 19) })).created as object)).toHaveLength(19);
+    // bootstrap --reset (auth generation moves): every subscription of the account is revoked
+    await h.ctx.db.query("UPDATE account SET auth_generation = auth_generation + 1 WHERE id = $1", [account.id]);
+    expect(Object.keys((await h.jmap(principal, "PushSubscription/set", { create: batch("b", 20) })).created as object)).toHaveLength(20);
+    // the revoked verified subscription no longer makes its relay record exempt from the pending quota
+    await h.app.inject({ method: "DELETE", url: "/relay/api/push/register/dev-revoked-quota", remoteAddress: "192.0.2.90" });
+    const saved = h.ctx.config.push.relayPendingPerSource;
+    h.ctx.config.push.relayPendingPerSource = 1;
+    try {
+      expect((await register("dev-rq-filler")).statusCode).toBe(200);
+      const res = await h.app.inject({
+        method: "POST", url: "/relay/api/push/register/web", remoteAddress: "127.0.0.1",
+        payload: { subscriptionId: "dev-revoked-quota", subscription: { endpoint: `https://${PUSH_HOST}/push/x`, keys } },
+      });
+      expect(res.statusCode).toBe(429);
+    } finally {
+      h.ctx.config.push.relayPendingPerSource = saved;
+    }
   });
 
   it("verifies with the right code only, idempotently, and keeps immutables immutable", async () => {

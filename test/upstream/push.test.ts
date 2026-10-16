@@ -16,7 +16,7 @@ beforeAll(async () => {
   fake = await startFakeJmap();
   h = await makeHarness(
     { upstream: { eventSourceMinBackoffMs: 20 } },
-    { UPSTREAM_KIND: "jmap", UPSTREAM_SESSION_URL: fake.sessionUrl, UPSTREAM_AUTH: "bearer" },
+    { UPSTREAM_KIND: "jmap", UPSTREAM_SESSION_URL: fake.sessionUrl, UPSTREAM_ALLOWED_ORIGINS: fake.dlOrigin, UPSTREAM_AUTH: "bearer" },
   );
 });
 afterAll(async () => {

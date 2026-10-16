@@ -1,8 +1,11 @@
-import type { Queryable } from "../../db/pool.js";
+import type { Db, Queryable } from "../../db/pool.js";
 
 /** SQL for the push tables (migrations/200_push.sql). Every function takes the db (or a tx) first. */
 
 // ---------------------------------------------------------------- relay records
+
+/** How long an anonymous relay record, or an unverified PushSubscription, may wait for verification. */
+export const PENDING_WINDOW_MS = 10 * 60 * 1000;
 
 export interface RelaySub {
   relayId: string;
@@ -46,16 +49,81 @@ const toRelay = (r: RelayRow): RelaySub => ({
 /** Register (or re-register) a browser endpoint. Always clears the verification code and revives a gone record. */
 export async function upsertRelaySub(
   db: Queryable,
-  s: { relayId: string; endpoint: string; p256dh: string; auth: string; accountLabel: string | null },
+  s: { relayId: string; endpoint: string; p256dh: string; auth: string; accountLabel: string | null; pendingSource?: string | null },
 ): Promise<void> {
+  // pending_source is charged once, at insert: refreshing a pending record never moves its charge to
+  // another source (which would let sources trade quota), and a linked record never gets one again.
   await db.query(
-    `INSERT INTO push_relay_sub (relay_id, endpoint, p256dh, auth, account_label)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO push_relay_sub (relay_id, endpoint, p256dh, auth, account_label, pending_source)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (relay_id) DO UPDATE SET
        endpoint = EXCLUDED.endpoint, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth,
        account_label = EXCLUDED.account_label, verification_code = NULL,
-       updated_at = now(), gone_at = NULL, fail_count = 0`,
-    [s.relayId, s.endpoint, s.p256dh, s.auth, s.accountLabel],
+       updated_at = now(), gone_at = NULL, fail_count = 0,
+       pending_source = CASE WHEN push_relay_sub.linked_at IS NULL THEN push_relay_sub.pending_source END`,
+    [s.relayId, s.endpoint, s.p256dh, s.auth, s.accountLabel, s.pendingSource ?? null],
+  );
+}
+
+/**
+ * Anonymous registrations are "pending" until a verified PushSubscription
+ * links them (gateway-data-2). They are bounded per source and globally, and
+ * expire after the setup window; re-registering an existing record (Bulwark
+ * does that on every enable and daily resync) adds no row and is never refused.
+ */
+export interface PendingLimits {
+  /** A pending record not re-registered or linked within this window is deleted. */
+  windowMs: number;
+  /** Most pending records at once, in total. */
+  maxPending: number;
+  /** Most pending records at once from one source (client IP, IPv6 /64). */
+  maxPendingPerSource: number;
+}
+
+export type RegisterOutcome = "ok" | "source_full" | "global_full";
+
+/** Arbitrary constant for pg_advisory_xact_lock: serialises the pending-quota check with the insert. */
+const PENDING_LOCK_KEY = 7_283_520;
+
+export async function registerRelaySub(
+  db: Db,
+  s: { relayId: string; endpoint: string; p256dh: string; auth: string; accountLabel: string | null; source: string },
+  limits: PendingLimits,
+): Promise<RegisterOutcome> {
+  return db.transaction(async (tx) => {
+    await tx.query("SELECT pg_advisory_xact_lock($1)", [PENDING_LOCK_KEY]);
+    // Expired pending records go first, so they neither count nor linger until the next GC.
+    await tx.query(
+      "DELETE FROM push_relay_sub WHERE linked_at IS NULL AND updated_at < now() - make_interval(secs => $1::double precision / 1000)",
+      [limits.windowMs],
+    );
+    // Lock the record itself: a concurrent anonymous DELETE must not turn this refresh (exempt from the
+    // quotas) into a fresh insert. If the record is already gone, the quotas apply as to any new one.
+    const existing = await tx.query("SELECT 1 FROM push_relay_sub WHERE relay_id = $1 FOR UPDATE", [s.relayId]);
+    const exists = existing.rows.length > 0;
+    const { rows } = await tx.query<{ referenced: boolean; source: number; total: number }>(
+      `SELECT EXISTS (SELECT 1 FROM push_jmap_sub s WHERE s.relay_id = $1 AND ${DELIVERABLE}) AS referenced,
+              (SELECT count(*)::int FROM push_relay_sub WHERE linked_at IS NULL AND pending_source = $2) AS source,
+              (SELECT count(*)::int FROM push_relay_sub WHERE linked_at IS NULL) AS total`,
+      [s.relayId, s.source],
+    );
+    const r = rows[0]!;
+    if (!exists && !r.referenced) {
+      if (r.total >= limits.maxPending) return "global_full";
+      if (r.source >= limits.maxPendingPerSource) return "source_full";
+    }
+    await upsertRelaySub(tx, { ...s, pendingSource: s.source });
+    // A record deleted and registered again under an id that a verified subscription still uses is not pending.
+    if (r.referenced) await linkRelaySub(tx, s.relayId);
+    return "ok";
+  });
+}
+
+/** A verified PushSubscription points at this record: it is no longer pending. */
+export async function linkRelaySub(db: Queryable, relayId: string): Promise<void> {
+  await db.query(
+    "UPDATE push_relay_sub SET linked_at = COALESCE(linked_at, now()), pending_source = NULL WHERE relay_id = $1",
+    [relayId],
   );
 }
 
@@ -197,6 +265,32 @@ export async function insertJmapSub(db: Queryable, s: Omit<JmapSub, "verifiedAt"
   );
 }
 
+/**
+ * Insert unless the account already has `max` subscriptions. Unverified ones
+ * count too, and expire after the setup window (garbageCollect). The account
+ * row lock makes the count and the insert atomic against concurrent
+ * PushSubscription/set calls.
+ */
+export async function insertJmapSubWithinQuota(db: Db, s: Omit<JmapSub, "verifiedAt" | "createdAt">, max: number): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    await tx.query("SELECT 1 FROM account WHERE id = $1 FOR UPDATE", [s.accountId]);
+    // Abandoned set-ups give their slot back now, not only at the next garbage collection.
+    await tx.query(
+      `DELETE FROM push_jmap_sub WHERE account_id = $1 AND verified_at IS NULL
+         AND created_at < now() - make_interval(secs => $2::double precision / 1000)`,
+      [s.accountId, PENDING_WINDOW_MS],
+    );
+    // Revoked subscriptions do not count (clients no longer see them; garbageCollect deletes them).
+    const { rows } = await tx.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM push_jmap_sub s WHERE s.account_id = $1 AND ${AUTHORIZED}`,
+      [s.accountId],
+    );
+    if ((rows[0]?.n ?? 0) >= max) return false;
+    await insertJmapSub(tx, s);
+    return true;
+  });
+}
+
 export async function updateJmapSub(
   db: Queryable,
   id: string,
@@ -218,9 +312,20 @@ export async function updateJmapSub(
   await db.query(`UPDATE push_jmap_sub SET ${sets.join(", ")} WHERE id = $1 AND account_id = $2`, vals);
 }
 
+/** Delete; a relay record no other verified subscription uses becomes pending again (and expires unless re-linked). */
 export async function deleteJmapSub(db: Queryable, id: string, accountId: string): Promise<boolean> {
-  const res = await db.query("DELETE FROM push_jmap_sub WHERE id = $1 AND account_id = $2", [id, accountId]);
-  return (res.rowCount ?? 0) > 0;
+  const { rows } = await db.query<{ relay_id: string }>(
+    "DELETE FROM push_jmap_sub WHERE id = $1 AND account_id = $2 RETURNING relay_id",
+    [id, accountId],
+  );
+  if (!rows[0]) return false;
+  await db.query(
+    `UPDATE push_relay_sub r SET linked_at = NULL, updated_at = now()
+      WHERE r.relay_id = $1 AND r.linked_at IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM push_jmap_sub s WHERE s.relay_id = r.relay_id AND ${DELIVERABLE})`,
+    [rows[0].relay_id],
+  );
+  return true;
 }
 
 /** Does the account have a subscription that can receive pushes (P1: only then keep an upstream)? */
@@ -451,12 +556,15 @@ export async function notifiedIds(db: Queryable, accountId: string, ids: string[
   return new Set(rows.map((r) => r.email_id));
 }
 
-/** Housekeeping: old dedupe rows, long-expired emulated subs, dead or orphaned relay records. */
-export async function garbageCollect(db: Queryable): Promise<void> {
+/** Housekeeping: old dedupe rows, long-expired or never-verified emulated subs, dead, orphaned or expired pending relay records. */
+export async function garbageCollect(db: Queryable, pendingWindowMs = PENDING_WINDOW_MS): Promise<void> {
+  const window = "make_interval(secs => $1::double precision / 1000)";
   await db.query("DELETE FROM push_notified WHERE notified_at < now() - interval '7 days'");
   await db.query("DELETE FROM push_summary WHERE created_at < now() - interval '7 days'");
   await db.query("DELETE FROM push_jmap_sub WHERE expires < now() - interval '7 days'");
   await db.query(`DELETE FROM push_jmap_sub s WHERE NOT (${AUTHORIZED})`);
+  await db.query(`DELETE FROM push_jmap_sub WHERE verified_at IS NULL AND created_at < now() - ${window}`, [pendingWindowMs]);
+  await db.query(`DELETE FROM push_relay_sub WHERE linked_at IS NULL AND updated_at < now() - ${window}`, [pendingWindowMs]);
   await db.query(
     `DELETE FROM push_relay_sub r
       WHERE (r.gone_at IS NOT NULL AND r.gone_at < now() - interval '30 days')

@@ -32,10 +32,11 @@ export function hostAllowed(host: string, patterns: string[]): boolean {
   return patterns.some((p) => (p.startsWith("*.") ? h.endsWith(p.slice(1)) && h.length > p.length - 1 : h === p));
 }
 
+/** https on the default port, no userinfo, an allowed host. Checked at registration and again before every send. */
 export function endpointAllowed(endpoint: string, patterns: string[]): boolean {
   try {
     const u = new URL(endpoint);
-    return u.protocol === "https:" && !u.username && !u.password && hostAllowed(u.hostname, patterns);
+    return u.protocol === "https:" && !u.port && !u.username && !u.password && hostAllowed(u.hostname, patterns);
   } catch {
     return false;
   }

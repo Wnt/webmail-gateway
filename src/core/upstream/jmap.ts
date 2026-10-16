@@ -44,11 +44,27 @@ export function isJmapSession(s: unknown): s is JmapSession {
 }
 
 /**
- * Resolve the session's URLs against the session URL (RFC 8620 allows them to
- * be relative) and refuse any that would downgrade to plain http when the
- * session itself is https: the credential goes to every one of them.
+ * Where the credential may go (gateway-data-5): the session URL's origin and
+ * the configured UPSTREAM_ALLOWED_ORIGINS, never user info, and never from
+ * https down to http. The origin includes the port, so another port is
+ * another origin.
  */
-export function absolutizeSession(s: JmapSession, sessionUrl: string): JmapSession {
+export function originAllowed(u: URL, allowedOrigins: readonly string[]): boolean {
+  return !u.username && !u.password && allowedOrigins.includes(u.origin);
+}
+
+const notAllowed = (what: string, origin: string) =>
+  new UpstreamCallError(
+    `upstream session ${what} is on ${origin}, which is not an allowed upstream origin; if it is legitimate, add it to UPSTREAM_ALLOWED_ORIGINS`,
+  );
+
+/**
+ * Resolve the session's URLs against the session URL (RFC 8620 allows them to
+ * be relative) and check each against the allowed origins: the credential goes
+ * to every one of them. Refuses a downgrade to plain http when the session
+ * itself is https, user info, and template variables in the scheme or host.
+ */
+export function absolutizeSession(s: JmapSession, sessionUrl: string, allowedOrigins: readonly string[] = [new URL(sessionUrl).origin]): JmapSession {
   const base = new URL(sessionUrl);
   const out: JmapSession = { ...s };
   for (const k of URL_FIELDS) {
@@ -56,13 +72,24 @@ export function absolutizeSession(s: JmapSession, sessionUrl: string): JmapSessi
     if (typeof v !== "string") continue;
     // Resolve without letting URL() encode the template braces.
     const abs = /^[a-z][a-z0-9+.-]*:\/\//i.test(v) ? v : new URL(v.replace(/[{}]/g, (c) => (c === "{" ? "%7B" : "%7D")), base).href.replace(/%7B/g, "{").replace(/%7D/g, "}");
-    const proto = new URL(abs.replace(/[{}]/g, "")).protocol;
-    if (proto !== "https:" && !(proto === "http:" && base.protocol === "http:")) {
+    // A variable must never decide where the request goes.
+    if (/[{}]/.test(/^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i.exec(abs)?.[0] ?? "{")) {
+      throw new UpstreamCallError(`upstream session ${k} has a template variable in its origin`);
+    }
+    const u = new URL(abs.replace(/[{}]/g, ""));
+    if (u.protocol !== "https:" && !(u.protocol === "http:" && base.protocol === "http:")) {
       throw new UpstreamCallError(`upstream session ${k} is not https`);
     }
+    if (!originAllowed(u, allowedOrigins)) throw notAllowed(k, u.origin);
     (out as Record<string, unknown>)[k] = abs;
   }
   return out;
+}
+
+/** A redirect hop the credential-carrying client may follow: allowed origin, no downgrade. */
+function redirectPolicy(allowedOrigins: readonly string[]) {
+  return (next: URL, from: URL): boolean =>
+    originAllowed(next, allowedOrigins) && !(from.protocol === "https:" && next.protocol !== "https:");
 }
 
 /** The absolute upstream URL for a target, from the upstream session's templates. */
@@ -100,6 +127,8 @@ export class JmapUpstream implements Upstream {
   readonly agent = newAgent();
   private readonly sessionUrl: string;
   private readonly auth: "bearer" | "basic";
+  private readonly allowedOrigins: readonly string[];
+  private readonly redirectAllowed: (next: URL, from: URL) => boolean;
   private readonly sessions = new Map<string, { s: JmapSession; at: number }>();
   private readonly creds = new Map<string, { c: UpstreamCredential | null; at: number }>();
   private readonly authLost = new Set<(accountId: string) => void>();
@@ -112,6 +141,8 @@ export class JmapUpstream implements Upstream {
     if (u.kind !== "jmap") throw new Error("JmapUpstream needs UPSTREAM_KIND=jmap");
     this.sessionUrl = u.sessionUrl;
     this.auth = u.auth;
+    this.allowedOrigins = u.allowedOrigins;
+    this.redirectAllowed = redirectPolicy(u.allowedOrigins);
     this.credentialPrompt = u.auth === "bearer" ? "Upstream API token" : "Upstream password";
   }
 
@@ -145,7 +176,13 @@ export class JmapUpstream implements Upstream {
     }
     const body: unknown = await r.res.body.json().catch(() => null);
     if (!isJmapSession(body)) throw new UpstreamCallError("upstream session is not a JMAP Session");
-    const s = absolutizeSession(body, this.sessionUrl);
+    let s: JmapSession;
+    try {
+      s = absolutizeSession(body, this.sessionUrl, this.allowedOrigins);
+    } catch (err) {
+      this.ctx.log?.error({ accountId: account.id, err: (err as Error).message }, "upstream session refused");
+      throw err;
+    }
     this.sessions.set(account.id, { s, at: this.now() });
     return s;
   }
@@ -166,10 +203,15 @@ export class JmapUpstream implements Upstream {
       }
       url = jmapUrl(session, this.sessionUrl, req.target);
     }
+    // The expanded URL too: the credential is attached below.
+    if (!originAllowed(new URL(url), this.allowedOrigins)) {
+      throw new UpstreamError(`upstream ${req.target.kind} URL is not on an allowed upstream origin`, 502);
+    }
     const res = await send(this.agent, url, {
       ...req,
       headers: { ...req.headers, authorization: authorizationFor(cred) },
       maxRedirects: req.method === "GET" ? MAX_REDIRECTS : 0,
+      redirectAllowed: this.redirectAllowed,
     });
     if (res.statusCode === 401) {
       // A static credential: nothing to refresh. The token was revoked or expired.
@@ -233,6 +275,7 @@ export class JmapUpstream implements Upstream {
         headersTimeout: SESSION_TIMEOUT_MS,
         bodyTimeout: SESSION_TIMEOUT_MS,
         maxRedirects: MAX_REDIRECTS,
+        redirectAllowed: this.redirectAllowed,
       });
       status = res.statusCode;
       if (status === 200) body = await res.body.json().catch(() => null);
@@ -248,7 +291,7 @@ export class JmapUpstream implements Upstream {
       return { ok: false, reason: "mismatch", detail: `the credential belongs to ${names.join(" / ") || "an unnamed account"}` };
     }
     try {
-      absolutizeSession(body, this.sessionUrl);
+      absolutizeSession(body, this.sessionUrl, this.allowedOrigins);
     } catch (err) {
       return { ok: false, reason: "error", detail: (err as Error).message };
     }

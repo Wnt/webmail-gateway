@@ -1,11 +1,12 @@
+import { isIPv6 } from "node:net";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { AppContext } from "../../types.js";
 import type { PushStats } from "./stats.js";
-import { deleteRelaySub, getRelaySub, relayActive, upsertRelaySub } from "./store.js";
+import { deleteRelaySub, getRelaySub, PENDING_WINDOW_MS, registerRelaySub, relayActive } from "./store.js";
 import { endpointAllowed, isValidSubscriptionId, isValidWebPushSubscription } from "./validation.js";
 
 /** A fresh relay record counts as active this long even before verification (same as the relay). */
-export const ACTIVE_GRACE_MS = 10 * 60 * 1000;
+export const ACTIVE_GRACE_MS = PENDING_WINDOW_MS;
 const BODY_LIMIT = 16 * 1024;
 
 /** Fixed-window per-IP limiter (one replica, D12: in memory is enough). */
@@ -28,6 +29,23 @@ export class RateLimiter {
   private sweep(now: number): void {
     for (const [k, v] of this.hits) if (v.resetAt <= now) this.hits.delete(k);
   }
+}
+
+/**
+ * The rate-limit and pending-quota key for a client address: IPv4 as is, IPv6
+ * by its /64, since one host usually holds a whole /64.
+ */
+export function sourceKey(ip: string): string {
+  const v4 = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
+  if (v4) return v4[1]!;
+  if (!isIPv6(ip)) return ip;
+  const [head = "", tail = ""] = ip.split("::");
+  const h = head ? head.split(":") : [];
+  const t = tail ? tail.split(":") : [];
+  // an embedded dotted IPv4 tail fills two groups
+  const width = (gs: string[]) => gs.reduce((n, g) => n + (g.includes(".") ? 2 : 1), 0);
+  const groups = ip.includes("::") ? [...h, ...Array<string>(8 - width(h) - width(t)).fill("0"), ...t] : h;
+  return `${groups.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(":")}::/64`;
 }
 
 const err = (reply: FastifyReply, status: number, error: string) =>
@@ -57,7 +75,7 @@ export async function registerRelayRoutes(app: FastifyInstance, ctx: AppContext,
       r.setNotFoundHandler((_req, reply) => err(reply, 404, "Not found"));
 
       const limited = (lim: RateLimiter) => async (req: FastifyRequest, reply: FastifyReply) => {
-        if (!lim.allow(req.ip)) {
+        if (!lim.allow(sourceKey(req.ip))) {
           stats.inc("relay_rate_limited");
           return err(reply, 429, "Too many requests");
         }
@@ -80,13 +98,23 @@ export async function registerRelayRoutes(app: FastifyInstance, ctx: AppContext,
           ctx.log.warn({ host: safeHost(subscription.endpoint) }, "push: refused endpoint host");
           return err(reply, 400, "Invalid subscription");
         }
-        await upsertRelaySub(ctx.db, {
-          relayId: subscriptionId,
-          endpoint: subscription.endpoint,
-          p256dh: subscription.keys.p256dh,
-          auth: subscription.keys.auth,
-          accountLabel: typeof accountLabel === "string" ? accountLabel.slice(0, 120) : null,
-        });
+        const outcome = await registerRelaySub(
+          ctx.db,
+          {
+            relayId: subscriptionId,
+            endpoint: subscription.endpoint,
+            p256dh: subscription.keys.p256dh,
+            auth: subscription.keys.auth,
+            accountLabel: typeof accountLabel === "string" ? accountLabel.slice(0, 120) : null,
+            source: sourceKey(req.ip),
+          },
+          { windowMs: PENDING_WINDOW_MS, maxPending: ctx.config.push.relayPendingMax, maxPendingPerSource: ctx.config.push.relayPendingPerSource },
+        );
+        if (outcome !== "ok") {
+          stats.inc(`relay_pending_${outcome}`);
+          if (outcome === "global_full") ctx.log.warn("push: too many pending relay registrations");
+          return err(reply, 429, "Too many pending registrations");
+        }
         stats.inc("relay_registered");
         return reply.header("cache-control", "no-store").send({ ok: true });
       });

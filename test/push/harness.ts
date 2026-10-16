@@ -70,6 +70,7 @@ export async function makeHarness(opts: PushTestOptions = {}, env: Record<string
   const appUrl = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}`;
   ctx.config.push.internalBaseUrl = appUrl;
 
+  let enables = 0;
   const h: Harness = {
     ctx,
     app,
@@ -110,9 +111,12 @@ export async function makeHarness(opts: PushTestOptions = {}, env: Record<string
     },
     jmap: (principal, method, args) => handlePushSubscription(principal, method, args),
     async enable(principal, relayId, browser = makeBrowser()) {
+      // Each enable is another browser, so the per-IP write limiter does not add up across a test file.
+      const n = ++enables;
       const reg = await app.inject({
         method: "POST",
         url: "/relay/api/push/register/web",
+        remoteAddress: `198.18.${(n >> 8) & 255}.${n & 255}`,
         payload: {
           subscriptionId: relayId,
           subscription: { endpoint: `https://${PUSH_HOST}/push/${relayId}`, keys: browser.keys },

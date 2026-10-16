@@ -32,6 +32,7 @@ beforeAll(async () => {
   const config = makeTestConfig({
     UPSTREAM_KIND: "jmap",
     UPSTREAM_SESSION_URL: fake.sessionUrl,
+    UPSTREAM_ALLOWED_ORIGINS: fake.dlOrigin,
     UPSTREAM_AUTH: "bearer",
     LEGACY_PROXY_URL: "",
     LEGACY_SESSION_HMAC_KEY: "",
@@ -76,7 +77,9 @@ describe("config", () => {
     expect(() => loadConfig({ ...env, UPSTREAM_KIND: "jmap" })).toThrow(/UPSTREAM_SESSION_URL/);
     expect(() => loadConfig(env)).toThrow(/LEGACY_PROXY_URL/);
     const c = loadConfig({ ...env, UPSTREAM_KIND: "jmap", UPSTREAM_SESSION_URL: "https://api.fastmail.com/jmap/session" });
-    expect(c.upstream).toEqual({ kind: "jmap", sessionUrl: "https://api.fastmail.com/jmap/session", auth: "bearer" });
+    expect(c.upstream).toEqual({
+      kind: "jmap", sessionUrl: "https://api.fastmail.com/jmap/session", auth: "bearer", allowedOrigins: ["https://api.fastmail.com"],
+    });
     expect(() => loadConfig({ ...env, UPSTREAM_KIND: "jmap", UPSTREAM_SESSION_URL: "https://x.test/s", JMAP_PASSWORD_MODE: "true" })).toThrow(/PASSWORD_MODE/);
   });
 });

@@ -36,6 +36,8 @@ export interface SendOptions {
   bodyTimeout?: number | undefined;
   /** GET only: follow up to this many redirects. Credentials are dropped when the origin changes. */
   maxRedirects?: number;
+  /** Each redirect target must pass this, or the request fails with 502 (instead of following it). */
+  redirectAllowed?: (next: URL, from: URL) => boolean;
 }
 
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
@@ -67,6 +69,9 @@ export async function send(agent: Dispatcher, url: string, o: SendOptions): Prom
     const next = new URL(location, target);
     if (next.protocol !== "https:" && next.protocol !== "http:") return res;
     await res.body.dump();
+    if (o.redirectAllowed && !o.redirectAllowed(next, target)) {
+      throw new UpstreamError(`upstream redirected to ${next.origin}, which is not an allowed upstream origin`, 502, "REDIRECT_REFUSED");
+    }
     if (next.origin !== target.origin) {
       // Like fetch(): never carry credentials to another origin.
       headers = Object.fromEntries(Object.entries(headers).filter(([k]) => k.toLowerCase() !== "authorization"));

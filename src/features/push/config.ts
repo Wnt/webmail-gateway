@@ -59,6 +59,10 @@ export const pushConfigSchema = z
           .map((h) => h.trim().toLowerCase())
           .filter(Boolean),
       ),
+    /** Most anonymous relay registrations waiting for a verified PushSubscription at once (gateway-data-2). */
+    PUSH_RELAY_PENDING_MAX: posInt(200),
+    /** The same, per client address (IPv6: per /64). */
+    PUSH_RELAY_PENDING_PER_SOURCE: posInt(10),
     /** P1: keep an upstream subscription for every account with a stored password, not only subscribed ones. */
     PUSH_UPSTREAM_ALWAYS: bool("false"),
     PUSH_RECONCILE_INTERVAL_S: posInt(300),
@@ -120,6 +124,8 @@ export interface PushConfig {
   vapid: VapidConfig | null;
   internalBaseUrl: string;
   endpointHosts: string[];
+  relayPendingMax: number;
+  relayPendingPerSource: number;
   upstreamAlways: boolean;
   reconcileIntervalMs: number;
   upstreamExpiresMs: number;
@@ -139,6 +145,8 @@ export function parsePushConfig(env: NodeJS.ProcessEnv): PushConfig {
         : null,
     internalBaseUrl: c.PUSH_INTERNAL_BASE_URL,
     endpointHosts: c.PUSH_ENDPOINT_HOSTS,
+    relayPendingMax: c.PUSH_RELAY_PENDING_MAX,
+    relayPendingPerSource: c.PUSH_RELAY_PENDING_PER_SOURCE,
     upstreamAlways: c.PUSH_UPSTREAM_ALWAYS,
     reconcileIntervalMs: c.PUSH_RECONCILE_INTERVAL_S * 1000,
     upstreamExpiresMs: c.PUSH_UPSTREAM_EXPIRES_DAYS * 86_400_000,

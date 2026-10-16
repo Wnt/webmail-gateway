@@ -5,6 +5,7 @@ import { minimalPayload, type PushPayload } from "./payload.js";
 import { safeHost } from "./relay-routes.js";
 import type { PushStats } from "./stats.js";
 import { recordRelayResult, targetStillAuthorized, type PushTarget, type SendOutcome } from "./store.js";
+import { endpointAllowed } from "./validation.js";
 
 /**
  * Encrypted Web Push (RFC 8291 aes128gcm) with VAPID (RFC 8292). `web-push`
@@ -65,6 +66,11 @@ export class Sender {
   }
 
   private async sendOne(target: PushTarget, payload: PushPayload, topic: string): Promise<SendOutcome> {
+    // The allowlist may have changed since the browser registered: check it again at every send.
+    if (!endpointAllowed(target.endpoint, this.ctx.config.push.endpointHosts)) {
+      this.ctx.log.warn({ relay: target.relayId.slice(0, 6), host: safeHost(target.endpoint) }, "push: endpoint host no longer allowed");
+      return this.done(target, "gone", "push_send_refused");
+    }
     let body = payload;
     let shrunk = false;
     for (let attempt = 0; ; attempt++) {
@@ -87,7 +93,8 @@ export class Sender {
         attempt--;
         continue;
       }
-      if (status === 400 || status === 401 || status === 403 || status === 413) {
+      // A redirect is never followed (it could lead anywhere): the endpoint is broken.
+      if (status === 400 || status === 401 || status === 403 || status === 413 || (status >= 300 && status < 400)) {
         this.ctx.log.warn({ relay: target.relayId.slice(0, 6), host: safeHost(target.endpoint), status }, "push: rejected");
         return this.done(target, "rejected", "push_send_rejected");
       }
@@ -140,6 +147,8 @@ export class Sender {
         method: "POST",
         headers,
         body: details.body as Buffer,
+        // Never follow: the next hop was not checked against PUSH_ENDPOINT_HOSTS.
+        redirect: "manual",
         signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
       });
       try {
@@ -149,7 +158,9 @@ export class Sender {
       }
       const ra = res.headers.get("retry-after");
       const secs = ra && /^\d+$/.test(ra) ? Number(ra) : NaN;
-      return { status: res.status, ...(Number.isFinite(secs) ? { retryAfterMs: secs * 1000 } : {}) };
+      // A spec-strict fetch hides a manual redirect as status 0 "opaqueredirect": still a redirect, not a network error.
+      const status = res.type === "opaqueredirect" ? 302 : res.status;
+      return { status, ...(Number.isFinite(secs) ? { retryAfterMs: secs * 1000 } : {}) };
     } catch (err) {
       this.ctx.log.debug({ host: safeHost(target.endpoint), err: (err as Error).message }, "push: network error");
       return { status: 0 };

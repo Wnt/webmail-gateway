@@ -5,7 +5,7 @@ import { onNewMail, type NewMailEvent } from "../../src/core/hooks.js";
 import { makePushPlugin } from "../../src/features/push/index.js";
 import { getRelaySub, getUpstream, upsertRelaySub } from "../../src/features/push/store.js";
 import { DEVICE_CLIENT_ID } from "../../src/features/push/upstream.js";
-import { checkVapid, makeBrowser, type FakeBrowser } from "./fakes.js";
+import { checkVapid, makeBrowser, startFakePushService, type FakeBrowser } from "./fakes.js";
 import { makeHarness, PUSH_HOST, sleep, until, type Harness } from "./harness.js";
 
 let h: Harness;
@@ -473,6 +473,43 @@ describe("push service answers", () => {
       await until(() => h.rt.stats.get("push_send_rejected") >= Number(id.slice(1)));
     }
     expect((await getRelaySub(h.ctx.db, "dev-svc-0005"))?.goneAt).not.toBeNull();
+  });
+
+  it("does not follow a push service redirect outside the registered endpoint (gateway-data-3)", async () => {
+    const acc = await setup("dev-svc-0008");
+    const outside = await startFakePushService();
+    try {
+      // Same-host and cross-host redirects alike: the next hop was never checked against PUSH_ENDPOINT_HOSTS.
+      h.pushSvc.script.set("dev-svc-0008", [
+        { status: 307, headers: { location: outside.endpoint("outside-allowlist") } },
+        { status: 308, headers: { location: `https://${PUSH_HOST}/push/elsewhere` } },
+        { status: 302, headers: { location: outside.endpoint("outside-allowlist") } },
+      ]);
+      for (const [i, id] of ["x1", "x2", "x3"].entries()) {
+        await h.legacy.deliver(acc.slug, { id });
+        await until(() => h.rt.stats.get("push_send_rejected") === i + 1);
+      }
+      expect(h.pushSvc.requests.map((r) => r.id)).toEqual(["dev-svc-0008", "dev-svc-0008", "dev-svc-0008"]);
+      expect(outside.requests, "the allowed service must not choose an unvalidated next-hop destination").toHaveLength(0);
+      // A redirect is a broken endpoint: three in a row mark it gone, like other rejections.
+      expect((await getRelaySub(h.ctx.db, "dev-svc-0008"))?.goneAt).not.toBeNull();
+    } finally {
+      await outside.close();
+    }
+  });
+
+  it("checks the endpoint against the current PUSH_ENDPOINT_HOSTS at send time (gateway-data-3)", async () => {
+    const acc = await setup("dev-svc-0009");
+    const saved = h.ctx.config.push.endpointHosts;
+    h.ctx.config.push.endpointHosts = ["other-push.example.test"];
+    try {
+      await h.legacy.deliver(acc.slug, { id: "h1" });
+      await until(() => h.rt.stats.get("push_send_refused") === 1);
+      expect(h.pushSvc.requests).toHaveLength(0);
+      expect((await getRelaySub(h.ctx.db, "dev-svc-0009"))?.goneAt).not.toBeNull();
+    } finally {
+      h.ctx.config.push.endpointHosts = saved;
+    }
   });
 
   it("does not send to an unverified or expired subscription", async () => {

@@ -39,6 +39,15 @@ export const coreConfigSchema = z.object({
   UPSTREAM_KIND: z.enum(["legacy", "jmap"]).default("legacy"),
   /** jmap upstream: its JMAP Session resource, e.g. https://api.fastmail.com/jmap/session */
   UPSTREAM_SESSION_URL: opt(z.url()),
+  /**
+   * jmap upstream: comma-separated origins, besides UPSTREAM_SESSION_URL's own, that the session's
+   * apiUrl/uploadUrl/downloadUrl/eventSourceUrl (and their redirects) may use, e.g. Fastmail's
+   * separate download host `https://www.fastmailusercontent.com`. The credential goes to no other origin.
+   */
+  UPSTREAM_ALLOWED_ORIGINS: z
+    .string()
+    .default("")
+    .transform((v) => v.split(",").map((o) => o.trim()).filter(Boolean)),
   /** jmap upstream: how the stored per-account credential is sent (`bearer` API token, or `basic` password). */
   UPSTREAM_AUTH: z.enum(["bearer", "basic"]).default("bearer"),
   /** legacy upstream: base URL of legacy-proxy, e.g. http://legacy-proxy:8080 */
@@ -62,13 +71,43 @@ export const coreConfigSchema = z.object({
     }
   } else if (!c.UPSTREAM_SESSION_URL) {
     ctx.addIssue({ code: "custom", path: ["UPSTREAM_SESSION_URL"], message: "required when UPSTREAM_KIND=jmap" });
+  } else {
+    const session = new URL(c.UPSTREAM_SESSION_URL);
+    if (session.username || session.password) {
+      ctx.addIssue({ code: "custom", path: ["UPSTREAM_SESSION_URL"], message: "must not contain user info" });
+    }
+    for (const o of c.UPSTREAM_ALLOWED_ORIGINS) {
+      const problem = originProblem(o, session.protocol);
+      if (problem) ctx.addIssue({ code: "custom", path: ["UPSTREAM_ALLOWED_ORIGINS"], message: `${o}: ${problem}` });
+    }
   }
 });
+
+/** Why `o` is not a bare origin (`scheme://host[:port]`) usable next to a session on `sessionProtocol`, or null. */
+function originProblem(o: string, sessionProtocol: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(o);
+  } catch {
+    return "not a URL";
+  }
+  if (u.protocol !== "https:" && !(u.protocol === "http:" && sessionProtocol === "http:")) return "must be https";
+  if (u.username || u.password || u.pathname !== "/" || u.search || u.hash) {
+    return "must be a bare origin, like https://host or https://host:port";
+  }
+  return null;
+}
 
 /** Where mail lives. `legacy`: legacy-proxy (minted tokens, Gandi re-login). `jmap`: any native JMAP server. */
 export type UpstreamConfig =
   | { kind: "legacy" }
-  | { kind: "jmap"; sessionUrl: string; auth: "bearer" | "basic" };
+  | {
+      kind: "jmap";
+      sessionUrl: string;
+      auth: "bearer" | "basic";
+      /** Origins the credential may be sent to: the session URL's own, then UPSTREAM_ALLOWED_ORIGINS. */
+      allowedOrigins: string[];
+    };
 
 export interface Config {
   port: number;
@@ -107,7 +146,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     encKey: c.GATEWAY_ENC_KEY,
     upstream:
       c.UPSTREAM_KIND === "jmap"
-        ? { kind: "jmap", sessionUrl: c.UPSTREAM_SESSION_URL!, auth: c.UPSTREAM_AUTH }
+        ? {
+            kind: "jmap",
+            sessionUrl: c.UPSTREAM_SESSION_URL!,
+            auth: c.UPSTREAM_AUTH,
+            allowedOrigins: [...new Set([new URL(c.UPSTREAM_SESSION_URL!).origin, ...c.UPSTREAM_ALLOWED_ORIGINS.map((o) => new URL(o).origin)])],
+          }
         : { kind: "legacy" },
     legacyProxyUrl: c.LEGACY_PROXY_URL ?? "",
     legacyHmacKey: c.LEGACY_SESSION_HMAC_KEY ?? Buffer.alloc(0),

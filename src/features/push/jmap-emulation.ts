@@ -5,7 +5,8 @@ import type { AppContext } from "../../types.js";
 import type { PushStats } from "./stats.js";
 import {
   deleteJmapSub,
-  insertJmapSub,
+  insertJmapSubWithinQuota,
+  linkRelaySub,
   listJmapSubs,
   setRelayVerificationCode,
   updateJmapSub,
@@ -128,18 +129,10 @@ export function createPushSubscriptionHandler(deps: EmulationDeps) {
     return { list, notFound };
   }
 
-  async function create(
-    accountId: string,
-    grantId: string | null,
-    raw: unknown,
-    existing: number,
-  ): Promise<Record<string, unknown> | { error: SetError }> {
+  async function create(accountId: string, grantId: string | null, raw: unknown): Promise<Record<string, unknown> | { error: SetError }> {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { error: { type: "invalidProperties", description: "not an object" } };
     const o = raw as Record<string, unknown>;
     for (const k of Object.keys(o)) if (!CREATE_PROPS.has(k)) return invalid(k, `unsupported property ${k}`);
-    if (existing >= MAX_SUBS_PER_ACCOUNT) {
-      return { error: { type: "overQuota", description: "Too many push subscriptions for this account" } };
-    }
     if (typeof o.deviceClientId !== "string" || o.deviceClientId.length < 1 || o.deviceClientId.length > 255) {
       return invalid("deviceClientId", "deviceClientId must be a string of 1-255 characters");
     }
@@ -156,17 +149,12 @@ export function createPushSubscriptionHandler(deps: EmulationDeps) {
 
     const id = newId();
     const code = randomBytes(24).toString("base64url");
-    await insertJmapSub(db, {
-      id,
-      accountId,
-      grantId,
-      deviceClientId: o.deviceClientId,
-      relayId,
-      url: o.url as string,
-      types: t.types,
-      expires: e.expires,
-      verificationCode: code,
-    });
+    const inserted = await insertJmapSubWithinQuota(
+      db,
+      { id, accountId, grantId, deviceClientId: o.deviceClientId, relayId, url: o.url as string, types: t.types, expires: e.expires, verificationCode: code },
+      MAX_SUBS_PER_ACCOUNT,
+    );
+    if (!inserted) return { error: { type: "overQuota", description: "Too many push subscriptions for this account" } };
     // The emulated PushVerification "POST" to the relay URL.
     const delivered = await setRelayVerificationCode(db, relayId, code);
     stats.inc("jmap_sub_created");
@@ -205,6 +193,8 @@ export function createPushSubscriptionHandler(deps: EmulationDeps) {
       if (e.clamped) result = { expires: utcDate(e.expires) };
     }
     await updateJmapSub(db, sub.id, accountId, patch);
+    // Verified: the relay record is no longer an anonymous pending registration.
+    if ("verificationCode" in o) await linkRelaySub(db, sub.relayId);
     if (patch.verified) {
       stats.inc("jmap_sub_verified");
       ctx.log.info({ accountId, relay: sub.relayId.slice(0, 6) }, "push: emulated subscription verified");
@@ -227,14 +217,11 @@ export function createPushSubscriptionHandler(deps: EmulationDeps) {
     const notDestroyed: Record<string, SetError> = {};
     let changed = false;
 
-    let count = (await listJmapSubs(db, accountId)).length;
+    // The quota is enforced per create, under the account lock (insertJmapSubWithinQuota).
     for (const [key, raw] of Object.entries((c as Record<string, unknown>) ?? {})) {
-      const r = await create(accountId, grantId, raw, count);
+      const r = await create(accountId, grantId, raw);
       if ("error" in r) notCreated[key] = r.error as SetError;
-      else {
-        created[key] = r;
-        count++;
-      }
+      else created[key] = r;
     }
 
     const subs = new Map((await listJmapSubs(db, accountId)).map((s) => [s.id, s]));

@@ -13,9 +13,9 @@ import { startFakeJmap } from "./fake-jmap.js";
 const fake = await startFakeJmap();
 const EMAIL = "alice@example.test";
 const TOKEN = "fmu1-alice-0123456789abcdef";
-const env = { UPSTREAM_KIND: "jmap", UPSTREAM_SESSION_URL: fake.sessionUrl, LEGACY_PROXY_URL: "", LEGACY_SESSION_HMAC_KEY: "" };
+const env = { UPSTREAM_KIND: "jmap", UPSTREAM_SESSION_URL: fake.sessionUrl, UPSTREAM_ALLOWED_ORIGINS: fake.dlOrigin, LEGACY_PROXY_URL: "", LEGACY_SESSION_HMAC_KEY: "" };
 const ctx: AppContext = await makeTestContext(env);
-const basicCtx: AppContext = { ...ctx, config: { ...ctx.config, upstream: { kind: "jmap", sessionUrl: fake.sessionUrl, auth: "basic" } } };
+const basicCtx: AppContext = { ...ctx, config: { ...ctx.config, upstream: { kind: "jmap", sessionUrl: fake.sessionUrl, auth: "basic", allowedOrigins: [new URL(fake.sessionUrl).origin, fake.dlOrigin] } } };
 const now = Date.parse("2026-10-15T12:00:00Z");
 
 function io(input: string): BootstrapIo & { out: string; err: string } {
@@ -74,7 +74,7 @@ describe("bootstrap with UPSTREAM_KIND=jmap", () => {
     let i = io(TOKEN);
     expect(await runBootstrap(["mallory@example.test"], ctx, i, () => now)).toBe(2);
     expect(fake.seen).toHaveLength(0);
-    const down: AppContext = { ...ctx, config: { ...ctx.config, upstream: { kind: "jmap", sessionUrl: "http://127.0.0.1:1/jmap/session", auth: "bearer" } } };
+    const down: AppContext = { ...ctx, config: { ...ctx.config, upstream: { kind: "jmap", sessionUrl: "http://127.0.0.1:1/jmap/session", auth: "bearer", allowedOrigins: ["http://127.0.0.1:1"] } } };
     i = io(TOKEN);
     expect(await runBootstrap([EMAIL], down, i, () => now)).toBe(1);
     expect(i.err).toContain("unreachable");
