@@ -11,6 +11,8 @@ export interface LlmRequest {
     max_tokens?: number;
     temperature?: number;
     stream?: boolean;
+    response_format?: { type: string; json_schema?: { name: string; schema: unknown } };
+    chat_template_kwargs?: Record<string, unknown>;
   };
 }
 
@@ -35,11 +37,14 @@ export interface FakeLlm {
 
 export const DEFAULT_SUMMARY = "Alice asks whether you can join the planning meeting on Friday.";
 
+/** A model answer in the shape the response_format schema forces: `{"ai_instructions": …, "summary": …}`. */
+export const json = (summary: string, aiInstructions = false): string => JSON.stringify({ ai_instructions: aiInstructions, summary });
+
 export async function startFakeLlm(): Promise<FakeLlm> {
   const fake: FakeLlm = {
     url: "",
     requests: [],
-    answer: () => ({ content: DEFAULT_SUMMARY }),
+    answer: () => ({ content: json(DEFAULT_SUMMARY) }),
     aborted: 0,
     close: async () => {
       server.closeAllConnections();

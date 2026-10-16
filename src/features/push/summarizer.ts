@@ -7,7 +7,17 @@ import { fitPayload, type PushPayload } from "./payload.js";
 import type { Sender } from "./sender.js";
 import type { PushStats } from "./stats.js";
 import { targetsForAccount } from "./store.js";
-import { bodyForSummary, sanitizeSummary, SYSTEM_PROMPT, userMessage, type BodyPart } from "./summary-text.js";
+import {
+  bodyForSummary,
+  buildMessages,
+  GEN_PARAMS,
+  INJECTION_NOTICE,
+  parseAnswer,
+  postprocess,
+  sanitizeSummary,
+  type BodyPart,
+  type ChatMessage,
+} from "./summary-text.js";
 
 /**
  * AI summaries (Phase 5). After the normal preview push, the newest message of
@@ -19,6 +29,9 @@ import { bodyForSummary, sanitizeSummary, SYSTEM_PROMPT, userMessage, type BodyP
  * - One summary at a time, gateway-wide (the model runs on a few CPU cores).
  * - Per account only the newest message: a newer push for the account
  *   replaces a queued job and aborts a running one.
+ * - The request follows design/summaries (prompt v3): JSON `{ai_instructions,
+ *   summary}` under a schema. A flagged email gets a fixed, localised notice
+ *   instead of the model's text.
  * - On timeout, error or a doubtful answer nothing more is sent: the preview stays.
  * - Results are cached per message in `push_summary` (sealed).
  * - Read, moved or junked mail is skipped, before and after the model call.
@@ -42,14 +55,7 @@ export interface SummarySource {
   stillNotifiable(job: SummaryJob): Promise<boolean>;
 }
 
-export interface ChatMessage {
-  role: "system" | "user";
-  content: string;
-}
-
 const MAX_RESPONSE_BYTES = 64 * 1024;
-/** About 180 characters of output, with room for Finnish's longer tokens. */
-const MAX_OUTPUT_TOKENS = 120;
 
 class SummaryHttpError extends Error {}
 
@@ -67,7 +73,7 @@ export async function chatCompletion(
       accept: "application/json",
       ...(cfg.apiKey ? { authorization: `Bearer ${cfg.apiKey}` } : {}),
     },
-    body: JSON.stringify({ model: cfg.model, messages, temperature: 0.2, max_tokens: MAX_OUTPUT_TOKENS, stream: false }),
+    body: JSON.stringify({ model: cfg.model, messages, ...GEN_PARAMS }),
     signal,
   });
   const text = await res.text();
@@ -204,6 +210,7 @@ export class Summarizer {
       this.pending.delete(accountId);
       const abort = new AbortController();
       this.current = { job, abort };
+      const started = Date.now();
       let outcome: SummaryOutcome;
       try {
         outcome = await this.run(job, abort.signal);
@@ -214,6 +221,8 @@ export class Summarizer {
         this.current = null;
       }
       this.stats.inc(`summary_${outcome}`);
+      // status and timing only, never content
+      this.ctx.log.info({ accountId, outcome, ms: Date.now() - started }, "push: summary outcome");
       this.opts.onOutcome?.(job, outcome);
     }
   }
@@ -227,6 +236,7 @@ export class Summarizer {
     const email = job.payload.email!;
     let summary: string | null = null;
     let modelMs: number | null = null;
+    let flagged = false;
 
     const cached = await getCachedSummary(db, config.encKey, job.accountId, job.emailId);
     if (cached?.status === "rejected") return "rejected";
@@ -240,18 +250,11 @@ export class Summarizer {
       const body = bodyForSummary(parts);
       if (!body && !email.subject) return "empty";
 
+      const { messages, lang } = buildMessages(email.from, email.subject, body);
       const started = Date.now();
       let raw: string;
       try {
-        raw = await chatCompletion(
-          this.ctx.fetch,
-          this.cfg,
-          [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: userMessage(email.from, email.subject, body) },
-          ],
-          AbortSignal.any([signal, AbortSignal.timeout(this.cfg.timeoutMs)]),
-        );
+        raw = await chatCompletion(this.ctx.fetch, this.cfg, messages, AbortSignal.any([signal, AbortSignal.timeout(this.cfg.timeoutMs)]));
       } catch (err) {
         if (signal.aborted) return "aborted";
         const timeout = (err as Error).name === "TimeoutError";
@@ -262,11 +265,21 @@ export class Summarizer {
         return timeout ? "timeout" : "error";
       }
       modelMs = Date.now() - started;
-      const verdict = sanitizeSummary(raw);
+      const answer = parseAnswer(raw);
+      const verdict: ReturnType<typeof sanitizeSummary> | { ok: false; reason: "malformed" } = !answer
+        ? { ok: false, reason: "malformed" }
+        : answer.aiInstructions
+          ? { ok: true, summary: INJECTION_NOTICE[lang] }
+          : sanitizeSummary(postprocess(answer.summary));
       if (!verdict.ok) {
-        log.info({ accountId: job.accountId, reason: verdict.reason, ms: modelMs }, "push: summary rejected");
+        log.info({ accountId: job.accountId, reason: verdict.reason, lang, ms: modelMs }, "push: summary rejected");
         await putCachedSummary(db, config.encKey, job.accountId, job.emailId, this.cfg.model, { status: "rejected" });
         return "rejected";
+      }
+      flagged = answer!.aiInstructions;
+      if (flagged) {
+        this.stats.inc("summary_flagged");
+        log.info({ accountId: job.accountId, lang, ms: modelMs }, "push: summary flagged ai instructions, sending the notice");
       }
       summary = verdict.summary;
       await putCachedSummary(db, config.encKey, job.accountId, job.emailId, this.cfg.model, { status: "ok", summary });
@@ -282,7 +295,7 @@ export class Summarizer {
     if (targets.length === 0 || !this.sender.enabled) return "no_devices";
     const outcomes = await this.sender.sendAll(targets, payload, job.topic);
     log.info(
-      { accountId: job.accountId, devices: targets.length, ok: outcomes.filter((o) => o === "ok").length, modelMs, chars: summary.length },
+      { accountId: job.accountId, devices: targets.length, ok: outcomes.filter((o) => o === "ok").length, modelMs, flagged, chars: summary.length },
       "push: summary pushed",
     );
     return "pushed";

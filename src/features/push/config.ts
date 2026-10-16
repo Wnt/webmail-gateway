@@ -81,8 +81,8 @@ export const pushConfigSchema = z
     SUMMARY_MODEL: opt(z.string().trim().min(1)),
     /** Optional Bearer token for the summary endpoint. Secret. */
     SUMMARY_API_KEY: opt(z.string().trim().min(1)),
-    /** Give up on one summary after this long; the preview then stays. */
-    SUMMARY_TIMEOUT_MS: posInt(45_000),
+    /** Give up on one summary after this long; the preview then stays (a CPU-only 4B model takes 30-100 s). */
+    SUMMARY_TIMEOUT_MS: posInt(120_000),
   })
   .superRefine((c, ctx) => {
     const n = [c.PUSH_VAPID_PUBLIC_KEY, c.PUSH_VAPID_PRIVATE_KEY].filter(Boolean).length;
