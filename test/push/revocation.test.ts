@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { resetAccountAuth } from "../../src/features/auth/generation.js";
 import { createAuthState } from "../../src/features/auth/state.js";
-import { ACCESS_TTL_MS, GRANT_TTL_MS, REFRESH_TTL_MS, REVOCABLE_AFTER_GRANT_MS, TokenStore } from "../../src/features/auth/tokens.js";
+import { ACCESS_TTL_MS, GRANT_TTL_MS, REFRESH_TTL_MS, TokenStore } from "../../src/features/auth/tokens.js";
 import { deletePasskey } from "../../src/features/auth/webauthn.js";
 import { addTestPasskey } from "../helpers.js";
 import { makeHarness, PUBLIC, type Harness } from "./harness.js";
@@ -155,12 +155,20 @@ describe("push stops when access is revoked (gateway-data-1)", () => {
     expect(await deliver(slug, ["unbound-device"])).toEqual({ "unbound-device": 0 });
   });
 
-  it("by /oauth/revoke with a refresh token long expired, as long as the grant can back push", async () => {
+  it("by /oauth/revoke with a refresh token long expired, while the subscription lasts (renewed by later sign-ins)", async () => {
     const { account, slug } = await newAccount();
     const { grant, principal } = await signIn(account.id);
-    await h.enable(principal, "expired-token-device");
-    now += REFRESH_TTL_MS + 1;
-    await tokens().prune();
+    const { subId } = await h.enable(principal, "expired-token-device");
+    // Nine months of later sign-ins renewing the same subscription: it keeps its grant.
+    for (let i = 0; i < 5; i++) {
+      now += 60 * 86_400_000;
+      const later = await signIn(account.id);
+      const renewed = await h.jmap(later.principal, "PushSubscription/set", {
+        update: { [subId]: { expires: new Date(Date.now() + 90 * 86_400_000).toISOString() } },
+      });
+      expect(Object.keys(renewed.updated as object)).toEqual([subId]);
+      await tokens().prune();
+    }
     expect(await tokens().refresh({ refreshToken: grant.refreshToken, clientId: "bulwark" })).toBeNull();
     expect(await deliver(slug, ["expired-token-device"])).toEqual({ "expired-token-device": 1 }); // expiry alone keeps push
     await tokens().revokeToken(grant.refreshToken, "bulwark");

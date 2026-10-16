@@ -8,7 +8,6 @@ import {
   GRANT_TTL_MS,
   REFRESH_GRACE_MS,
   REFRESH_TTL_MS,
-  REVOCABLE_AFTER_GRANT_MS,
   TokenStore,
 } from "../src/features/auth/tokens.js";
 import { hashToken } from "../src/features/auth/util.js";
@@ -211,12 +210,17 @@ describe("revocation", () => {
     await store.prune();
     expect((await ctx.db.query("SELECT 1 FROM oauth_access_token")).rows).toHaveLength(0);
     expect((await ctx.db.query("SELECT 1 FROM oauth_code WHERE code_hash = $1", [hashToken(c)])).rows).toHaveLength(0);
-    // Expired refresh tokens stay as long as revoking the grant can still stop its push subscriptions.
+    // Expired refresh tokens stay while a push subscription belongs to their grant.
     const refreshRows = async () => (await ctx.db.query("SELECT 1 FROM oauth_refresh_token")).rows.length;
+    await ctx.db.query(
+      `INSERT INTO push_jmap_sub (id, account_id, grant_id, device_client_id, relay_id, url, expires, verification_code)
+       VALUES ('sub', $1, $2, 'd', 'relay-id-1', 'u', now(), 'c')`,
+      [accountId, t.grantId],
+    );
     now += REFRESH_TTL_MS;
     await store.prune();
     expect(await refreshRows()).toBe(2);
-    now += GRANT_TTL_MS + REVOCABLE_AFTER_GRANT_MS;
+    await ctx.db.query("DELETE FROM push_jmap_sub");
     await store.prune();
     expect(await refreshRows()).toBe(0);
   });
