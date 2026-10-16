@@ -1,7 +1,11 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+
+# The syntax frontend (line 1) and base images are pinned as
+# tag@sha256:<multi-arch index digest>. To bump, change the tag and digest
+# together: docker buildx imagetools inspect <image>:<tag>
 
 # ---- build: full deps, compile TypeScript ----
-FROM node:24.18.1-alpine3.24 AS build
+FROM node:24.18.1-alpine3.24@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3 AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -10,13 +14,13 @@ COPY src ./src
 RUN npm run build
 
 # ---- deps: production dependencies only ----
-FROM node:24.18.1-alpine3.24 AS deps
+FROM node:24.18.1-alpine3.24@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3 AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 # ---- runtime ----
-FROM node:24.18.1-alpine3.24
+FROM node:24.18.1-alpine3.24@sha256:f70403e87646dc51b45295f4b8b70cdad0b63d2297c4c9899119b03f7af7a6b3
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=deps --chown=node:node /app/node_modules ./node_modules
