@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import { resetAuthenticators } from "../src/core/auth-context.js";
+import { AUTH_SCRIPT } from "../src/features/auth/static.js";
 import { makeTestContext } from "./helpers.js";
 
 const ctx = await makeTestContext({ OAUTH_CLIENT_SECRET_BULWARK: "s".repeat(40) });
@@ -16,7 +17,7 @@ describe("auth static assets and pages", () => {
   it("serves the stylesheet, the page script and the SimpleWebAuthn bundle, immutable", async () => {
     for (const [name, type, needle] of [
       ["auth.css", "text/css", ".passkey"],
-      ["auth.js", "text/javascript", "startAuthentication"],
+      [AUTH_SCRIPT, "text/javascript", "startAuthentication"],
       ["logo.svg", "image/svg+xml", "<svg"],
       ["webauthn-14.0.0.js", "text/javascript", "SimpleWebAuthnBrowser"],
     ]) {
@@ -26,14 +27,17 @@ describe("auth static assets and pages", () => {
       expect(res.headers["cache-control"]).toBe("public, max-age=86400, immutable");
       expect(res.body).toContain(needle);
     }
+    expect(AUTH_SCRIPT).toMatch(/^auth-[0-9a-f]{12}\.js$/);
     expect((await app.inject({ method: "GET", url: "/auth/static/nope.js" })).statusCode).toBe(404);
+    // The unversioned name is gone: a changed script never hides behind a cached one.
+    expect((await app.inject({ method: "GET", url: "/auth/static/auth.js" })).statusCode).toBe(404);
   });
 
   it("the login page references exactly those assets and carries the security headers", async () => {
     const res = await app.inject({ method: "GET", url: "/auth/login" });
     expect(res.statusCode).toBe(200);
     expect(res.body).toContain('<link rel="stylesheet" href="/auth/static/auth.css">');
-    expect(res.body).toContain('<script defer src="/auth/static/webauthn-14.0.0.js"></script><script defer src="/auth/static/auth.js"></script>');
+    expect(res.body).toContain(`<script defer src="/auth/static/webauthn-14.0.0.js"></script><script defer src="/auth/static/${AUTH_SCRIPT}"></script>`);
     expect(res.body).toContain('<link rel="icon" href="/auth/static/logo.svg" type="image/svg+xml">');
     expect(res.body).toContain('<header class="brand"><img src="/auth/static/logo.svg" alt="" width="32" height="32"><span>Webmail</span></header>');
     expect(res.body).toContain("<title>Sign in · Webmail</title>");

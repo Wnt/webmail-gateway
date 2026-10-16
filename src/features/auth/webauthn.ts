@@ -267,11 +267,13 @@ export async function authenticationOptions(s: AuthState, allow?: Passkey[]): Pr
  * Verify an assertion against the passkey named by `response.id`, check that
  * the `userHandle` names the same account, and bump the counter. Returns the
  * passkey (with its account) and the account's auth generation as read with
- * it, for the issuer's `holdAuth`.
+ * it, for the issuer's `holdAuth`. `accountId` (step-up, where the request
+ * listed the account's credentials): the passkey must be that account's, and
+ * the authenticator may then omit `userHandle`; login always requires it.
  */
 export async function verifyAuthentication(
   s: AuthState,
-  input: { response: AuthenticationResponseJSON; challenge: string },
+  input: { response: AuthenticationResponseJSON; challenge: string; accountId?: string },
 ): Promise<{ passkey: Passkey; generation: number }> {
   const r = input.response;
   if (!b64url.is(r?.id) || r.id.length > 1400) throw new CeremonyError("assertion: bad credential id");
@@ -282,8 +284,10 @@ export async function verifyAuthentication(
   if (!rows[0]) throw new CeremonyError("assertion: unknown credential");
   const passkey = toPasskey(rows[0]);
   const generation = rows[0].auth_generation;
+  if (input.accountId !== undefined && passkey.accountId !== input.accountId) throw new CeremonyError("step-up: another account's passkey");
   const expectedHandle = Buffer.from(passkey.accountId.replace(/-/g, ""), "hex");
-  if (!r.response?.userHandle || !b64url.decode(r.response.userHandle).equals(expectedHandle)) {
+  const handle = r.response?.userHandle;
+  if (handle ? !b64url.decode(handle).equals(expectedHandle) : input.accountId === undefined) {
     throw new CeremonyError("assertion: user handle mismatch");
   }
   let result: Awaited<ReturnType<typeof verifyAuthenticationResponse>>;

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -15,6 +17,14 @@ function browserBundlePath(): string {
 
 export const WEBAUTHN_SCRIPT = "webauthn-14.0.0.js";
 
+/**
+ * The page script, named after its content: assets are cached immutable for a
+ * day, so a changed script needs a new URL or browsers keep running the old
+ * one against new pages.
+ */
+const AUTH_JS = readFileSync(path.join(STATIC_DIR, "auth.js"));
+export const AUTH_SCRIPT = `auth-${createHash("sha256").update(AUTH_JS).digest("hex").slice(0, 12)}.js`;
+
 interface Asset {
   body: Buffer;
   type: string;
@@ -24,7 +34,7 @@ interface Asset {
 export async function staticRoutes(app: FastifyInstance): Promise<void> {
   const assets = new Map<string, Asset>([
     ["auth.css", { body: await readFile(path.join(STATIC_DIR, "auth.css")), type: "text/css; charset=utf-8" }],
-    ["auth.js", { body: await readFile(path.join(STATIC_DIR, "auth.js")), type: "text/javascript; charset=utf-8" }],
+    [AUTH_SCRIPT, { body: AUTH_JS, type: "text/javascript; charset=utf-8" }],
     ["logo.svg", { body: await readFile(path.join(STATIC_DIR, "logo.svg")), type: "image/svg+xml" }],
     [WEBAUTHN_SCRIPT, { body: await readFile(browserBundlePath()), type: "text/javascript; charset=utf-8" }],
   ]);

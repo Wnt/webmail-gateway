@@ -5,7 +5,7 @@ import { resetAuthenticators } from "../src/core/auth-context.js";
 import { createEnrollToken } from "../src/features/auth/enroll.js";
 import { makeAuthPlugin } from "../src/features/auth/index.js";
 import { STEP_UP_WINDOW_MS } from "../src/features/auth/sessions.js";
-import { SoftAuthenticator } from "./fake-authenticator.js";
+import { SoftAuthenticator, type Overrides } from "./fake-authenticator.js";
 import { makeTestContext } from "./helpers.js";
 
 // Audit finding gateway-auth-1: adding or deleting a passkey needs a recent
@@ -61,10 +61,10 @@ async function login(b: Browser, a: SoftAuthenticator) {
   return b.go("POST", "/auth/login/verify", a.authenticate(options.json()));
 }
 
-async function stepUp(b: Browser, a: SoftAuthenticator, credentialId?: string) {
+async function stepUp(b: Browser, a: SoftAuthenticator, credentialId?: string, over: Overrides = {}) {
   const options = await b.go("POST", "/auth/passkeys/reauth/options", {});
   expect(options.statusCode).toBe(200);
-  return b.go("POST", "/auth/passkeys/reauth/verify", a.authenticate(options.json(), {}, credentialId));
+  return b.go("POST", "/auth/passkeys/reauth/verify", a.authenticate(options.json(), over, credentialId));
 }
 
 async function add(b: Browser) {
@@ -190,6 +190,22 @@ describe("step-up authorization", () => {
     expect((await add(b)).statusCode).toBe(403);
     const reasons = await ctx.db.query<{ details: { reason: string } }>("SELECT details FROM auth_audit WHERE event = 'passkey.reauth_fail'");
     expect(reasons.rows.map((r) => r.details.reason)).toEqual(["step-up: another account's passkey"]);
+  });
+
+  it("accepts an assertion without a user handle (the request named the credentials), not one with another account's", async () => {
+    const b = new Browser();
+    const key = authenticator();
+    await enroll(b, key);
+    expect((await stepUp(b, key, undefined, { userHandle: Buffer.from("0123456789abcdef0123456789abcdef", "hex") })).statusCode).toBe(400);
+    expect((await add(b)).statusCode).toBe(403);
+    expect((await stepUp(b, key, undefined, { userHandle: null })).json()).toEqual({ ok: true, manageFor: 300 });
+    expect((await add(b)).statusCode).toBe(200);
+    // Login stays discoverable: there the handle is what names the account.
+    const options = await b.go("POST", "/auth/login/options", {});
+    expect((await b.go("POST", "/auth/login/verify", key.authenticate(options.json(), { userHandle: null }))).statusCode).toBe(400);
+    expect((await ctx.db.query<{ details: { reason: string } }>("SELECT details FROM auth_audit WHERE event = 'login.fail'")).rows).toEqual([
+      { details: { reason: "assertion: user handle mismatch" } },
+    ]);
   });
 
   it("ends when the passkey that proved it is deleted", async () => {

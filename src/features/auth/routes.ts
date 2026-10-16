@@ -11,7 +11,7 @@ import { messagePage, sendPage } from "./pages.js";
 import { openJson, sealJson } from "./sealed.js";
 import { appendSetCookie, STEP_UP_WINDOW_MS, stepUpValid, type Session } from "./sessions.js";
 import type { AuthState } from "./state.js";
-import { WEBAUTHN_SCRIPT } from "./static.js";
+import { AUTH_SCRIPT, WEBAUTHN_SCRIPT } from "./static.js";
 import { b64url, escapeHtml, hashToken, parseCookies, serializeCookie } from "./util.js";
 import {
   authenticationOptions,
@@ -115,7 +115,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     return sendPage(reply, {
       title: "Sign in",
       lang: pending?.ui_locales.split(/[\s,]/)[0],
-      scripts: [WEBAUTHN_SCRIPT, "auth.js"],
+      scripts: [WEBAUTHN_SCRIPT, AUTH_SCRIPT],
       body:
         `<h1>Sign in</h1><p>Use your passkey to continue${pending ? ` to ${escapeHtml(s.ctx.config.auth.rpName)}` : ""}.</p>` +
         `<form id="flow" data-flow="login"><button type="submit" id="go">Sign in with passkey</button></form>` +
@@ -206,7 +206,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     if (!peek) return messagePage(reply, 404, "Link expired", "This enrollment link is invalid, expired or already used. Ask for a new one.");
     return sendPage(reply, {
       title: "Create a passkey",
-      scripts: [WEBAUTHN_SCRIPT, "auth.js"],
+      scripts: [WEBAUTHN_SCRIPT, AUTH_SCRIPT],
       body:
         `<h1>Create a passkey</h1><p>This passkey will sign <strong>${escapeHtml(peek.email)}</strong> in to ${escapeHtml(s.ctx.config.auth.rpName)}.</p>` +
         `<form id="flow" data-flow="enroll"><label for="name">Name</label>` +
@@ -281,7 +281,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const manageFor = session.verifiedAt === null ? 0 : Math.max(0, Math.floor((session.verifiedAt + STEP_UP_WINDOW_MS - s.now()) / 1000));
     return sendPage(reply, {
       title: "Passkeys",
-      scripts: [WEBAUTHN_SCRIPT, "auth.js"],
+      scripts: [WEBAUTHN_SCRIPT, AUTH_SCRIPT],
       body:
         `<h1>Passkeys</h1><p>Signed in as <strong>${escapeHtml(session.email)}</strong>.</p>` +
         `<ul class="passkeys" id="passkeys" data-manage-for="${manageFor}">${rows}</ul>` +
@@ -400,22 +400,30 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     let verified: { passkey: Passkey; generation: number };
     try {
       const challenge = await consumeFor(req, "reauth", session.accountId);
-      verified = await verifyAuthentication(s, { response: body(req) as unknown as AuthenticationResponseJSON, challenge });
-      if (verified.passkey.accountId !== session.accountId) throw new CeremonyError("step-up: another account's passkey");
+      verified = await verifyAuthentication(s, {
+        response: body(req) as unknown as AuthenticationResponseJSON,
+        challenge,
+        accountId: session.accountId,
+      });
     } catch (err) {
       return fail(req, reply, "passkey.reauth_fail", err, session.accountId);
     }
     const { passkey, generation } = verified;
-    const ok = await s.ctx.db.transaction(async (tx) => {
-      const held = await holdAuth(tx, {
-        accountId: session.accountId,
-        generation,
-        passkeyId: passkey.id,
-        session: { idHash: session.idHash, now: s.now() },
+    let ok: boolean;
+    try {
+      ok = await s.ctx.db.transaction(async (tx) => {
+        const held = await holdAuth(tx, {
+          accountId: session.accountId,
+          generation,
+          passkeyId: passkey.id,
+          session: { idHash: session.idHash, now: s.now(), forUpdate: true },
+        });
+        if (held) await s.sessions.markVerified(tx, session.idHash, passkey.id);
+        return held;
       });
-      if (held) await s.sessions.markVerified(tx, session.idHash, passkey.id);
-      return held;
-    });
+    } catch (err) {
+      return fail(req, reply, "passkey.reauth_fail", err, session.accountId);
+    }
     if (!ok) return stale(req, reply, "passkey.reauth_fail", session.accountId, 401, "no_session");
     clearCookie(reply, CHAL_COOKIE, "/auth");
     void audit(s.ctx, { event: "passkey.reauth", accountId: session.accountId, ip, userAgent, details: { passkey: passkey.name } }, s.now());

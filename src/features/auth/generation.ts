@@ -18,7 +18,7 @@ import type { AuthState } from "./state.js";
  */
 export async function holdAuth(
   tx: Queryable,
-  h: { accountId: string; generation: number; passkeyId?: Buffer; session?: { idHash: Buffer; now: number } },
+  h: { accountId: string; generation: number; passkeyId?: Buffer; session?: { idHash: Buffer; now: number; forUpdate?: boolean } },
 ): Promise<boolean> {
   const { rows } = await tx.query<{ auth_generation: number }>("SELECT auth_generation FROM account WHERE id = $1 FOR SHARE", [
     h.accountId,
@@ -32,9 +32,18 @@ export async function holdAuth(
   return h.session ? holdSession(tx, h.accountId, h.session) : true;
 }
 
-/** The session is still live (not reset, not ended with its passkey); locked FOR SHARE until the commit. */
-export async function holdSession(tx: Queryable, accountId: string, session: { idHash: Buffer; now: number }): Promise<boolean> {
-  const { rows } = await tx.query("SELECT 1 FROM auth_session WHERE id_hash = $1 AND account_id = $2 AND expires_at > $3 FOR SHARE", [
+/**
+ * The session is still live (not reset, not ended with its passkey); locked
+ * until the commit: FOR SHARE, or FOR NO KEY UPDATE when the caller will
+ * write the row (two writers must not both hold a shared lock and upgrade).
+ */
+export async function holdSession(
+  tx: Queryable,
+  accountId: string,
+  session: { idHash: Buffer; now: number; forUpdate?: boolean },
+): Promise<boolean> {
+  const lock = session.forUpdate ? "FOR NO KEY UPDATE" : "FOR SHARE";
+  const { rows } = await tx.query(`SELECT 1 FROM auth_session WHERE id_hash = $1 AND account_id = $2 AND expires_at > $3 ${lock}`, [
     session.idHash,
     accountId,
     new Date(session.now),
