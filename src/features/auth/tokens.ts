@@ -299,6 +299,9 @@ export class TokenStore {
    * passkey selector always stamps it, even with no grant to revoke). Grants
    * that merely expired are revoked too: push outlives expiry, not this. Call
    * `announce` with the result after the commit.
+   *
+   * Locks the account row first (FOR NO KEY UPDATE), then grants: the order
+   * passkey deletion and reset use, so concurrent revocations cannot deadlock.
    */
   async revokeIn(
     tx: Queryable,
@@ -306,6 +309,13 @@ export class TokenStore {
     reason: RevokeReason,
   ): Promise<RevokedGrant[]> {
     const t = new Date(this.now());
+    let account: string | undefined;
+    if ("grantId" in which) {
+      const g = await tx.query<{ account_id: string }>("SELECT account_id FROM oauth_grant WHERE id = $1", [which.grantId]);
+      account = g.rows[0]?.account_id;
+      if (!account) return [];
+    } else account = which.accountId;
+    await tx.query("SELECT 1 FROM account WHERE id = $1 FOR NO KEY UPDATE", [account]);
     const revocable = "(revoked_at IS NULL OR revoked_reason = 'expired')";
     const { rows } =
       "grantId" in which
@@ -323,8 +333,7 @@ export class TokenStore {
               `UPDATE oauth_grant SET revoked_at = $2, revoked_reason = $3 WHERE account_id = $1 AND ${revocable} RETURNING id, account_id`,
               [which.accountId, t, reason],
             );
-    const account = "grantId" in which ? rows[0]?.account_id : which.accountId;
-    if (account) await tx.query("UPDATE account SET auth_revoked_at = $2 WHERE id = $1", [account, t]);
+    if (!("grantId" in which) || rows.length > 0) await tx.query("UPDATE account SET auth_revoked_at = $2 WHERE id = $1", [account, t]);
     const out: RevokedGrant[] = [];
     for (const g of rows) {
       const ats = await tx.query<{ token_hash: Uint8Array }>("DELETE FROM oauth_access_token WHERE grant_id = $1 RETURNING token_hash", [g.id]);

@@ -10,6 +10,17 @@ ALTER TABLE account ADD COLUMN auth_generation integer NOT NULL DEFAULT 0;
 -- purpose (not by expiry). Push subscriptions that are bound to no grant
 -- (password mode, or from before migration 202) stop at the next one.
 ALTER TABLE account ADD COLUMN auth_revoked_at timestamptz;
+-- Carried over from before this migration: the last deliberate grant
+-- revocation, `bootstrap --reset` or passkey deletion on record.
+UPDATE account a SET auth_revoked_at = (
+  SELECT max(t) FROM (
+    SELECT max(g.revoked_at) AS t FROM oauth_grant g
+     WHERE g.account_id = a.id AND g.revoked_at IS NOT NULL AND g.revoked_reason <> 'expired'
+    UNION ALL
+    SELECT max(e.at) FROM auth_audit e
+     WHERE e.account_id = a.id AND (e.event = 'passkey.delete' OR (e.event = 'bootstrap' AND e.details->>'reset' = 'true'))
+  ) AS revocations
+);
 
 -- A session dies with the passkey that created it. Sessions whose passkey is
 -- already gone are exactly the ones the old ON DELETE SET NULL kept alive.
