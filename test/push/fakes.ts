@@ -13,9 +13,25 @@ export interface FakeEmail {
   preview: string | null;
   receivedAt: string;
   keywords: Record<string, boolean>;
-  /** Body parts served as `textBody` + `bodyValues` when `fetchTextBodyValues` is set. */
-  body?: { type: string; value: string }[];
+  /**
+   * Body parts. Each is listed in `textBody` (default), `htmlBody` or both
+   * (`in`), and its value is in `bodyValues` when the matching
+   * fetchTextBodyValues / fetchHTMLBodyValues flag is set. Without `body`,
+   * one text/plain part with DEFAULT_BODY.
+   */
+  body?: FakeBodyPart[];
 }
+
+export interface FakeBodyPart {
+  type: string;
+  value: string;
+  in?: "text" | "html" | "both";
+  isTruncated?: boolean;
+  isEncodingProblem?: boolean;
+}
+
+/** The default message body: long enough to be worth a summary. */
+export const DEFAULT_BODY = "Hi, the quarterly report is ready. Please review it before the meeting on Friday at 10.";
 
 export interface FakeSub {
   id: string;
@@ -207,15 +223,27 @@ export async function startFakeLegacyPush(hmacKey: Buffer): Promise<FakeLegacyPu
             .filter(Boolean)
             .map((e) => {
               const { mailboxId, body, ...rest } = e!;
-              const parts = body ?? [{ type: "text/plain", value: e!.preview ?? "" }];
+              const parts = (body ?? [{ type: "text/plain", value: DEFAULT_BODY }]).map((p, i) => ({ ...p, partId: String(i + 1) }));
+              const props = (args.properties as string[] | undefined) ?? [];
+              const inText = parts.filter((p) => (p.in ?? "text") !== "html");
+              const inHtml = parts.filter((p) => p.in === "html" || p.in === "both");
+              const fetched = [
+                ...(args.fetchTextBodyValues ? inText : []),
+                ...(args.fetchHTMLBodyValues ? inHtml : []),
+              ];
+              const ref = (p: (typeof parts)[number]) => ({ partId: p.partId, type: p.type });
               return {
                 ...rest,
                 mailboxIds: { [mailboxId]: true },
-                ...(args.fetchTextBodyValues
+                ...(props.includes("textBody") ? { textBody: inText.map(ref) } : {}),
+                ...(props.includes("htmlBody") ? { htmlBody: inHtml.map(ref) } : {}),
+                ...(props.includes("bodyValues")
                   ? {
-                      textBody: parts.map((p, i) => ({ partId: String(i + 1), type: p.type })),
                       bodyValues: Object.fromEntries(
-                        parts.map((p, i) => [String(i + 1), { value: p.value, isTruncated: false, isEncodingProblem: false }]),
+                        fetched.map((p) => [
+                          p.partId,
+                          { value: p.value, isTruncated: p.isTruncated ?? false, isEncodingProblem: p.isEncodingProblem ?? false },
+                        ]),
                       ),
                     }
                   : {}),

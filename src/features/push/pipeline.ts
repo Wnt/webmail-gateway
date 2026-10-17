@@ -22,7 +22,7 @@ import { Sender, topicFor } from "./sender.js";
 import type { PushStats } from "./stats.js";
 import { claimEmails, getUpstream, targetsForAccount, updateUpstream } from "./store.js";
 import { Summarizer, type SummarizerOptions, type SummaryJob, type SummarySource } from "./summarizer.js";
-import type { BodyPart } from "./summary-text.js";
+import { emailBody, type EmailBody } from "./summary-text.js";
 
 /**
  * New-mail pipeline (design/push.md section 5), written against plain JMAP so
@@ -162,8 +162,8 @@ export class Pipeline implements SummarySource {
     }
   }
 
-  /** One message's keywords, mailboxes and (optionally) text body, or null when it no longer exists. */
-  private async getForSummary(job: SummaryJob, withBody: boolean): Promise<{ notifiable: boolean; parts: BodyPart[] } | null> {
+  /** One message's keywords, mailboxes and (optionally) text and HTML body, or null when it no longer exists. */
+  private async getForSummary(job: SummaryJob, withBody: boolean): Promise<{ notifiable: boolean; body: EmailBody } | null> {
     const account = await getAccountById(this.ctx, job.accountId);
     if (!account) return null;
     const inboxId = await this.inboxId(account, job.legacyAccountId);
@@ -175,8 +175,14 @@ export class Pipeline implements SummarySource {
           {
             accountId: job.legacyAccountId,
             ids: [job.emailId],
-            properties: withBody ? ["id", "mailboxIds", "keywords", "textBody", "bodyValues"] : ["id", "mailboxIds", "keywords"],
-            ...(withBody ? { fetchTextBodyValues: true, maxBodyValueBytes: MAX_BODY_VALUE_BYTES } : {}),
+            properties: withBody
+              ? ["id", "mailboxIds", "keywords", "textBody", "htmlBody", "bodyValues"]
+              : ["id", "mailboxIds", "keywords"],
+            // Both lists: an HTML-only message has its body in htmlBody (and,
+            // per RFC 8621, in textBody too, but not every server does that).
+            ...(withBody
+              ? { fetchTextBodyValues: true, fetchHTMLBodyValues: true, maxBodyValueBytes: MAX_BODY_VALUE_BYTES }
+              : {}),
           },
           "g",
         ],
@@ -186,19 +192,13 @@ export class Pipeline implements SummarySource {
     const e = (response(res, "g", "Email/get").list as Record<string, unknown>[] | undefined)?.[0];
     if (!e || e.id !== job.emailId) return null;
     const notifiable = skipReason(e as Parameters<typeof skipReason>[0], inboxId) === null;
-    const values = (e.bodyValues ?? {}) as Record<string, { value?: unknown }>;
-    const parts: BodyPart[] = [];
-    for (const p of (Array.isArray(e.textBody) ? e.textBody : []) as { partId?: unknown; type?: unknown }[]) {
-      const v = typeof p?.partId === "string" ? values[p.partId]?.value : undefined;
-      if (typeof v === "string" && typeof p.type === "string" && /^text\//i.test(p.type)) parts.push({ type: p.type, value: v });
-    }
-    return { notifiable, parts };
+    return { notifiable, body: emailBody(e) };
   }
 
   /** SummarySource: the body of a message that is still unread in the Inbox. */
-  async bodyParts(job: SummaryJob): Promise<BodyPart[] | null> {
+  async body(job: SummaryJob): Promise<EmailBody | null> {
     const r = await this.getForSummary(job, true);
-    return r?.notifiable ? r.parts : null;
+    return r?.notifiable ? r.body : null;
   }
 
   /** SummarySource: re-check right before the replacement push. */

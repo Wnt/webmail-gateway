@@ -18,6 +18,13 @@ export const SUMMARY_MAX = 200;
  * (design/summaries/RESULTS.md).
  */
 export const INPUT_MAX_CHARS = 1600;
+/**
+ * Below this many characters of usable body text (after HTML, quotes, the
+ * signature and URLs are removed) there is nothing to summarise: the preview
+ * (up to 200 characters) already shows all of it, and a small model asked to
+ * summarise an empty body writes that the body is missing. So no summary.
+ */
+export const MIN_BODY_CHARS = 40;
 /** Output longer than this is not a summary (the model ignored the instructions). */
 const OUTPUT_REJECT_CHARS = 600;
 const OUTPUT_MIN_CHARS = 8;
@@ -136,8 +143,11 @@ export function htmlToText(html: string): string {
   const q = HTML_QUOTE_START.exec(s);
   if (q) s = s.slice(0, q.index);
   s = s
-    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, " ")
     .replace(/<(head|style|script|title|template|svg)\b[\s\S]*?<\/\1\s*>/gi, " ")
+    // a block left open (a value cut at maxBodyValueBytes): the rest is not text
+    .replace(/<(style|script|template|svg)\b[\s\S]*$/i, " ")
+    .replace(/<[^>]*$/, "")
     .replace(/<blockquote\b[\s\S]*?<\/blockquote\s*>/gi, "\n")
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/?(p|div|li|ul|ol|tr|table|h[1-6]|section|article|header|footer|hr)\b[^>]*>/gi, "\n")
@@ -197,6 +207,80 @@ function capChars(text: string, max: number): string {
 export interface BodyPart {
   type: string;
   value: string;
+  /** RFC 8621 bodyValue flags. */
+  isTruncated?: boolean;
+  isEncodingProblem?: boolean;
+}
+
+/** A message's body as listed by Email/get: the textBody and htmlBody parts with their values. */
+export interface EmailBody {
+  text: BodyPart[];
+  html: BodyPart[];
+}
+
+/**
+ * The textBody/htmlBody parts of an Email/get answer, with their bodyValues
+ * and flags. Only text/plain and text/html count as a body (a text/calendar
+ * part is not something to summarise). A part without a value comes back
+ * empty, so it counts as missing.
+ */
+export function emailBody(e: { textBody?: unknown; htmlBody?: unknown; bodyValues?: unknown }): EmailBody {
+  const values = (e.bodyValues && typeof e.bodyValues === "object" ? e.bodyValues : {}) as Record<
+    string,
+    { value?: unknown; isTruncated?: unknown; isEncodingProblem?: unknown } | undefined
+  >;
+  const list = (parts: unknown): BodyPart[] =>
+    (Array.isArray(parts) ? parts : [])
+      .filter(
+        (p): p is { partId: string; type: string } =>
+          typeof p?.partId === "string" && typeof p?.type === "string" && /^text\/(?:plain|html)$/i.test(p.type),
+      )
+      .map((p) => {
+        const v = Object.hasOwn(values, p.partId) ? values[p.partId] : undefined;
+        return {
+          type: p.type.toLowerCase(),
+          value: typeof v?.value === "string" ? v.value : "",
+          isTruncated: v?.isTruncated === true,
+          isEncodingProblem: v?.isEncodingProblem === true,
+        };
+      });
+  return { text: list(e.textBody), html: list(e.htmlBody) };
+}
+
+/**
+ * Text decoded with the wrong charset, from a server that did not flag it:
+ * several U+FFFD replacement characters, over 1 % of the text.
+ */
+function misdecoded(value: string): boolean {
+  const bad = value.match(/\uFFFD/g)?.length ?? 0;
+  return bad >= 3 && bad / value.length > 0.01;
+}
+
+export type SummaryInput =
+  | { ok: true; body: string; source: "text" | "html" }
+  | { ok: false; reason: "no_body" | "truncated" | "encoding" };
+
+/**
+ * The model input for a message, or why there is none. textBody first, then
+ * htmlBody (an HTML-only message from a server that lists its HTML part only
+ * in htmlBody); whichever yields more usable text. A part with an encoding
+ * problem is never used. Below MIN_BODY_CHARS there is no summary at all: the
+ * model must never be asked to summarise a body it did not get.
+ */
+export function summaryInput(body: EmailBody): SummaryInput {
+  let best: { body: string; source: "text" | "html" } | null = null;
+  for (const [source, parts] of [["text", body.text], ["html", body.html]] as const) {
+    const usable = parts.filter((p) => p.value && !p.isEncodingProblem && !misdecoded(p.value));
+    if (usable.length === 0) continue;
+    const text = bodyForSummary(usable);
+    if (!best || text.length > best.body.length) best = { body: text, source };
+    if (best.body.length >= MIN_BODY_CHARS) break;
+  }
+  if (best && best.body.length >= MIN_BODY_CHARS) return { ok: true, ...best };
+  const all = [...body.text, ...body.html];
+  if (all.some((p) => p.isEncodingProblem || misdecoded(p.value))) return { ok: false, reason: "encoding" };
+  if (all.some((p) => p.isTruncated && !p.value)) return { ok: false, reason: "truncated" };
+  return { ok: false, reason: "no_body" };
 }
 
 /** The email body as model input: text parts as they are, HTML parts converted; quotes, signature and URLs removed; capped. */
@@ -344,7 +428,38 @@ const REFUSAL_RES = [
   /\b(?:i cannot|i can't) (?:help|assist|summari[sz]e)\b/i,
 ];
 
-export type SummaryVerdict = { ok: true; summary: string } | { ok: false; reason: "empty" | "link" | "injection" | "refusal" | "too_long" | "too_short" };
+/**
+ * Answers about the input rather than the email: the body, content or message
+ * is missing, empty or unavailable, or there is nothing to summarise (English
+ * and Finnish). The gateway checks the body before calling the model; this is
+ * the second line, so such an answer never replaces the preview.
+ */
+const MISSING_BODY_RES = [
+  // "The email body is missing", "the content of the message was not provided", "body text appears to be empty"
+  /\b(?:body|content|contents|text)\s+(?:of\s+(?:the|this)\s+(?:e-?mail|message|mail)\s+)?(?:is|was|has\s+been|appears\s+to\s+be|seems\s+to\s+be|seems|appears)\s+(?:missing|empty|blank|unavailable|absent|not\s+(?:available|provided|included|shown|visible|present|accessible))\b/i,
+  // "The email is empty", "This message appears to be blank"
+  /\b(?:e-?mail|message|mail)\s+(?:is|was|appears\s+to\s+be|seems\s+to\s+be)\s+(?:empty|blank)\b/i,
+  // "The message has no content", "there is no body text", "contains no text"
+  /\b(?:has|have|had|contains|contained|with|there\s+is|there's|there\s+was)\s+no\s+(?:e-?mail\s+|message\s+)?(?:body|content|contents|text)\b/i,
+  // "No email content was provided", "no body available"
+  /\bno\s+(?:e-?mail\s+|message\s+)?(?:body|content|contents|text)\s+(?:was\s+|is\s+|has\s+been\s+)?(?:provided|available|included|given|shown|found)\b/i,
+  // "Missing email body", "empty message content"
+  /\b(?:missing|empty|blank|unavailable)\s+(?:e-?mail\s+|message\s+)?(?:body|content|contents)\b/i,
+  // "unable to summarise", "nothing to summarize", "cannot be summarised"
+  /\b(?:unable|impossible|not\s+possible|nothing|cannot|can't|can\s+not)\s+(?:to\s+)?(?:be\s+)?summari[sz](?:e|ed)\b/i,
+  // fi: "Viestin sisältö puuttuu", "Viesti on tyhjä", "Viestissä ei ole sisältöä", "Sähköpostin runkoa ei ole saatavilla"
+  /\b(?:viesti|sähköposti|posti)(?:n|ssä|stä|ä)?\s+(?:(?:sisältö|sisältöä|sisällöstä|runko|runkoa|rungosta|teksti|tekstiä|leipäteksti|leipätekstiä)\s+)?(?:on\s+|oli\s+|näyttää\s+olevan\s+)?(?:tyhjä|puuttuu|puuttui|ei\s+(?:ole|ollut)\s+(?:saatavilla|saatavissa|näkyvissä|mukana|annettu|sisältöä|tekstiä|runkoa|mitään)|ei\s+näy|ei\s+sisällä\s+(?:tekstiä|mitään|sisältöä))/i,
+  // fi: "Sisältö puuttuu", "Sisältöä ei ole saatavilla", "Tekstiä ei ole annettu" (the whole answer is about the input)
+  /^(?:viestin\s+|sähköpostin\s+)?(?:sisältö|sisältöä|runko|runkoa|teksti|tekstiä|leipäteksti|leipätekstiä)\s+(?:puuttuu|puuttui|on\s+tyhjä|ei\s+(?:ole|ollut)\s+(?:saatavilla|saatavissa|näkyvissä|mukana|annettu))/i,
+  // fi: "Puuttuva sisältö", "Tyhjä viesti"
+  /^(?:puuttuva|tyhjä)\s+(?:sisältö|viesti|sähköposti|runko|teksti)(?=[\s.,!?]|$)/i,
+  // fi: "ei voi tiivistää", "tiivistelmää ei voida tehdä", "tiivistettävää ei ole"
+  /\bei\s+(?:voi|voida|pysty|pystytä)\w*\s+tiivist\w*|\btiivistelmää\s+ei\s+(?:voi|voida|pysty|ole)|\btiivistettävää\s+ei\b|\bei\s+(?:ole\s+)?mitään\s+tiivistettävää/i,
+];
+
+export type SummaryVerdict =
+  | { ok: true; summary: string }
+  | { ok: false; reason: "empty" | "link" | "injection" | "refusal" | "missing_body" | "too_long" | "too_short" };
 
 /** Strip markdown and HTML, labels and wrapping quotes. */
 function stripMarkup(s: string): string {
@@ -372,6 +487,7 @@ export function sanitizeSummary(raw: unknown): SummaryVerdict {
   s = cleanText(stripMarkup(s));
   s = s.replace(/^["'“”‘’«»„]+|["'“”‘’«»„]+$/g, "").trim();
   if (REFUSAL_RES.some((re) => re.test(s))) return { ok: false, reason: "refusal" };
+  if (MISSING_BODY_RES.some((re) => re.test(s))) return { ok: false, reason: "missing_body" };
   if (s.length < OUTPUT_MIN_CHARS) return { ok: false, reason: "too_short" };
   return { ok: true, summary: truncate(s, SUMMARY_MAX) };
 }

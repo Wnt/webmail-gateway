@@ -122,13 +122,79 @@ describe("AI summary replacement push", () => {
 
   it("reads HTML bodies as text", async () => {
     const { slug } = await setup("dev-sum-0002");
-    const html = `<html><head><style>p{color:red}</style></head><body><p>Lasku&nbsp;erääntyy <b>perjantaina</b>.</p>
+    const html = `<html><head><style>p{color:red}</style></head><body><p>Lasku&nbsp;erääntyy <b>perjantaina</b>, summa 42,50 euroa.</p>
       <div class="gmail_quote">Old thread</div></body></html>`;
     await h.legacy.deliver(slug, { id: "s2", body: [{ type: "text/html", value: html }] });
     await h.rt.idle();
     const user = emailMessage(llm.requests[0]!);
-    expect(user).toContain("Lasku erääntyy perjantaina.");
+    expect(user).toContain("Lasku erääntyy perjantaina, summa 42,50 euroa.");
     expect(user).not.toMatch(/color|Old thread|<p>|<b>/);
+  });
+
+  const HTML_ONLY = `<html><head><style>p{color:red}</style></head><body><table><tr><td><p>Tilauksesi 4711 on lähetetty.
+    Paketti saapuu Postin noutopisteeseen torstaina 15.10. ja sitä säilytetään 14 päivää.</p></td></tr></table></body></html>`;
+
+  it("summarises HTML-only mail from its htmlBody when textBody lists nothing (no 'body missing' text)", async () => {
+    const { slug, browser } = await setup("dev-sum-0020");
+    await h.legacy.deliver(slug, { id: "html-only", subject: "Tilaus lähetetty", body: [{ type: "text/html", value: HTML_ONLY, in: "html" }] });
+    await h.rt.idle();
+    expect(outcomes.map((o) => o.outcome)).toEqual(["pushed"]);
+    expect(llm.requests).toHaveLength(1);
+    const user = emailMessage(llm.requests[0]!);
+    expect(user).toContain("Tilauksesi 4711 on lähetetty.");
+    expect(user).toContain("torstaina 15.10.");
+    expect(user).not.toMatch(/<p>|color/);
+    expect(pushes(browser)).toHaveLength(2);
+  });
+
+  it("summarises HTML-only mail whose HTML part is in textBody and htmlBody (RFC 8621)", async () => {
+    const { slug } = await setup("dev-sum-0021");
+    await h.legacy.deliver(slug, { id: "html-both", subject: "Tilaus lähetetty", body: [{ type: "text/html", value: HTML_ONLY, in: "both" }] });
+    await h.rt.idle();
+    expect(outcomes.map((o) => o.outcome)).toEqual(["pushed"]);
+    expect(emailMessage(llm.requests[0]!)).toContain("Tilauksesi 4711 on lähetetty.");
+  });
+
+  it("skips the summary for an empty body: no model call, no second push, the preview stays", async () => {
+    const { slug, browser } = await setup("dev-sum-0022");
+    await h.legacy.deliver(slug, { id: "empty", subject: "Kuva", preview: "", body: [] });
+    await h.rt.idle();
+    await h.legacy.deliver(slug, { id: "empty-part", subject: "Kuva", preview: "", body: [{ type: "text/plain", value: "" }], receivedAt: new Date(Date.now() + 1000).toISOString() });
+    await h.rt.idle();
+    expect(llm.requests).toHaveLength(0);
+    expect(outcomes.map((o) => o.outcome)).toEqual(["no_body", "no_body"]);
+    const got = pushes(browser);
+    expect(got).toHaveLength(2);
+    expect(got.every((p) => p.payload.email?.summary === undefined)).toBe(true);
+    expect(got.map((p) => p.payload.email?.subject)).toEqual(["Kuva", "Kuva"]);
+  });
+
+  it("skips a body too short to summarise, a value cut to nothing and a badly decoded one", async () => {
+    const { slug } = await setup("dev-sum-0023");
+    const later = (n: number) => new Date(Date.now() + n * 1000).toISOString();
+    await h.legacy.deliver(slug, { id: "short", body: [{ type: "text/plain", value: "See attached.\n\n-- \nAlice" }] });
+    await h.rt.idle();
+    await h.legacy.deliver(slug, { id: "cut", body: [{ type: "text/plain", value: "", isTruncated: true }], receivedAt: later(1) });
+    await h.rt.idle();
+    await h.legacy.deliver(slug, { id: "bad", body: [{ type: "text/plain", value: "Hei, laskusi erääntyy perjantaina 16.10. summa 42,50 €.", isEncodingProblem: true }], receivedAt: later(2) });
+    await h.rt.idle();
+    expect(llm.requests).toHaveLength(0);
+    expect(outcomes.map((o) => o.outcome)).toEqual(["no_body", "no_body", "no_body"]);
+    expect(h.pushSvc.requests).toHaveLength(3);
+  });
+
+  it("drops a model answer that says the body is missing: no replacement push", async () => {
+    const { slug, browser } = await setup("dev-sum-0024");
+    llm.answer = () => ({ content: json("Viestin sisältöä ei ole saatavilla, vain otsikko näkyy.") });
+    await h.legacy.deliver(slug, { id: "says-missing" });
+    await h.rt.idle();
+    llm.answer = () => ({ content: json("The email body is missing.") });
+    await h.legacy.deliver(slug, { id: "says-missing-en", receivedAt: new Date(Date.now() + 1000).toISOString() });
+    await h.rt.idle();
+    expect(llm.requests).toHaveLength(2);
+    expect(outcomes.map((o) => o.outcome)).toEqual(["rejected", "rejected"]);
+    expect(pushes(browser).every((p) => p.payload.email?.summary === undefined)).toBe(true);
+    expect(h.pushSvc.requests).toHaveLength(2);
   });
 
   it("sends nothing more when the model times out (the preview stays), and does not cache it", async () => {

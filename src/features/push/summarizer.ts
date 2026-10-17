@@ -8,15 +8,15 @@ import type { Sender } from "./sender.js";
 import type { PushStats } from "./stats.js";
 import { targetsForAccount } from "./store.js";
 import {
-  bodyForSummary,
   buildMessages,
   GEN_PARAMS,
   INJECTION_NOTICE,
   parseAnswer,
   postprocess,
   sanitizeSummary,
-  type BodyPart,
+  summaryInput,
   type ChatMessage,
+  type EmailBody,
 } from "./summary-text.js";
 
 /**
@@ -32,6 +32,8 @@ import {
  * - The request follows design/summaries (prompt v3): JSON `{ai_instructions,
  *   summary}` under a schema. A flagged email gets a fixed, localised notice
  *   instead of the model's text.
+ * - No usable body (empty, too short, cut off or badly decoded): no model
+ *   call and no summary push (`no_body`); the preview stays.
  * - On timeout, error or a doubtful answer nothing more is sent: the preview stays.
  * - Results are cached per message in `push_summary` (sealed).
  * - Read, moved or junked mail is skipped, before and after the model call.
@@ -77,8 +79,8 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 /** What the summarizer needs from the mail upstream (the pipeline implements it). */
 export interface SummarySource {
-  /** The message's text/HTML body parts, or null when it is no longer notifiable (read, moved, junk, gone). */
-  bodyParts(job: SummaryJob): Promise<BodyPart[] | null>;
+  /** The message's textBody/htmlBody parts and values, or null when it is no longer notifiable (read, moved, junk, gone). */
+  body(job: SummaryJob): Promise<EmailBody | null>;
   /** Whether the message is still unread in the Inbox (same rules as the preview push). */
   stillNotifiable(job: SummaryJob): Promise<boolean>;
 }
@@ -179,7 +181,7 @@ export type SummaryOutcome =
   | "timeout"
   | "error"
   | "rejected"
-  | "empty"
+  | "no_body"
   | "not_notifiable"
   | "stale"
   | "aborted";
@@ -272,13 +274,21 @@ export class Summarizer {
       summary = cached.summary;
       this.stats.inc("summary_cache_hit");
     } else {
-      const parts = await this.source.bodyParts(job);
+      const parts = await this.source.body(job);
       if (!parts) return "not_notifiable";
       if (this.isStale(job)) return "stale";
-      const body = bodyForSummary(parts);
-      if (!body && !email.subject) return "empty";
+      // Never ask the model about a body it did not get: it would answer that
+      // the body is missing, and that would replace the preview.
+      const input = summaryInput(parts);
+      if (!input.ok) {
+        log.info(
+          { accountId: job.accountId, reason: input.reason, textParts: parts.text.length, htmlParts: parts.html.length },
+          "push: summary skipped, no usable body",
+        );
+        return "no_body";
+      }
 
-      const { messages, lang } = buildMessages(email.from, email.subject, body);
+      const { messages, lang } = buildMessages(email.from, email.subject, input.body);
       const started = Date.now();
       let raw: string;
       try {
