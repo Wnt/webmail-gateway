@@ -229,19 +229,42 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     return false;
   }
 
+  /** A store or database failure: logged, answered with the sanitized 503 (never the exception text). */
+  function unavailable(reply: FastifyReply, event: string, err: unknown) {
+    s.ctx.log.error({ err }, `${event}: unexpected failure`);
+    return reply.code(503).send({ error: "temporarily_unavailable" });
+  }
+
   app.post("/auth/fp/options", async (req, reply) => {
     if (!fromThisOrigin(req, reply)) return;
     if (limited(req, reply, "login", 10)) return;
+    try {
+      return await fpOptions(reply);
+    } catch (err) {
+      return unavailable(reply, "fp.options", err);
+    }
+  });
+
+  async function fpOptions(reply: FastifyReply) {
     const options = await authenticationOptions(s);
     const id = await storeChallenge(s, "login", options.challenge, null);
     const csrf = randomBytes(32).toString("base64url");
     appendSetCookie(reply, cookie(CHAL_COOKIE, sealJson(s.sealKey, CHAL_COOKIE, { id, csrf }, s.now() + CHALLENGE_TTL_MS), "/auth", CHALLENGE_TTL_MS / 1000));
     return { options, csrf, expiresIn: CHALLENGE_TTL_MS / 1000 };
-  });
+  }
 
   app.post("/auth/fp/authorize", async (req, reply) => {
     if (!fromThisOrigin(req, reply)) return;
     if (limited(req, reply, "login", 10)) return;
+    try {
+      return await fpAuthorize(req, reply);
+    } catch (err) {
+      // Whatever was consumed stays consumed; a retry takes a fresh challenge.
+      return unavailable(reply, "fp.authorize", err);
+    }
+  });
+
+  async function fpAuthorize(req: FastifyRequest, reply: FastifyReply) {
     const { ip, userAgent } = requestMeta(req);
     const b = body(req);
     const field = (k: string) => (typeof b[k] === "string" ? (b[k] as string) : "");
@@ -293,7 +316,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     void audit(s.ctx, { event: "oauth.code_issued", accountId: account.id, clientId: client.id, ip, userAgent, details: { flow: "first_party" } }, s.now());
     void audit(s.ctx, { event: "login.ok", accountId: account.id, ip, userAgent, details: { passkey: passkey.name, flow: "first_party" } }, s.now());
     return reply.header("Cache-Control", "no-store").send({ code: issued.code, iss: s.ctx.config.publicBaseUrl });
-  });
+  }
 
   // --- enrollment (bootstrap link) -----------------------------------------
 

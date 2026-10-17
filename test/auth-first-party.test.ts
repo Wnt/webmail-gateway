@@ -129,13 +129,15 @@ describe("first-party passkey sign-in", () => {
     expect(iss).toBe(BASE);
     expect(b.cookies.has("__Host-gw_session")).toBe(true); // the gateway session, as /auth/login does
     expect(b.cookies.has("gw_chal")).toBe(false);
-    // wrong verifier, wrong redirect URI: refused (and the code is gone after a failed redeem? no - only bound)
+    // Bound to its redirect URI: another one is refused, and that attempt spends the code.
     expect((await token({ grant_type: "authorization_code", code, redirect_uri: `${BASE}/de/auth/callback`, code_verifier: verifier })).json().error).toBe("invalid_grant");
-    const ok = await token({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: verifier });
-    expect([200, 400]).toContain(ok.statusCode);
-    // A code is single use: whichever attempt redeemed it, a second one fails.
-    const again = await token({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: verifier });
-    expect(again.json().error).toBe("invalid_grant");
+    expect((await token({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: verifier })).json().error).toBe("invalid_grant");
+    // A fresh code redeems once, then never again.
+    const b2 = new Browser("10.0.0.2");
+    const second = await fpOptions(b2);
+    const { code: code2 } = (await b2.go("POST", "/auth/fp/authorize", fpBody(a, second.options), { "x-gateway-csrf": second.csrf })).json();
+    expect((await token({ grant_type: "authorization_code", code: code2, redirect_uri: REDIRECT, code_verifier: verifier })).statusCode).toBe(200);
+    expect((await token({ grant_type: "authorization_code", code: code2, redirect_uri: REDIRECT, code_verifier: verifier })).json().error).toBe("invalid_grant");
   });
 
   it("redeems with the right verifier and no other", async () => {
@@ -217,6 +219,31 @@ describe("first-party passkey sign-in", () => {
     expect((await new Browser().go("POST", "/auth/fp/options", {}, { "sec-fetch-site": "cross-site" })).statusCode).toBe(403);
     // still usable by the real page afterwards
     expect((await b.go("POST", "/auth/fp/authorize", body, { "x-gateway-csrf": csrf })).statusCode).toBe(200);
+  });
+
+  it("answers a store failure with the sanitized 503, never the exception text", async () => {
+    const a = await enrolled();
+    const b = new Browser("10.0.0.3");
+    const { options, csrf } = await fpOptions(b);
+    const realTx = ctx.db.transaction.bind(ctx.db);
+    const realQuery = ctx.db.query.bind(ctx.db);
+    try {
+      (ctx.db as { transaction: unknown }).transaction = async () => { throw new Error("db secret detail"); };
+      const res = await b.go("POST", "/auth/fp/authorize", fpBody(a, options), { "x-gateway-csrf": csrf });
+      expect(res.statusCode).toBe(503);
+      expect(res.json()).toEqual({ error: "temporarily_unavailable" });
+      expect(res.body).not.toContain("secret");
+      (ctx.db as { query: unknown }).query = async (sql: string, ...rest: unknown[]) => {
+        if (/auth_challenge/.test(sql)) throw new Error("db secret detail");
+        return realQuery(sql, ...(rest as [never]));
+      };
+      const opt = await new Browser("10.0.0.4").go("POST", "/auth/fp/options", {});
+      expect(opt.statusCode).toBe(503);
+      expect(opt.body).not.toContain("secret");
+    } finally {
+      (ctx.db as { transaction: unknown }).transaction = realTx;
+      (ctx.db as { query: unknown }).query = realQuery;
+    }
   });
 
   it("keeps the allowlist and the login rate limit", async () => {
