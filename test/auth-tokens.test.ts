@@ -69,6 +69,7 @@ describe("authorization codes", () => {
       scopes: ["mail"],
       via: "oauth",
       grantId: t!.grantId,
+      expiresAt: now + 3600_000,
     });
 
     expect(await store.redeemCode({ code: c, clientId: "bulwark", redirectUri: REDIRECT, codeVerifier: verifier })).toBeNull();
@@ -176,7 +177,7 @@ describe("revocation", () => {
     await store.revokeToken(r!.accessToken, "bulwark");
     expect(await store.authenticate(r!.accessToken)).toBeNull();
     expect(await store.authenticate(t.accessToken)).not.toBeNull();
-    expect(events).toEqual([{ grantId: t.grantId, accountId, tokenIds: [hashToken(r!.accessToken).toString("hex")] }]);
+    expect(events).toEqual([{ grantId: t.grantId, accountId, tokenIds: [hashToken(r!.accessToken).toString("hex")], tokensOnly: true }]);
 
     await store.revokeToken(r!.refreshToken, "other-client"); // not theirs: ignored
     expect(await store.authenticate(t.accessToken)).not.toBeNull();

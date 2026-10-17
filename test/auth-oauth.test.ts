@@ -226,7 +226,7 @@ describe("POST /oauth/token", () => {
 
     // The core authenticator now recognises the bearer token.
     const principal = await authenticate({ headers: { authorization: `Bearer ${t1.access_token}` } } as never);
-    expect(principal).toEqual({ accountId, email: "alice@example.test", scopes: ["mail"], via: "oauth", grantId: expect.any(String) });
+    expect(principal).toEqual({ accountId, email: "alice@example.test", scopes: ["mail"], via: "oauth", grantId: expect.any(String), expiresAt: expect.any(Number) });
 
     // Replaying the code is invalid_grant and kills the grant.
     res = await tokenReq({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: verifier });

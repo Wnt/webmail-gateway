@@ -8,6 +8,12 @@ export type Principal = {
   via: "basic" | "oauth";
   /** OAuth only: the grant behind the token. Push subscriptions are bound to it and die with it. */
   grantId?: string;
+  /**
+   * OAuth only: when this access ends by itself (the earliest of the access
+   * token's, the grant's and a temporary passkey's expiry), epoch ms. Long
+   * streams close at this time.
+   */
+  expiresAt?: number;
 };
 
 /** Return a Principal if this authenticator recognises the credentials on `req`, else null (never throw for "not mine"). */

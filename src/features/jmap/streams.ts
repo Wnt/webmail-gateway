@@ -26,8 +26,12 @@ export interface SseHandle {
   accountId: string;
   /** sha256 hex of the client's bearer token, when it used one (matches hooks' TokenRevokedEvent.tokenIds). */
   tokenId?: string;
+  /** The OAuth grant behind the token: revoking the grant ends the stream. */
+  grantId?: string;
   /** End the stream cleanly (max age, shutdown, revocation). */
   end(reason: string): void;
+  /** Check the stream's access again (the revocation feed was down) and end it if it is gone. */
+  recheck?(): Promise<void>;
 }
 
 export class SseRegistry {
@@ -66,6 +70,20 @@ export class SseRegistry {
     for (const h of [...(this.byAccount.get(accountId) ?? [])]) {
       if (h.tokenId !== undefined && tokenIds.has(h.tokenId)) h.end(reason);
     }
+  }
+
+  /** End the streams of a revoked grant (any of its tokens), or with `tokensOnly` those of the listed tokens. */
+  endRevoked(e: { accountId: string; grantId: string; tokenIds: readonly string[]; tokensOnly?: boolean }, reason: string): void {
+    const tokens = new Set(e.tokenIds);
+    for (const h of [...(this.byAccount.get(e.accountId) ?? [])]) {
+      const byToken = h.tokenId !== undefined && tokens.has(h.tokenId);
+      if (byToken || (!e.tokensOnly && h.grantId === e.grantId)) h.end(reason);
+    }
+  }
+
+  /** Every stream rechecks its access (the revocation feed changed state, so notices may have been missed). */
+  recheckAll(): void {
+    for (const set of [...this.byAccount.values()]) for (const h of [...set]) void h.recheck?.();
   }
 
   endAll(reason: string): void {

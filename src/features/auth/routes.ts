@@ -95,6 +95,13 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
    * passkey in this session (audit gateway-auth-1): checked here at the start
    * and again under lock where the change is written.
    */
+  /** A temporary passkey's session (live testing) never manages passkeys: checked here, and under lock where it matters. */
+  function temporaryRefused(session: Session, reply: FastifyReply): boolean {
+    if (!session.temporary) return false;
+    void reply.code(403).send({ error: "temporary_passkey" });
+    return true;
+  }
+
   function needsStepUp(session: Session, reply: FastifyReply): boolean {
     if (stepUpValid(session, s.now())) return false;
     void reply.code(403).send({ error: "reauth_required" });
@@ -219,6 +226,9 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
       scripts: [WEBAUTHN_SCRIPT, AUTH_SCRIPT],
       body:
         `<h1>Create a passkey</h1><p>This passkey will sign <strong>${escapeHtml(peek.email)}</strong> in to ${escapeHtml(s.ctx.config.auth.rpName)}.</p>` +
+        (peek.temporary
+          ? `<p>It is temporary: it stops working ${Math.round(peek.temporary.ttlMs / 60_000)} minutes after it is created, and cannot manage passkeys.</p>`
+          : "") +
         `<form id="flow" data-flow="enroll"><label for="name">Name</label>` +
         `<input id="name" name="name" maxlength="64" placeholder="e.g. Phone, Laptop" autocomplete="off">` +
         `<button type="submit" id="go">Create passkey</button></form>` +
@@ -252,10 +262,12 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
       issued = await s.ctx.db.transaction(async (tx) => {
         if (!(await holdAuth(tx, { accountId: peek.accountId, generation: peek.generation }))) return null;
         if ((await consumeEnrollToken(tx, hashToken(token), s.now())) !== peek.accountId) return null;
+        const temp = peek.temporary;
         const passkey = await storePasskey(s, tx, {
           info,
           accountId: peek.accountId,
-          name: passkeyName(b.name, `Passkey ${new Date(s.now()).toISOString().slice(0, 10)}`),
+          name: temp?.label ?? passkeyName(b.name, `${temp ? "Temporary passkey" : "Passkey"} ${new Date(s.now()).toISOString().slice(0, 10)}`),
+          expiresAt: temp ? new Date(s.now() + temp.ttlMs) : null,
         });
         return { passkey, session: await startSession(tx, req, peek.accountId, passkey.id, false) };
       });
@@ -267,7 +279,8 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     clearCookie(reply, CHAL_COOKIE, "/auth");
     clearCookie(reply, ENROLL_COOKIE, "/auth/enroll");
     s.sessions.setCookie(reply, issued.session);
-    void audit(s.ctx, { event: "enroll.ok", accountId: peek.accountId, ip, userAgent, details: { passkey: passkey.name } }, s.now());
+    const enrolled = passkey.expiresAt ? { passkey: passkey.name, temporary: true, expiresAt: passkey.expiresAt.toISOString() } : { passkey: passkey.name };
+    void audit(s.ctx, { event: "enroll.ok", accountId: peek.accountId, ip, userAgent, details: enrolled }, s.now());
     return { next: "/auth/passkeys" };
   });
 
@@ -277,14 +290,16 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const session = await s.sessions.ofRequest(req);
     if (!session) return reply.code(303).redirect("/auth/login");
     const keys = await listPasskeys(s, session.accountId);
+    const permanent = keys.filter((k) => !k.expiresAt).length;
     const fmt = (d: Date | null) => (d ? escapeHtml(d.toISOString().slice(0, 16).replace("T", " ") + " UTC") : "never");
     const rows = keys
       .map(
         (k) =>
           `<li class="passkey" data-id="${b64url.encode(k.id)}"><div><strong class="name">${escapeHtml(k.name)}</strong>` +
-          `${k.backedUp ? ' <span class="tag">synced</span>' : ""}<br><small>created ${fmt(k.createdAt)}, last used ${fmt(k.lastUsedAt)}</small></div>` +
+          `${k.backedUp ? ' <span class="tag">synced</span>' : ""}${k.expiresAt ? ' <span class="tag">temporary</span>' : ""}` +
+          `<br><small>created ${fmt(k.createdAt)}, last used ${fmt(k.lastUsedAt)}${k.expiresAt ? `, expires ${fmt(k.expiresAt)}` : ""}</small></div>` +
           `<div class="actions"><button type="button" data-action="rename">Rename</button>` +
-          `<button type="button" data-action="delete"${keys.length <= 1 ? " disabled title=\"The last passkey cannot be deleted\"" : ""}>Delete</button></div></li>`,
+          `<button type="button" data-action="delete"${!k.expiresAt && permanent <= 1 ? " disabled title=\"The last passkey cannot be deleted\"" : ""}>Delete</button></div></li>`,
       )
       .join("");
     // Seconds left of the step-up window: the page asks for a passkey first once it has run out.
@@ -309,6 +324,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const session = await s.sessions.ofRequest(req);
     if (!session) return reply.code(401).send({ error: "no_session" });
     if (limited(req, reply, "manage", 30)) return;
+    if (temporaryRefused(session, reply)) return;
     if (needsStepUp(session, reply)) return;
     const options = await registrationOptions(s, { id: session.accountId, email: session.email });
     setChallengeCookie(reply, await storeChallenge(s, "add", options.challenge, session.accountId));
@@ -320,6 +336,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const session = await s.sessions.ofRequest(req);
     if (!session) return reply.code(401).send({ error: "no_session" });
     if (limited(req, reply, "manage", 30)) return;
+    if (temporaryRefused(session, reply)) return;
     if (needsStepUp(session, reply)) return;
     const { ip, userAgent } = requestMeta(req);
     const b = body(req);
@@ -362,11 +379,14 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const session = await s.sessions.ofRequest(req);
     if (!session) return reply.code(401).send({ error: "no_session" });
     if (limited(req, reply, "manage", 30)) return;
+    if (temporaryRefused(session, reply)) return;
     const id = credentialId(req);
     const name = passkeyName(body(req).name, "");
     if (!id || !name) return reply.code(400).send({ error: "invalid_request" });
     const renamed = await renamePasskey(s, session.accountId, id, name, session);
-    if (renamed !== "renamed") return reply.code(renamed === "not_found" ? 404 : 401).send({ error: renamed });
+    if (renamed !== "renamed") {
+      return reply.code({ not_found: 404, no_session: 401, temporary_passkey: 403 }[renamed]).send({ error: renamed });
+    }
     void audit(s.ctx, { event: "passkey.rename", accountId: session.accountId, ...requestMeta(req), details: { name } }, s.now());
     return { ok: true };
   });
@@ -376,6 +396,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const session = await s.sessions.ofRequest(req);
     if (!session) return reply.code(401).send({ error: "no_session" });
     if (limited(req, reply, "manage", 30)) return;
+    if (temporaryRefused(session, reply)) return;
     const id = credentialId(req);
     if (!id) return reply.code(400).send({ error: "invalid_request" });
     if (needsStepUp(session, reply)) return;
@@ -384,7 +405,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
       const status = { not_found: 404, last_passkey: 409, no_session: 401, reauth_required: 403 }[outcome.status];
       return reply.code(status).send({ error: outcome.status });
     }
-    const details = { sessions: outcome.sessions, grants: outcome.grants };
+    const details = { passkey: outcome.name, temporary: outcome.temporary, sessions: outcome.sessions, grants: outcome.grants };
     void audit(s.ctx, { event: "passkey.delete", accountId: session.accountId, ...requestMeta(req), details }, s.now());
     return { ok: true };
   });
@@ -396,7 +417,9 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const session = await s.sessions.ofRequest(req);
     if (!session) return reply.code(401).send({ error: "no_session" });
     if (limited(req, reply, "manage", 30)) return;
-    const options = await authenticationOptions(s, await listPasskeys(s, session.accountId));
+    if (temporaryRefused(session, reply)) return;
+    // Only ordinary passkeys can authorize passkey management.
+    const options = await authenticationOptions(s, (await listPasskeys(s, session.accountId)).filter((k) => !k.expiresAt));
     setChallengeCookie(reply, await storeChallenge(s, "reauth", options.challenge, session.accountId));
     return options;
   });
@@ -406,6 +429,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     const session = await s.sessions.ofRequest(req);
     if (!session) return reply.code(401).send({ error: "no_session" });
     if (limited(req, reply, "manage", 30)) return;
+    if (temporaryRefused(session, reply)) return;
     const { ip, userAgent } = requestMeta(req);
     let verified: { passkey: Passkey; generation: number };
     try {
@@ -415,6 +439,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
         challenge,
         accountId: session.accountId,
       });
+      if (verified.passkey.expiresAt) throw new CeremonyError("step-up: a temporary passkey cannot authorize passkey management");
     } catch (err) {
       return fail(req, reply, "passkey.reauth_fail", err, session.accountId);
     }

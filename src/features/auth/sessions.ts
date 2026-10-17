@@ -21,11 +21,13 @@ export interface Session {
   generation: number;
   /** When this session last proved an existing passkey (login or step-up), or null. */
   verifiedAt: number | null;
+  /** It came from a temporary passkey: it cannot manage passkeys, and it ends with the passkey's expiry. */
+  temporary: boolean;
 }
 
 /** May this session add or delete passkeys right now? Rechecked under lock by `holdStepUp`. */
 export const stepUpValid = (session: Session, now: number): boolean =>
-  session.verifiedAt !== null && now - session.verifiedAt < STEP_UP_WINDOW_MS;
+  !session.temporary && session.verifiedAt !== null && now - session.verifiedAt < STEP_UP_WINDOW_MS;
 
 type Ctx = Pick<AppContext, "config" | "db">;
 
@@ -52,6 +54,7 @@ export class SessionStore {
    * Call inside the issuing transaction, after `holdAuth`. `verified`: the
    * session comes from an assertion with `passkeyId` (a login), which starts
    * its step-up window; an enrollment registered a new passkey and does not.
+   * A temporary passkey's session ends no later than the passkey.
    */
   async create(
     input: { accountId: string; passkeyId: Buffer; verified: boolean; ip?: string | null; userAgent?: string | null },
@@ -62,7 +65,7 @@ export class SessionStore {
     await q.query(
       `INSERT INTO auth_session (id_hash, account_id, passkey_id, created_at, last_seen_at, expires_at, ip, user_agent,
                                  verified_at, verified_passkey_id)
-       VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8, $9)`,
+       VALUES ($1, $2, $3, $4, $4, LEAST($5::timestamptz, (SELECT expires_at FROM passkey WHERE id = $3)), $6, $7, $8, $9)`,
       [
         hashToken(token),
         input.accountId,
@@ -78,7 +81,11 @@ export class SessionStore {
     return token;
   }
 
-  /** The live session behind a cookie value, or null. Only allowlisted accounts count. */
+  /**
+   * The live session behind a cookie value, or null, read from the database
+   * on every call (no cache). Only allowlisted accounts count, and only while
+   * the session's passkey has not expired.
+   */
   async get(token: string | undefined): Promise<Session | null> {
     if (!token || tokenKind(token) !== "session") return null;
     const t = this.now();
@@ -92,14 +99,17 @@ export class SessionStore {
       auth_generation: number;
       verified_at: Date | null;
       verified_passkey_id: Uint8Array | null;
+      passkey_expires_at: Date | null;
     }>(
-      `SELECT s.account_id, a.email, s.expires_at, s.last_seen_at, s.passkey_id, a.auth_generation, s.verified_at, s.verified_passkey_id
-       FROM auth_session s JOIN account a ON a.id = s.account_id
+      `SELECT s.account_id, a.email, s.expires_at, s.last_seen_at, s.passkey_id, a.auth_generation, s.verified_at, s.verified_passkey_id,
+              p.expires_at AS passkey_expires_at
+       FROM auth_session s JOIN account a ON a.id = s.account_id JOIN passkey p ON p.id = s.passkey_id
        WHERE s.id_hash = $1`,
       [hash],
     );
     const row = rows[0];
     if (!row || row.expires_at.getTime() <= t || !this.ctx.config.allowedEmails.includes(row.email)) return null;
+    if (row.passkey_expires_at && row.passkey_expires_at.getTime() <= t) return null;
     if (t - row.last_seen_at.getTime() > 60_000) {
       await this.ctx.db.query("UPDATE auth_session SET last_seen_at = $2 WHERE id_hash = $1", [hash, new Date(t)]);
     }
@@ -111,6 +121,7 @@ export class SessionStore {
       passkeyId: asBuffer(row.passkey_id)!,
       generation: row.auth_generation,
       verifiedAt: row.verified_at && row.verified_passkey_id ? row.verified_at.getTime() : null,
+      temporary: row.passkey_expires_at !== null,
     };
   }
 

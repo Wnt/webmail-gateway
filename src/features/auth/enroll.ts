@@ -3,15 +3,45 @@ import { hashToken, newToken, tokenKind } from "./util.js";
 
 export const ENROLL_TTL_MS = 15 * 60_000;
 
+/** Temporary passkeys (CLI `enroll --ttl`): the default lifetime, and the bounds. */
+export const TEMP_PASSKEY_DEFAULT_TTL_MS = 4 * 3600_000;
+export const TEMP_PASSKEY_MIN_TTL_MS = 60_000;
+export const TEMP_PASSKEY_MAX_TTL_MS = 24 * 3600_000;
+
 type Ctx = { db: Queryable };
 
-/** Mint a one-time enrollment token for an account (the bootstrap CLI prints its URL). */
-export async function createEnrollToken(ctx: Ctx, accountId: string, now: number): Promise<{ token: string; expiresAt: Date }> {
+/** What a temporary enrollment link records: the passkey's lifetime from its creation, and its name. */
+export interface TemporaryEnrollment {
+  ttlMs: number;
+  label?: string | null;
+}
+
+/**
+ * Mint a one-time enrollment token for an account (the bootstrap CLI prints
+ * its URL). `temporary`: the passkey created from it expires `ttlMs` after its
+ * creation (bounded by TEMP_PASSKEY_MIN/MAX_TTL_MS) and is named `label`.
+ */
+export async function createEnrollToken(
+  ctx: Ctx,
+  accountId: string,
+  now: number,
+  temporary?: TemporaryEnrollment,
+): Promise<{ token: string; expiresAt: Date }> {
+  if (temporary && !(temporary.ttlMs >= TEMP_PASSKEY_MIN_TTL_MS && temporary.ttlMs <= TEMP_PASSKEY_MAX_TTL_MS)) {
+    throw new RangeError(`temporary passkey TTL must be between ${TEMP_PASSKEY_MIN_TTL_MS / 60_000} min and ${TEMP_PASSKEY_MAX_TTL_MS / 3600_000} h`);
+  }
   const token = newToken("enroll");
   const expiresAt = new Date(now + ENROLL_TTL_MS);
   await ctx.db.query(
-    "INSERT INTO auth_enroll_token (token_hash, account_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
-    [hashToken(token), accountId, new Date(now), expiresAt],
+    "INSERT INTO auth_enroll_token (token_hash, account_id, created_at, expires_at, passkey_ttl_s, label) VALUES ($1, $2, $3, $4, $5, $6)",
+    [
+      hashToken(token),
+      accountId,
+      new Date(now),
+      expiresAt,
+      temporary ? Math.floor(temporary.ttlMs / 1000) : null,
+      temporary?.label ?? null,
+    ],
   );
   return { token, expiresAt };
 }
@@ -25,15 +55,37 @@ export async function peekEnrollToken(
   ctx: Ctx,
   token: string | undefined,
   now: number,
-): Promise<{ accountId: string; email: string; expiresAt: Date; generation: number } | null> {
+): Promise<{
+  accountId: string;
+  email: string;
+  expiresAt: Date;
+  generation: number;
+  /** A temporary enrollment: the new passkey's lifetime and name. */
+  temporary: { ttlMs: number; label: string | null } | null;
+} | null> {
   if (!token || tokenKind(token) !== "enroll") return null;
-  const { rows } = await ctx.db.query<{ account_id: string; email: string; expires_at: Date; auth_generation: number }>(
-    `SELECT e.account_id, a.email, e.expires_at, a.auth_generation FROM auth_enroll_token e JOIN account a ON a.id = e.account_id
+  const { rows } = await ctx.db.query<{
+    account_id: string;
+    email: string;
+    expires_at: Date;
+    auth_generation: number;
+    passkey_ttl_s: number | null;
+    label: string | null;
+  }>(
+    `SELECT e.account_id, a.email, e.expires_at, a.auth_generation, e.passkey_ttl_s, e.label
+     FROM auth_enroll_token e JOIN account a ON a.id = e.account_id
      WHERE e.token_hash = $1 AND e.used_at IS NULL AND e.expires_at > $2`,
     [hashToken(token), new Date(now)],
   );
   const r = rows[0];
-  return r ? { accountId: r.account_id, email: r.email, expiresAt: r.expires_at, generation: r.auth_generation } : null;
+  if (!r) return null;
+  return {
+    accountId: r.account_id,
+    email: r.email,
+    expiresAt: r.expires_at,
+    generation: r.auth_generation,
+    temporary: r.passkey_ttl_s === null ? null : { ttlMs: r.passkey_ttl_s * 1000, label: r.label },
+  };
 }
 
 /** Mark the token used, exactly once. Returns the account id, or null when it was already used or expired. */

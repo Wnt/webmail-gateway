@@ -67,13 +67,18 @@ export async function lockAccountForRevocation(tx: Queryable, accountId: string)
 /**
  * Inside the transaction that adds or deletes a passkey, after `holdAuth`
  * (or `lockAccountForRevocation` and the passkey locks): the session still
- * holds a step-up authorization (audit gateway-auth-1). The session row is locked FOR SHARE, so deleting the
+ * holds a step-up authorization (audit gateway-auth-1), and neither it nor
+ * its step-up came from a temporary passkey. The session row is locked FOR SHARE, so deleting the
  * passkey that authorized it (which clears `verified_passkey_id`) waits.
  */
 export async function holdStepUp(tx: Queryable, session: { idHash: Buffer; accountId: string }, now: number): Promise<boolean> {
+  // Neither the session's passkey nor the one that verified it may be
+  // temporary: a temporary passkey's session never manages passkeys.
   const { rows } = await tx.query(
-    `SELECT 1 FROM auth_session WHERE id_hash = $1 AND account_id = $2 AND expires_at > $3
-       AND verified_passkey_id IS NOT NULL AND verified_at > $4 FOR SHARE`,
+    `SELECT 1 FROM auth_session s WHERE s.id_hash = $1 AND s.account_id = $2 AND s.expires_at > $3
+       AND s.verified_passkey_id IS NOT NULL AND s.verified_at > $4
+       AND NOT EXISTS (SELECT 1 FROM passkey p WHERE p.id IN (s.passkey_id, s.verified_passkey_id) AND p.expires_at IS NOT NULL)
+     FOR SHARE OF s`,
     [session.idHash, session.accountId, new Date(now), new Date(now - STEP_UP_WINDOW_MS)],
   );
   return rows.length > 0;

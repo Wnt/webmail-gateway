@@ -156,7 +156,7 @@ describe("deleting a passkey (gateway-auth-2)", () => {
     expect((await lost.go("POST", "/auth/passkeys/options", {})).statusCode).toBe(401);
     expect((await safe.go("GET", "/auth/passkeys")).statusCode).toBe(200);
     const audit = await ctx.db.query<{ details: unknown }>("SELECT details FROM auth_audit WHERE event = 'passkey.delete'");
-    expect(audit.rows).toEqual([{ details: { sessions: 1, grants: 0 } }]);
+    expect(audit.rows).toEqual([{ details: { passkey: "owner", temporary: false, sessions: 1, grants: 0 } }]);
   });
 
   it("revokes the OAuth grants and unused codes it authorized, not the other passkey's", async () => {

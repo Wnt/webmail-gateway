@@ -1,13 +1,18 @@
 import { registerAuthenticator } from "../../core/auth-context.js";
+import { RevocationFeed } from "../../core/revocation.js";
 import type { AppContext, CliCommand, FeaturePlugin } from "../../types.js";
 import { oauthRoutes } from "./oauth.js";
 import { brandPages, securityHeaders } from "./pages.js";
 import { bootstrapCommand } from "./bootstrap.js";
+import { enrollCommand } from "./enroll-cli.js";
 import { authRoutes } from "./routes.js";
 import { staticRoutes } from "./static.js";
 import { createAuthState, type AuthState } from "./state.js";
+import { sweepExpiredPasskeys } from "./webauthn.js";
 
 const JANITOR_INTERVAL_MS = 3600_000;
+/** Expired temporary passkeys are deleted this often (housekeeping: they are refused at use already). */
+export const SWEEP_INTERVAL_MS = 60_000;
 const AUDIT_RETENTION_MS = 180 * 86400_000;
 
 /** Expired state is swept hourly; nothing here is needed for correctness, only for size. */
@@ -35,9 +40,18 @@ export function makeAuthPlugin(opts: { now?: () => number } = {}): FeaturePlugin
       janitor(s).catch((err) => ctx.log.error({ err }, "auth janitor failed"));
     }, JANITOR_INTERVAL_MS);
     timer.unref();
+    const sweeper = setInterval(() => {
+      sweepExpiredPasskeys(s).catch((err) => ctx.log.error({ err }, "temporary passkey sweep failed"));
+    }, SWEEP_INTERVAL_MS);
+    sweeper.unref();
+    // Revocations from any process (the CLI included) reach this one's open streams.
+    const feed = new RevocationFeed(ctx.db, ctx.log);
+    feed.start();
     app.addHook("onClose", async () => {
       unregister();
       clearInterval(timer);
+      clearInterval(sweeper);
+      await feed.stop();
     });
 
     securityHeaders(app);
@@ -51,4 +65,4 @@ export function makeAuthPlugin(opts: { now?: () => number } = {}): FeaturePlugin
 export const authPlugin: FeaturePlugin = makeAuthPlugin();
 
 /** CLI commands contributed by this feature (merged into `src/cli.ts`). */
-export const authCliCommands: Record<string, CliCommand> = { bootstrap: bootstrapCommand };
+export const authCliCommands: Record<string, CliCommand> = { bootstrap: bootstrapCommand, enroll: enrollCommand };

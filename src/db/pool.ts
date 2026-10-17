@@ -12,11 +12,24 @@ export interface Queryable {
   exec(sql: string): Promise<void>;
 }
 
+/** A live LISTEN (see `Db.listen`). */
+export interface Listener {
+  /** A round trip on the listening connection; rejects when it is dead. */
+  ping(): Promise<void>;
+  close(): Promise<void>;
+}
+
 /** Database handle used everywhere. Implemented for node-postgres and PGlite. */
 export interface Db extends Queryable {
   /** Run `fn` in a transaction: commit on return, roll back on throw. */
   transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T>;
   close(): Promise<void>;
+  /**
+   * LISTEN on `channel` over a dedicated connection: `onNotify` gets each
+   * payload, `onLost` is called once if the connection fails (the caller
+   * reconnects with a new `listen`). Rejects when it cannot connect.
+   */
+  listen?(channel: string, onNotify: (payload: string) => void, onLost: (err: Error) => void): Promise<Listener>;
 }
 
 function queryable(q: pg.Pool | pg.PoolClient): Queryable {
@@ -60,5 +73,37 @@ export function createPgDb(
       }
     },
     close: () => pool.end(),
+    async listen(channel, onNotify, onLost): Promise<Listener> {
+      const client = new pg.Client({ connectionString: databaseUrl, keepAlive: true, keepAliveInitialDelayMillis: 10_000 });
+      let done = false;
+      const lost = (err: Error) => {
+        if (done) return;
+        done = true;
+        client.end().catch(() => {});
+        onLost(err);
+      };
+      client.on("error", lost);
+      client.on("end", () => lost(new Error("listen connection ended")));
+      client.on("notification", (m) => {
+        if (m.channel === channel) onNotify(m.payload ?? "");
+      });
+      try {
+        await client.connect();
+        await client.query(`LISTEN ${pg.escapeIdentifier(channel)}`);
+      } catch (err) {
+        done = true;
+        await client.end().catch(() => {});
+        throw err;
+      }
+      return {
+        ping: async () => {
+          await client.query("SELECT 1");
+        },
+        close: async () => {
+          done = true;
+          await client.end().catch(() => {});
+        },
+      };
+    },
   };
 }

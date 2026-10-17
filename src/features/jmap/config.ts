@@ -28,6 +28,8 @@ export const jmapConfigSchema = z.object({
   JMAP_SSE_MAX_AGE_SEC: int(3600, 1),
   JMAP_SSE_MAX_PER_ACCOUNT: int(10, 1),
   JMAP_SSE_MAX_TOTAL: int(500, 1),
+  /** While the revocation feed (LISTEN) is down, each open stream rechecks its access this often. */
+  JMAP_SSE_RECHECK_SEC: int(3, 1),
 });
 
 export interface JmapConfig {
@@ -38,7 +40,7 @@ export interface JmapConfig {
   maxSizeUpload: number;
   maxSizeDownload: number;
   maxCallsInRequest: number;
-  sse: { maxAgeSec: number; maxPerAccount: number; maxTotal: number };
+  sse: { maxAgeSec: number; maxPerAccount: number; maxTotal: number; recheckSec: number };
 }
 
 export function parseJmapConfig(env: NodeJS.ProcessEnv): JmapConfig {
@@ -61,6 +63,7 @@ export function parseJmapConfig(env: NodeJS.ProcessEnv): JmapConfig {
       maxAgeSec: c.JMAP_SSE_MAX_AGE_SEC,
       maxPerAccount: c.JMAP_SSE_MAX_PER_ACCOUNT,
       maxTotal: c.JMAP_SSE_MAX_TOTAL,
+      recheckSec: c.JMAP_SSE_RECHECK_SEC,
     },
   };
 }

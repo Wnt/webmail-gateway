@@ -24,5 +24,14 @@ export async function createPgliteDb(): Promise<Db> {
     ...wrap(pg),
     transaction: (fn) => pg.transaction((tx) => fn(wrap(tx))),
     close: () => pg.close(),
+    async listen(channel, onNotify) {
+      const off = await pg.listen(channel, onNotify);
+      return {
+        ping: async () => {
+          await pg.query("SELECT 1");
+        },
+        close: () => off(),
+      };
+    },
   };
 }

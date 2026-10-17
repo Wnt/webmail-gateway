@@ -47,6 +47,8 @@ export interface TokenRevokedEvent {
   grantId: string;
   accountId: string;
   tokenIds: string[];
+  /** Only the `tokenIds` were revoked (RFC 7009 on one access token); the grant lives on. Otherwise the whole grant is. */
+  tokensOnly?: boolean;
 }
 
 export type TokenRevokedListener = (event: TokenRevokedEvent) => void | Promise<void>;

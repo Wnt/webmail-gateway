@@ -90,7 +90,7 @@ describe("jmap config", () => {
     const c = parseJmapConfig({ JMAP_PASSWORD_MODE: "true" });
     expect(c.passwordMode).toBe(true);
     expect(c.rateLimit).toEqual({ windowSec: 900, ip: 20, account: 5, global: 30, verifyConcurrency: 4 });
-    expect(c.sse).toEqual({ maxAgeSec: 3600, maxPerAccount: 10, maxTotal: 500 });
+    expect(c.sse).toEqual({ maxAgeSec: 3600, maxPerAccount: 10, maxTotal: 500, recheckSec: 3 });
     expect(c.basicCacheTtlSec).toBe(300);
   });
 });

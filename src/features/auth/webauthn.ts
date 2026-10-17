@@ -9,6 +9,7 @@ import {
   type RegistrationResponseJSON,
 } from "@simplewebauthn/server";
 import type { Queryable } from "../../db/pool.js";
+import { audit } from "./audit.js";
 import { holdAuth, holdSession, holdStepUp, lockAccountForRevocation } from "./generation.js";
 import type { AuthState } from "./state.js";
 import { asBuffer, b64url } from "./util.js";
@@ -31,7 +32,13 @@ export interface Passkey {
   name: string;
   createdAt: Date;
   lastUsedAt: Date | null;
+  /** A temporary passkey (CLI `enroll --ttl`) stops working at this time; null: an ordinary passkey. */
+  expiresAt: Date | null;
 }
+
+/** A temporary passkey that has reached its expiry. */
+export const passkeyExpired = (p: Pick<Passkey, "expiresAt">, now: number): boolean =>
+  p.expiresAt !== null && p.expiresAt.getTime() <= now;
 
 interface Row {
   id: Uint8Array;
@@ -44,9 +51,10 @@ interface Row {
   name: string;
   created_at: Date;
   last_used_at: Date | null;
+  expires_at: Date | null;
 }
 
-const COLS = "id, account_id, public_key, counter, transports, aaguid, backed_up, name, created_at, last_used_at";
+const COLS = "id, account_id, public_key, counter, transports, aaguid, backed_up, name, created_at, last_used_at, expires_at";
 const P_COLS = COLS.split(", ").map((c) => `p.${c}`).join(", ");
 const toPasskey = (r: Row): Passkey => ({
   id: asBuffer(r.id)!,
@@ -59,6 +67,7 @@ const toPasskey = (r: Row): Passkey => ({
   name: r.name,
   createdAt: r.created_at,
   lastUsedAt: r.last_used_at,
+  expiresAt: r.expires_at,
 });
 
 /** Verification failures are uniform to the browser; the detail goes to the audit log only. */
@@ -122,47 +131,98 @@ export async function renamePasskey(
   id: Buffer,
   name: string,
   by: Requester,
-): Promise<"renamed" | "not_found" | "no_session"> {
+): Promise<"renamed" | "not_found" | "no_session" | "temporary_passkey"> {
   return s.ctx.db.transaction(async (tx) => {
     if (!(await holdAuth(tx, { accountId, generation: by.generation }))) return "no_session";
     const { rows } = await tx.query("SELECT 1 FROM passkey WHERE id = $1 AND account_id = $2 FOR UPDATE", [id, accountId]);
     if (rows.length === 0) return "not_found";
     if (!(await holdSession(tx, accountId, { idHash: by.idHash, now: s.now() }))) return "no_session";
+    const temp = await tx.query(
+      "SELECT 1 FROM auth_session s JOIN passkey p ON p.id = s.passkey_id WHERE s.id_hash = $1 AND p.expires_at IS NOT NULL",
+      [by.idHash],
+    );
+    if (temp.rows.length > 0) return "temporary_passkey";
     await tx.query("UPDATE passkey SET name = $3 WHERE id = $1 AND account_id = $2", [id, accountId, name]);
     return "renamed";
   });
 }
 
-export type DeleteOutcome = { status: "deleted"; sessions: number; grants: number } | { status: "not_found" | "last_passkey" | "no_session" | "reauth_required" };
+export type DeleteOutcome =
+  | { status: "deleted"; sessions: number; grants: number; name: string; temporary: boolean }
+  | { status: "not_found" | "last_passkey" | "no_session" | "reauth_required" };
 
 /**
  * Delete a passkey and everything it authorized (audit gateway-auth-2): the
  * gateway sessions it created, its unused codes (by cascade) and its OAuth
  * grants, with their tokens and push subscriptions. Grants from before grants
  * recorded their passkey go too, since any of them may be this one's. Other
- * passkeys' sessions and grants stay. Refuses to delete the last passkey
- * (`last_passkey`): recovery is the CLI, not an empty account. `by`: the
+ * passkeys' sessions and grants stay. Refuses to delete the last ordinary
+ * passkey (`last_passkey`): recovery is the CLI, not an empty account; a
+ * temporary passkey can always go, and does not count as a remaining one.
+ * A temporary passkey revokes only the grants that recorded it: it was
+ * enrolled long after grants started recording their passkey (migration
+ * 101), so the owner's older grants and push are not its. `by`: the
  * session asking, rechecked under lock (`no_session` if it was reset or
  * revoked meanwhile), which must also hold a step-up authorization
- * (`reauth_required`); null for callers that are not a session.
+ * (`reauth_required`); null for callers that are not a session (the sweeper).
  */
-export async function deletePasskey(s: AuthState, accountId: string, id: Buffer, by: Requester | null): Promise<DeleteOutcome> {
+export async function deletePasskey(
+  s: AuthState,
+  accountId: string,
+  id: Buffer,
+  by: Requester | null,
+  reason: "passkey_deleted" | "passkey_expired" = "passkey_deleted",
+): Promise<DeleteOutcome> {
   const out = await s.ctx.db.transaction(async (tx) => {
     const generation = await lockAccountForRevocation(tx, accountId);
     if (by && generation !== by.generation) return { status: "no_session" as const };
-    const { rows } = await tx.query<{ id: Uint8Array }>("SELECT id FROM passkey WHERE account_id = $1 FOR UPDATE", [accountId]);
+    const { rows } = await tx.query<{ id: Uint8Array; name: string; expires_at: Date | null }>(
+      "SELECT id, name, expires_at FROM passkey WHERE account_id = $1 FOR UPDATE",
+      [accountId],
+    );
     if (by && !(await holdSession(tx, accountId, { idHash: by.idHash, now: s.now() }))) return { status: "no_session" as const };
     if (by && !(await holdStepUp(tx, { idHash: by.idHash, accountId }, s.now()))) return { status: "reauth_required" as const };
-    if (!rows.some((r) => asBuffer(r.id)!.equals(id))) return { status: "not_found" as const };
-    if (rows.length <= 1) return { status: "last_passkey" as const };
+    const target = rows.find((r) => asBuffer(r.id)!.equals(id));
+    if (!target) return { status: "not_found" as const };
+    const temporary = target.expires_at !== null;
+    if (!temporary && rows.filter((r) => r.expires_at === null).length <= 1) return { status: "last_passkey" as const };
     const sessions = await tx.query("DELETE FROM auth_session WHERE passkey_id = $1 AND account_id = $2", [id, accountId]);
-    const revoked = await s.store.revokeIn(tx, { accountId, passkeyId: id }, "passkey_deleted");
+    const revoked = await s.store.revokeIn(tx, { accountId, passkeyId: id, ...(temporary ? { exact: true } : {}) }, reason);
     await tx.query("DELETE FROM passkey WHERE id = $1 AND account_id = $2", [id, accountId]);
-    return { status: "deleted" as const, sessions: sessions.rowCount ?? 0, revoked };
+    return { status: "deleted" as const, sessions: sessions.rowCount ?? 0, revoked, name: target.name, temporary };
   });
   if (out.status !== "deleted") return out;
-  await s.store.announce(out.revoked, "passkey_deleted");
-  return { status: "deleted", sessions: out.sessions, grants: out.revoked.length };
+  await s.store.announce(out.revoked, reason);
+  return { status: "deleted", sessions: out.sessions, grants: out.revoked.length, name: out.name, temporary: out.temporary };
+}
+
+/**
+ * Housekeeping (the auth plugin runs it every minute): delete expired
+ * temporary passkeys with the same cascade as a manual deletion, and audit
+ * each expiry. Nothing depends on it for enforcement: everything from an
+ * expired passkey is refused at use already.
+ */
+export async function sweepExpiredPasskeys(s: AuthState): Promise<number> {
+  const { rows } = await s.ctx.db.query<{ id: Uint8Array; account_id: string; expires_at: Date }>(
+    "SELECT id, account_id, expires_at FROM passkey WHERE expires_at <= $1 ORDER BY expires_at LIMIT 100",
+    [new Date(s.now())],
+  );
+  let n = 0;
+  for (const r of rows) {
+    const out = await deletePasskey(s, r.account_id, asBuffer(r.id)!, null, "passkey_expired");
+    if (out.status !== "deleted") continue;
+    n++;
+    await audit(
+      s.ctx,
+      {
+        event: "passkey.expired",
+        accountId: r.account_id,
+        details: { passkey: out.name, expiredAt: r.expires_at.toISOString(), sessions: out.sessions, grants: out.grants },
+      },
+      s.now(),
+    );
+  }
+  return n;
 }
 
 export const passkeyName = (raw: unknown, fallback: string): string => {
@@ -218,15 +278,15 @@ export async function verifyRegistration(
 export async function storePasskey(
   s: AuthState,
   q: Queryable,
-  input: { info: NewCredential; accountId: string; name: string },
+  input: { info: NewCredential; accountId: string; name: string; expiresAt?: Date | null },
 ): Promise<Passkey> {
   const { info } = input;
   const id = b64url.decode(info.credential.id);
   const t = s.now();
   try {
     await q.query(
-      `INSERT INTO passkey (id, account_id, public_key, counter, transports, aaguid, backed_up, name, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      `INSERT INTO passkey (id, account_id, public_key, counter, transports, aaguid, backed_up, name, created_at, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
         id,
         input.accountId,
@@ -237,6 +297,7 @@ export async function storePasskey(
         info.credentialBackedUp,
         input.name,
         new Date(t),
+        input.expiresAt ?? null,
       ],
     );
   } catch (err) {
@@ -285,6 +346,8 @@ export async function verifyAuthentication(
   const passkey = toPasskey(rows[0]);
   const generation = rows[0].auth_generation;
   if (input.accountId !== undefined && passkey.accountId !== input.accountId) throw new CeremonyError("step-up: another account's passkey");
+  // A temporary passkey past its expiry signs nobody in (it may not be swept yet).
+  if (passkeyExpired(passkey, s.now())) throw new CeremonyError("assertion: temporary passkey expired");
   const expectedHandle = Buffer.from(passkey.accountId.replace(/-/g, ""), "hex");
   const handle = r.response?.userHandle;
   if (handle ? !b64url.decode(handle).equals(expectedHandle) : input.accountId === undefined) {

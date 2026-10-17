@@ -193,13 +193,18 @@ export async function recordRelayResult(db: Queryable, relayId: string, outcome:
  *    purpose, which `TokenStore.revokeIn` also does to expired grants;
  *  - a subscription without a grant (password mode, or from before grants
  *    were recorded) ends with the account's next deliberate revocation of a
- *    grant or passkey (`account.auth_revoked_at`).
+ *    grant or passkey (`account.auth_revoked_at`);
+ *  - its grant's passkey, if temporary (migration 103), has not expired:
+ *    unlike a grant's own expiry, that one ends push at once, before the
+ *    sweeper revokes the grant.
  */
 const AUTHORIZED = `EXISTS (SELECT 1 FROM account a
           WHERE a.id = s.account_id AND a.auth_generation = s.auth_generation
             AND (s.grant_id IS NOT NULL OR a.auth_revoked_at IS NULL OR a.auth_revoked_at < s.created_at))
   AND NOT EXISTS (SELECT 1 FROM oauth_grant g
-                  WHERE g.id = s.grant_id AND g.revoked_at IS NOT NULL AND g.revoked_reason <> 'expired')`;
+                  WHERE g.id = s.grant_id AND g.revoked_at IS NOT NULL AND g.revoked_reason <> 'expired')
+  AND NOT EXISTS (SELECT 1 FROM oauth_grant g JOIN passkey p ON p.id = g.passkey_id
+                  WHERE g.id = s.grant_id AND p.expires_at <= now())`;
 
 /** A subscription that can receive pushes: verified, unexpired, authorized. */
 const DELIVERABLE = `s.verified_at IS NOT NULL AND s.expires > now() AND ${AUTHORIZED}`;

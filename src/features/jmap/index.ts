@@ -7,6 +7,7 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import { getAccountById, type Account } from "../../core/accounts.js";
 import { authenticate, registerAuthenticator, type Principal } from "../../core/auth-context.js";
 import { handlePushSubscription, onTokenRevoked } from "../../core/hooks.js";
+import { onRevocationFeedChange, revocationFeedHealthy } from "../../core/revocation.js";
 import type { CliCommand, FeaturePlugin } from "../../types.js";
 import { ForwardRequestError, isPushCall, runSplit, validateEnvelope, type ResponseEnvelope } from "./api.js";
 import { AuthHttpError, BasicAuth } from "./basic-auth.js";
@@ -73,12 +74,17 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
     accounts.delete(id);
   });
 
-  // D8: a revoked grant's streams close at once (the 1 h max age is the backstop).
-  const offRevoked = onTokenRevoked((e) => sse.endTokens(e.accountId, new Set(e.tokenIds), "revoked"));
+  // D8: a revoked grant's streams close at once, whichever process revoked it
+  // (core/revocation turns the database notice into this hook). Each stream
+  // also closes at its access's expiry, and rechecks its access itself while
+  // the feed is down and whenever it comes back (notices may have been lost).
+  const offRevoked = onTokenRevoked((e) => sse.endRevoked(e, "revoked"));
+  const offFeed = onRevocationFeedChange(() => sse.recheckAll());
 
   app.addHook("preClose", async () => sse.endAll("shutdown"));
   app.addHook("onClose", async () => {
     offRevoked();
+    offFeed();
     offAuthLost();
     unregister?.();
   });
@@ -433,10 +439,27 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
     const ac = new AbortController();
     let endStream: (reason: string) => void = () => ac.abort();
     const bearer = /^bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
+    // The access behind the stream, checked again from the database (the
+    // revocation feed was down or came back): gone, or another account, ends it.
+    let rechecking = false;
+    const recheck = async () => {
+      if (rechecking) return;
+      rechecking = true;
+      try {
+        const p = await authenticate(req);
+        if (!p || p.accountId !== g.account.id || !p.scopes.includes(REQUIRED_SCOPE)) handle.end("revoked");
+      } catch {
+        handle.end("recheck_failed");
+      } finally {
+        rechecking = false;
+      }
+    };
     const handle: SseHandle = {
       accountId: g.account.id,
       ...(bearer ? { tokenId: createHash("sha256").update(bearer).digest("hex") } : {}),
+      ...(g.principal.grantId ? { grantId: g.principal.grantId } : {}),
       end: (reason) => endStream(reason),
+      recheck,
     };
     if (!sse.add(handle)) {
       retryAfter(reply, 30);
@@ -491,6 +514,16 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
     const maxAgeMs = cfg.sse.maxAgeSec * 1000;
     const timer = setTimeout(() => handle.end("max_age"), Math.round(maxAgeMs * 0.9) + randomInt(Math.max(1, Math.round(maxAgeMs * 0.2))));
     timer.unref();
+    // Exactly at the access's own end (token, grant or temporary passkey expiry).
+    const expiresAt = g.principal.expiresAt;
+    const expiry =
+      expiresAt === undefined ? null : setTimeout(() => handle.end("expired"), Math.min(Math.max(0, expiresAt - Date.now()), 2 ** 31 - 1));
+    expiry?.unref();
+    // While no revocation feed is listening, notices can be missed: recheck on a timer.
+    const fallback = setInterval(() => {
+      if (!revocationFeedHealthy()) void recheck();
+    }, cfg.sse.recheckSec * 1000);
+    fallback.unref();
 
     endStream = (why) => {
       reason = why;
@@ -510,6 +543,8 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
     });
     out.on("close", () => {
       clearTimeout(timer);
+      if (expiry) clearTimeout(expiry);
+      clearInterval(fallback);
       sse.remove(handle);
       body.destroy();
       ctx.log.info(

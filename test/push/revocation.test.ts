@@ -151,6 +151,8 @@ describe("push stops when access is revoked (gateway-data-1)", () => {
       status: "deleted",
       sessions: 0,
       grants: 0,
+      name: "test",
+      temporary: false,
     });
     expect(await deliver(slug, ["unbound-device"])).toEqual({ "unbound-device": 0 });
   });
