@@ -25,10 +25,21 @@ let account: Account;
 
 /** The database as the gateway sees it, with a LISTEN connection the test can cut. */
 let listenDown = false;
+/** Runs right after the next Bearer lookup read its row (a request paused mid-authentication). */
+let afterAuthRead: (() => Promise<void>) | null = null;
 const cut: Array<(err: Error) => void> = [];
 function controlledDb(inner: Db): Db {
   return {
     ...inner,
+    async query<R>(sql: string, params?: unknown[]) {
+      const result = await inner.query<R>(sql, params);
+      if (afterAuthRead && sql.includes("FROM oauth_access_token at JOIN oauth_grant")) {
+        const fn = afterAuthRead;
+        afterAuthRead = null;
+        await fn();
+      }
+      return result;
+    },
     async listen(channel, onNotify, onLost): Promise<Listener> {
       if (listenDown) throw new Error("connection refused (test)");
       const l = await inner.listen!(channel, onNotify, onLost);
@@ -55,6 +66,7 @@ beforeEach(async () => {
   fake.accounts.add(account.legacySlug);
 });
 afterEach(async () => {
+  afterAuthRead = null;
   endEventSourceStreams(account.id, "test");
   for (const s of fake.sse) s.end();
   fake.sse.length = 0;
@@ -121,7 +133,7 @@ describe("Bearer access, every request", () => {
     expect(await jmapGet(t.accessToken)).toBe(401);
   });
 
-  it("is refused on the very next request after the passkey was deleted by another process", async () => {
+  it("is refused on the very next request after another process deleted its access token", async () => {
     const t = await signIn();
     await addTestPasskey(gw.ctx, account.id); // not the last one
     expect(await jmapGet(t.accessToken)).toBe(200);
@@ -186,6 +198,75 @@ describe("open EventSource streams", () => {
       listenDown = false;
     }
     // The feed reconnects on its own.
+    for (let i = 0; i < 100 && !revocationFeedHealthy(); i++) await sleep(50);
+    expect(revocationFeedHealthy()).toBe(true);
+  });
+});
+
+// Review temp-passkey r1, issues 1 and 2.
+describe("stream start-up and failing rechecks", () => {
+  it("do not open a stream whose grant was revoked while its request was being authenticated", async () => {
+    const t = await signIn();
+    expect(revocationFeedHealthy()).toBe(true);
+    afterAuthRead = async () => {
+      await db.transaction((tx) => t.store.revokeIn(tx, { grantId: t.grantId }, "client_revoke"));
+      await sleep(50); // the NOTIFY reaches the listener before the request goes on: no stream to close yet
+    };
+    const res = await request(`${gw.base}/jmap/eventsource?types=*&closeafter=no&ping=30`, {
+      headers: { authorization: `Bearer ${t.accessToken}` },
+    });
+    await res.body.dump();
+    expect(res.statusCode).toBe(401);
+    expect(eventSourceStreamCount(account.id)).toBe(0);
+  });
+
+  it("deliver nothing once the passkey expired while the stream was being set up", async () => {
+    const expiresAt = Date.now() + 800;
+    const t = await signIn(expiresAt);
+    afterAuthRead = async () => {
+      await sleep(Math.max(0, expiresAt - Date.now()) + 100);
+    };
+    const push = fake.sse.push;
+    fake.sse.push = function (...streams) {
+      for (const stream of streams) stream.send(JSON.stringify({ "@type": "StateChange", changed: { "7": { Email: "after-expiry" } } }));
+      return push.apply(this, streams);
+    };
+    try {
+      const res = await request(`${gw.base}/jmap/eventsource?types=*&closeafter=no&ping=30`, {
+        headers: { authorization: `Bearer ${t.accessToken}` },
+      });
+      const body = await res.body.text();
+      expect(body).not.toContain("after-expiry");
+      expect(res.statusCode).toBe(401);
+    } finally {
+      fake.sse.push = push;
+    }
+  });
+
+  it("close the stream when a recheck gets no answer (fail closed), and a late answer does not revive it", async () => {
+    const t = await signIn();
+    const it = await openStream(t.accessToken);
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>((r) => (release = r));
+    const started = new Promise<void>((r) => (entered = r));
+    afterAuthRead = async () => {
+      entered();
+      await blocked;
+    };
+    listenDown = true;
+    try {
+      for (const lose of cut.splice(0)) lose(new Error("connection reset (test)"));
+      await started;
+      expect(await endsWithin(it, 4000)).toBeLessThan(4000);
+      await sleep(20);
+      expect(lastCloseReason()).toBe("recheck_failed");
+    } finally {
+      release();
+      listenDown = false;
+    }
+    await sleep(50);
+    expect(eventSourceStreamCount(account.id)).toBe(0);
     for (let i = 0; i < 100 && !revocationFeedHealthy(); i++) await sleep(50);
     expect(revocationFeedHealthy()).toBe(true);
   });

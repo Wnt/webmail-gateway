@@ -231,7 +231,12 @@ describe("expiry, enforced at use", () => {
     const pending = await authorize(b, temp); // a code issued just before the expiry
     expect((await b.go("GET", "/auth/passkeys")).statusCode).toBe(200);
 
-    now += 800_000; // the passkey's expiry; nothing has been swept
+    now += 800_000 - 5_000;
+    const lastMinute = await authorize(b, temp); // a code issued 5 s before the expiry: capped at it, not at 60 s
+    const code = await ctx.db.query<{ expires_at: Date }>("SELECT expires_at FROM oauth_code WHERE used_at IS NULL ORDER BY created_at DESC LIMIT 1");
+    expect(code.rows[0]!.expires_at).toEqual(new Date(now + 5_000));
+    now += 5_000; // the passkey's expiry; nothing has been swept
+    expect((await exchange(lastMinute)).json()).toEqual({ error: "invalid_grant" });
     expect(await state.store.authenticate(refreshed.access_token)).toBeNull();
     expect(await state.store.authenticate(tokens.access_token)).toBeNull();
     expect((await refresh(refreshed.refresh_token)).json()).toEqual({ error: "invalid_grant" });
@@ -289,7 +294,11 @@ describe("a temporary passkey's session", () => {
     const b = new Browser();
     await enrollTemporary(b, temp);
     expect((await login(b, temp)).statusCode).toBe(200); // a fresh assertion: the step-up window would be open
-    expect((await b.go("GET", "/auth/passkeys")).statusCode).toBe(200);
+    const page = await b.go("GET", "/auth/passkeys");
+    expect(page.statusCode).toBe(200);
+    expect(page.body).toContain("temporary passkey");
+    expect(page.body).not.toContain('data-action="delete"');
+    expect(page.body).not.toContain('data-flow="add"');
     const refused = { error: "temporary_passkey" };
     for (const [method, url, body] of [
       ["POST", "/auth/passkeys/options", {}],

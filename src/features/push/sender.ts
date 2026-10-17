@@ -76,7 +76,7 @@ export class Sender {
     for (let attempt = 0; ; attempt++) {
       // Revocation is durable state: re-read it before every attempt, so a
       // retry queued before a revocation does not go out after it.
-      if (!(await targetStillAuthorized(this.ctx.db, target))) {
+      if (!(await targetStillAuthorized(this.ctx.db, target, this.ctx.config.allowedEmails))) {
         this.stats.inc("push_send_revoked");
         return "revoked";
       }

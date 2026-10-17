@@ -3,6 +3,7 @@ import { RevocationFeed } from "../../core/revocation.js";
 import type { AppContext, CliCommand, FeaturePlugin } from "../../types.js";
 import { oauthRoutes } from "./oauth.js";
 import { brandPages, securityHeaders } from "./pages.js";
+import { audit } from "./audit.js";
 import { bootstrapCommand } from "./bootstrap.js";
 import { enrollCommand } from "./enroll-cli.js";
 import { authRoutes } from "./routes.js";
@@ -26,6 +27,34 @@ export async function janitor(s: AuthState): Promise<void> {
 }
 
 /**
+ * Accounts no longer in `ALLOWED_EMAILS` (the list changes only with a
+ * restart): at startup, every grant they hold is revoked for good (with the
+ * cross-process notice; their push stops with it, unbound subscriptions
+ * included through the account's revocation stamp) and their sessions end.
+ * Every use checks the allowlist too; this makes the removal durable.
+ */
+export async function revokeDisallowedAccounts(s: AuthState): Promise<number> {
+  const { rows } = await s.ctx.db.query<{ id: string }>(
+    `SELECT a.id FROM account a WHERE NOT (a.email = ANY ($1::text[]))
+       AND (EXISTS (SELECT 1 FROM oauth_grant g WHERE g.account_id = a.id AND (g.revoked_at IS NULL OR g.revoked_reason = 'expired'))
+         OR EXISTS (SELECT 1 FROM auth_session x WHERE x.account_id = a.id)
+         OR EXISTS (SELECT 1 FROM push_jmap_sub p WHERE p.account_id = a.id AND p.grant_id IS NULL
+                      AND (a.auth_revoked_at IS NULL OR a.auth_revoked_at < p.created_at)))`,
+    [[...s.ctx.config.allowedEmails]],
+  );
+  for (const { id } of rows) {
+    const out = await s.ctx.db.transaction(async (tx) => {
+      const revoked = await s.store.revokeIn(tx, { accountId: id }, "not_allowed");
+      const sessions = await tx.query("DELETE FROM auth_session WHERE account_id = $1", [id]);
+      return { revoked, sessions: sessions.rowCount ?? 0 };
+    });
+    await s.store.announce(out.revoked, "not_allowed");
+    await audit(s.ctx, { event: "account.not_allowed", accountId: id, details: { grants: out.revoked.length, sessions: out.sessions } }, s.now());
+  }
+  return rows.length;
+}
+
+/**
  * The auth feature as a Fastify plugin. `makeAuthPlugin({now})` exists so
  * tests can drive the clock; `authPlugin` is what `src/app.ts` registers.
  */
@@ -34,6 +63,12 @@ export function makeAuthPlugin(opts: { now?: () => number } = {}): FeaturePlugin
     const s = createAuthState(ctx, opts.now);
     if (!ctx.config.auth.bulwarkClientSecret) {
       ctx.log.warn("OAUTH_CLIENT_SECRET_BULWARK is not set: the bulwark OAuth client is disabled");
+    }
+    try {
+      await revokeDisallowedAccounts(s);
+    } catch (err) {
+      // Every use checks the allowlist anyway; this only makes the removal durable.
+      ctx.log.error({ err }, "revoking accounts removed from ALLOWED_EMAILS failed");
     }
     const unregister = registerAuthenticator(s.store.authenticator());
     const timer = setInterval(() => {

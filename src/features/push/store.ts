@@ -351,24 +351,27 @@ export interface PushTarget {
   auth: string;
 }
 
-/** Distinct endpoints that should get the account's EmailDelivery pushes. */
-export async function targetsForAccount(db: Queryable, accountId: string): Promise<PushTarget[]> {
+/** The account is (still) in `ALLOWED_EMAILS` (`$n` is that list): removing it ends its pushes at once. */
+const ALLOWED = (n: number) => `EXISTS (SELECT 1 FROM account ae WHERE ae.id = s.account_id AND ae.email = ANY ($${n}::text[]))`;
+
+/** Distinct endpoints that should get the account's EmailDelivery pushes. `allowed`: the configured allowlist. */
+export async function targetsForAccount(db: Queryable, accountId: string, allowed: readonly string[]): Promise<PushTarget[]> {
   const { rows } = await db.query<{ relay_id: string; endpoint: string; p256dh: string; auth: string }>(
     `SELECT DISTINCT ON (r.endpoint) r.relay_id, r.endpoint, r.p256dh, r.auth
        FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
-      WHERE s.account_id = $1 AND ${DELIVERABLE} AND r.gone_at IS NULL
+      WHERE s.account_id = $1 AND ${DELIVERABLE} AND ${ALLOWED(2)} AND r.gone_at IS NULL
         AND (s.types IS NULL OR 'EmailDelivery' = ANY (s.types))
       ORDER BY r.endpoint, r.updated_at DESC`,
-    [accountId],
+    [accountId, [...allowed]],
   );
   return rows.map((r) => ({ accountId, relayId: r.relay_id, endpoint: r.endpoint, p256dh: r.p256dh, auth: r.auth }));
 }
 
-/** Is `target` still a recipient? Checked before every send attempt, retries included. */
-export async function targetStillAuthorized(db: Queryable, target: PushTarget): Promise<boolean> {
+/** Is `target` still a recipient (and its account still allowlisted)? Checked before every send attempt, retries included. */
+export async function targetStillAuthorized(db: Queryable, target: PushTarget, allowed: readonly string[]): Promise<boolean> {
   const { rows } = await db.query(
-    `SELECT 1 FROM push_jmap_sub s WHERE s.account_id = $1 AND s.relay_id = $2 AND ${DELIVERABLE} LIMIT 1`,
-    [target.accountId, target.relayId],
+    `SELECT 1 FROM push_jmap_sub s WHERE s.account_id = $1 AND s.relay_id = $2 AND ${DELIVERABLE} AND ${ALLOWED(3)} LIMIT 1`,
+    [target.accountId, target.relayId, [...allowed]],
   );
   return rows.length > 0;
 }

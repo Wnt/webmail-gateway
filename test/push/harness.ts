@@ -109,6 +109,7 @@ export async function makeHarness(opts: PushTestOptions = {}, env: Record<string
     async newAccount() {
       const email = `u${randomBytes(4).toString("hex")}@example.test`;
       const account = await upsertAccount(ctx, { email });
+      ctx.config.allowedEmails.push(email); // only allowlisted accounts get pushes
       await setGandiPassword(ctx, account.id, "gandi-pass");
       legacy.passwords.set(email, "gandi-pass");
       legacy.known.add(account.legacySlug);

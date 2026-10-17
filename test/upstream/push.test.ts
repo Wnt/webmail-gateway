@@ -40,6 +40,7 @@ async function setup(relayId: string) {
   const token = `fmu1-${randomBytes(8).toString("hex")}`;
   fake.tokens.set(token, email);
   const account = await upsertAccount(h.ctx, { email });
+  h.ctx.config.allowedEmails.push(email); // only allowlisted accounts get pushes
   await setUpstreamCredential(h.ctx, account.id, { auth: "bearer", username: email, secret: token });
   const principal: Principal = { accountId: account.id, email, scopes: ["mail"], via: "oauth" };
   const dev = await h.enable(principal, relayId);

@@ -444,7 +444,6 @@ export class TokenStore {
    */
   async authenticate(token: string): Promise<Principal | null> {
     if (tokenKind(token) !== "access") return null;
-    const t = this.now();
     const { rows } = await this.ctx.db.query<GrantRow & { at_expires_at: Date; passkey_expires_at: Date | null }>(
       `SELECT g.id, g.client_id, g.account_id, g.scopes, g.resource, g.expires_at, g.revoked_at, a.email,
               at.expires_at AS at_expires_at, p.expires_at AS passkey_expires_at
@@ -453,6 +452,8 @@ export class TokenStore {
        WHERE at.token_hash = $1`,
       [hashToken(token)],
     );
+    // The time of the answer, not of the question: a lookup that waited on the database is judged when it returns.
+    const t = this.now();
     const row = rows[0];
     if (!row || row.revoked_at || row.at_expires_at.getTime() <= t || row.expires_at.getTime() <= t) return null;
     const passkeyExpiresAt = row.passkey_expires_at?.getTime() ?? null;

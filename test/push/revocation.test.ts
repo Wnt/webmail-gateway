@@ -220,3 +220,27 @@ describe("push keeps working through expiry and routine token use", () => {
     expect(await deliver(slug, ["resync-device"])).toEqual({ "resync-device": 1 });
   });
 });
+
+describe("allowlist removal (review temp-passkey r1)", () => {
+  it("stops push at once when the account is removed from ALLOWED_EMAILS, and startup revokes its grants for good", async () => {
+    const { account, slug } = await newAccount();
+    const { grant, principal } = await signIn(account.id);
+    await h.enable(principal, "removed-account-device");
+    expect(await deliver(slug, ["removed-account-device"])).toEqual({ "removed-account-device": 1 });
+    const allowed = h.ctx.config.allowedEmails;
+    while (allowed.includes(account.email)) allowed.splice(allowed.indexOf(account.email), 1);
+    try {
+      expect(await tokens().authenticate(grant.accessToken)).toBeNull();
+      expect(await deliver(slug, ["removed-account-device"])).toEqual({ "removed-account-device": 0 });
+      // What a restart with the new list does: durable, account-wide revocation.
+      const { revokeDisallowedAccounts } = await import("../../src/features/auth/index.js");
+      expect(await revokeDisallowedAccounts(createAuthState(h.ctx, () => now))).toBe(1);
+      const g = await h.ctx.db.query<{ revoked_reason: string }>("SELECT revoked_reason FROM oauth_grant WHERE id = $1", [grant.grantId]);
+      expect(g.rows[0]!.revoked_reason).toBe("not_allowed");
+      expect(await revokeDisallowedAccounts(createAuthState(h.ctx, () => now))).toBe(0);
+    } finally {
+      allowed.push(account.email);
+    }
+    expect(await deliver(slug, ["removed-account-device"])).toEqual({ "removed-account-device": 0 });
+  });
+});

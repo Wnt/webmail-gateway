@@ -433,7 +433,7 @@ export class Pipeline implements SummarySource {
       email: { from: newest.from, subject: newest.subject, preview: newest.preview },
     });
 
-    const targets = await targetsForAccount(this.ctx.db, accountId);
+    const targets = await targetsForAccount(this.ctx.db, accountId, this.ctx.config.allowedEmails);
     if (targets.length === 0 || !this.sender.enabled) {
       this.ctx.log.debug({ accountId, messages: items.length, targets: targets.length }, "push: new mail, nobody to push to");
       return;

@@ -24,6 +24,8 @@ import {
 } from "../../core/upstream/index.js";
 
 const ACCOUNT_CACHE_MS = 60_000;
+/** A stream's access recheck that gets no answer in this time ends the stream (fail closed). */
+const RECHECK_TIMEOUT_MS = 2_000;
 const REQUIRED_SCOPE = "mail"; // D7
 
 const DOWNLOAD_PATH = /^\/jmap\/download\/([^/?#]+)\/([^/?#]+)\/([^/?#]+)\/([^/?#]+)(\?[^#]*)?$/;
@@ -437,33 +439,80 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
     if (!g) return reply;
 
     const ac = new AbortController();
+    // Set once the stream must end (revoked, expired, shut down, ...): a
+    // revocation that lands while the upstream stream is still being opened
+    // is latched here, and nothing is delivered after it.
+    let ended: string | null = null;
     let endStream: (reason: string) => void = () => ac.abort();
     const bearer = /^bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
+    const expiresAt = g.principal.expiresAt;
     // The access behind the stream, checked again from the database (the
-    // revocation feed was down or came back): gone, or another account, ends it.
-    let rechecking = false;
-    const recheck = async () => {
-      if (rechecking) return;
-      rechecking = true;
+    // revocation feed was down or came back): gone, another account, an
+    // error or no answer within RECHECK_TIMEOUT_MS ends it. A check asked for
+    // while one is running runs again after it, so no transition is lost.
+    let rechecking: Promise<void> | null = null;
+    let again = false;
+    const checkOnce = async () => {
+      let timer: NodeJS.Timeout | undefined;
       try {
-        const p = await authenticate(req);
-        if (!p || p.accountId !== g.account.id || !p.scopes.includes(REQUIRED_SCOPE)) handle.end("revoked");
+        const p = await Promise.race([
+          authenticate(req),
+          new Promise<"timeout">((resolve) => {
+            timer = setTimeout(() => resolve("timeout"), RECHECK_TIMEOUT_MS);
+          }),
+        ]);
+        if (p === "timeout") handle.end("recheck_failed");
+        else if (!p || p.accountId !== g.account.id || !p.scopes.includes(REQUIRED_SCOPE)) handle.end("revoked");
       } catch {
         handle.end("recheck_failed");
       } finally {
-        rechecking = false;
+        clearTimeout(timer);
       }
+    };
+    const recheck = (): Promise<void> => {
+      if (ended) return Promise.resolve();
+      if (rechecking) {
+        again = true;
+        return rechecking;
+      }
+      rechecking = (async () => {
+        do {
+          again = false;
+          await checkOnce();
+        } while (again && !ended);
+        rechecking = null;
+      })();
+      return rechecking;
     };
     const handle: SseHandle = {
       accountId: g.account.id,
       ...(bearer ? { tokenId: createHash("sha256").update(bearer).digest("hex") } : {}),
       ...(g.principal.grantId ? { grantId: g.principal.grantId } : {}),
-      end: (reason) => endStream(reason),
+      end: (reason) => {
+        ended ??= reason;
+        endStream(reason);
+      },
       recheck,
     };
     if (!sse.add(handle)) {
       retryAfter(reply, 30);
       return sendProblem(reply, 429);
+    }
+    // From here on a revocation finds the handle. Exactly at the access's own
+    // end (token, grant or temporary passkey expiry), whatever stage the stream is in.
+    const expiry =
+      expiresAt === undefined ? null : setTimeout(() => handle.end("expired"), Math.min(Math.max(0, expiresAt - Date.now()), 2 ** 31 - 1));
+    expiry?.unref();
+    const abandon = () => {
+      if (expiry) clearTimeout(expiry);
+      sse.remove(handle);
+    };
+    // A revocation committed between the authentication above and the
+    // registration would have found no stream to close: check once more now.
+    await recheck();
+    if (ended) {
+      abandon();
+      return sendProblem(reply, 401);
     }
 
     let res: UpstreamResponse | null;
@@ -484,16 +533,23 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
         bodyTimeout: 0,
       });
     } catch (err) {
-      sse.remove(handle);
+      abandon();
+      if (ended) return sendProblem(reply, 401);
       throw err;
     }
     if (!res) {
-      sse.remove(handle);
+      abandon();
       return reply;
     }
     if (res.statusCode !== 200) {
-      sse.remove(handle);
+      abandon();
       return relayError(res, reply);
+    }
+    // Revoked or expired while the upstream stream was opening: nothing of it goes out.
+    if (ended || (expiresAt !== undefined && Date.now() >= expiresAt)) {
+      res.body.destroy();
+      abandon();
+      return sendProblem(reply, 401);
     }
 
     const body = res.body;
@@ -514,11 +570,6 @@ export const jmapPlugin: FeaturePlugin = async (app, ctx) => {
     const maxAgeMs = cfg.sse.maxAgeSec * 1000;
     const timer = setTimeout(() => handle.end("max_age"), Math.round(maxAgeMs * 0.9) + randomInt(Math.max(1, Math.round(maxAgeMs * 0.2))));
     timer.unref();
-    // Exactly at the access's own end (token, grant or temporary passkey expiry).
-    const expiresAt = g.principal.expiresAt;
-    const expiry =
-      expiresAt === undefined ? null : setTimeout(() => handle.end("expired"), Math.min(Math.max(0, expiresAt - Date.now()), 2 ** 31 - 1));
-    expiry?.unref();
     // While no revocation feed is listening, notices can be missed: recheck on a timer.
     const fallback = setInterval(() => {
       if (!revocationFeedHealthy()) void recheck();

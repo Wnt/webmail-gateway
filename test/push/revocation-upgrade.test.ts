@@ -70,7 +70,8 @@ it("carries revocations made before the upgrade over to subscriptions without a 
   await sub(noPasskey, "no-passkey", "2026-10-01T00:00:00Z");
 
   await migrate(db);
-  const relays = async (id: string) => (await targetsForAccount(db, id)).map((t) => t.relayId);
+  const everyone = (await db.query<{ email: string }>("SELECT email FROM account")).rows.map((r) => r.email);
+  const relays = async (id: string) => (await targetsForAccount(db, id, everyone)).map((t) => t.relayId);
   expect(await relays(revokedGrant)).toEqual(["after-signout"]);
   expect(await relays(reset)).toEqual([]);
   expect(await relays(untouched)).toEqual(["never-revoked"]);

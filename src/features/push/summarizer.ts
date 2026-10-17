@@ -329,7 +329,7 @@ export class Summarizer {
 
     const payload = fitPayload({ ...job.payload, renotify: false, email: { ...email, summary } });
     if (!payload.email?.summary) return "error";
-    let targets = await targetsForAccount(db, job.accountId);
+    let targets = await targetsForAccount(db, job.accountId, config.allowedEmails);
     if (targets.length === 0 || !this.sender.enabled) return "no_devices";
 
     // WebKit shows the summary as a new notification and the service worker
@@ -353,7 +353,7 @@ export class Summarizer {
       if (this.isStale(job)) return "stale";
       if (!(await this.source.stillNotifiable(job))) return "not_notifiable";
       if (this.isStale(job) || signal.aborted) return "stale";
-      targets = (await targetsForAccount(db, job.accountId)).filter((t) => isApplePushEndpoint(t.endpoint));
+      targets = (await targetsForAccount(db, job.accountId, config.allowedEmails)).filter((t) => isApplePushEndpoint(t.endpoint));
     }
     if (targets.length > 0) outcomes.push(...(await this.sender.sendAll(targets, payload, job.topic)));
     log.info(

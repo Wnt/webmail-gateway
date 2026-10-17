@@ -229,8 +229,11 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
         (peek.temporary
           ? `<p>It is temporary: it stops working ${Math.round(peek.temporary.ttlMs / 60_000)} minutes after it is created, and cannot manage passkeys.</p>`
           : "") +
-        `<form id="flow" data-flow="enroll"><label for="name">Name</label>` +
-        `<input id="name" name="name" maxlength="64" placeholder="e.g. Phone, Laptop" autocomplete="off">` +
+        `<form id="flow" data-flow="enroll">` +
+        // A temporary passkey is named by the operator (`enroll --label`).
+        (peek.temporary?.label
+          ? `<p>Name: <strong>${escapeHtml(peek.temporary.label)}</strong></p>`
+          : `<label for="name">Name</label><input id="name" name="name" maxlength="64" placeholder="e.g. Phone, Laptop" autocomplete="off">`) +
         `<button type="submit" id="go">Create passkey</button></form>` +
         `<p id="msg" class="msg" role="status" aria-live="polite"></p>`,
     });
@@ -298,8 +301,10 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
           `<li class="passkey" data-id="${b64url.encode(k.id)}"><div><strong class="name">${escapeHtml(k.name)}</strong>` +
           `${k.backedUp ? ' <span class="tag">synced</span>' : ""}${k.expiresAt ? ' <span class="tag">temporary</span>' : ""}` +
           `<br><small>created ${fmt(k.createdAt)}, last used ${fmt(k.lastUsedAt)}${k.expiresAt ? `, expires ${fmt(k.expiresAt)}` : ""}</small></div>` +
-          `<div class="actions"><button type="button" data-action="rename">Rename</button>` +
-          `<button type="button" data-action="delete"${!k.expiresAt && permanent <= 1 ? " disabled title=\"The last passkey cannot be deleted\"" : ""}>Delete</button></div></li>`,
+          (session.temporary
+            ? `</li>`
+            : `<div class="actions"><button type="button" data-action="rename">Rename</button>` +
+              `<button type="button" data-action="delete"${!k.expiresAt && permanent <= 1 ? " disabled title=\"The last passkey cannot be deleted\"" : ""}>Delete</button></div></li>`),
       )
       .join("");
     // Seconds left of the step-up window: the page asks for a passkey first once it has run out.
@@ -310,10 +315,12 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
       body:
         `<h1>Passkeys</h1><p>Signed in as <strong>${escapeHtml(session.email)}</strong>.</p>` +
         `<ul class="passkeys" id="passkeys" data-manage-for="${manageFor}">${rows}</ul>` +
-        `<p><small>Adding or deleting a passkey asks for one of your passkeys first, unless you signed in within the last ${STEP_UP_WINDOW_MS / 60_000} minutes.</small></p>` +
-        `<form id="flow" data-flow="add"><label for="name">New passkey</label>` +
-        `<input id="name" name="name" maxlength="64" placeholder="Name, e.g. Phone" autocomplete="off">` +
-        `<button type="submit" id="go">Add passkey</button></form>` +
+        (session.temporary
+          ? `<p>You signed in with a temporary passkey: passkeys can't be added, renamed or deleted in this session.</p>`
+          : `<p><small>Adding or deleting a passkey asks for one of your passkeys first, unless you signed in within the last ${STEP_UP_WINDOW_MS / 60_000} minutes.</small></p>` +
+            `<form id="flow" data-flow="add"><label for="name">New passkey</label>` +
+            `<input id="name" name="name" maxlength="64" placeholder="Name, e.g. Phone" autocomplete="off">` +
+            `<button type="submit" id="go">Add passkey</button></form>`) +
         `<p id="msg" class="msg" role="status" aria-live="polite"></p>` +
         `<p><button type="button" id="logout" class="link">Sign out</button></p>`,
     });
