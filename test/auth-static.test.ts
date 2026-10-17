@@ -18,6 +18,7 @@ describe("auth static assets and pages", () => {
     for (const [name, type, needle] of [
       ["auth.css", "text/css", ".passkey"],
       [AUTH_SCRIPT, "text/javascript", "startAuthentication"],
+      [AUTH_SCRIPT, "text/javascript", "data-autostart"],
       ["logo.svg", "image/svg+xml", "<svg"],
       ["webauthn-14.0.0.js", "text/javascript", "SimpleWebAuthnBrowser"],
     ]) {

@@ -84,18 +84,111 @@
     if (go) go.disabled = true;
   }
 
+  // --- sign-in ---------------------------------------------------------------
+  // The challenge is fetched when the page loads, so a tap on the button goes
+  // straight to navigator.credentials.get(): WebKit only lets a page ask for a
+  // passkey from a tap (or as its one allowance per page load), and a network
+  // round trip between the tap and the call can use that up. With an
+  // authorization request waiting (data-autostart), the prompt opens on load
+  // where the browser allows it - Chrome, Edge, Firefox and Safari 16+ do for
+  // a focused, visible page - and the button is the fallback. A refused or
+  // cancelled prompt leaves the page waiting for that one tap; it never
+  // retries by itself.
+  var login = flow === "login" && W && W.browserSupportsWebAuthn();
+  // Server challenge lifetime (CHALLENGE_TTL_MS, 120 s) less a margin for the ceremony itself.
+  var CHALLENGE_FRESH_MS = 90 * 1000;
+  var prepared = null; // { options, at } - a challenge not yet spent on a verify
+  var preparing = null;
+  var running = false;
+
+  function prepare() {
+    if (!preparing) {
+      preparing = api("POST", "/auth/login/options", {}).then(function (options) {
+        prepared = { options: options, at: Date.now() };
+        return prepared;
+      }).finally(function () { preparing = null; });
+    }
+    return preparing;
+  }
+
+  function fresh() {
+    return prepared && Date.now() - prepared.at < CHALLENGE_FRESH_MS ? prepared : null;
+  }
+
+  async function signIn(p, auto) {
+    if (running) return;
+    running = true;
+    if (go) go.disabled = true;
+    say("Odotetaan passkeytä… / Waiting for your passkey…");
+    try {
+      var assertion = await W.startAuthentication({ optionsJSON: p.options });
+      prepared = null; // the verify spends the challenge, whatever its outcome
+      var next = (await api("POST", "/auth/login/verify", assertion)).next;
+      say("Valmis. / Done.");
+      location.assign(next);
+      return;
+    } catch (err) {
+      running = false;
+      if (go) go.disabled = false;
+      if (err && (err.name === "AbortError")) return;
+      if (err && err.name === "NotAllowedError") {
+        // Cancelled, timed out, or (on load) not allowed without a tap: the same answer either way.
+        say(auto ? "Napauta painiketta kirjautuaksesi. / Tap the button to sign in."
+                 : "Passkey-kysely peruttiin tai aikakatkaistiin. / The passkey prompt was cancelled or timed out.", !auto);
+      } else {
+        say(explain(err), true);
+      }
+      // Have the next challenge ready for the tap.
+      if (!fresh()) prepare().catch(function () { /* the tap fetches one */ });
+    }
+  }
+
+  if (login) {
+    var autostart = form.getAttribute("data-autostart") === "1";
+    var started = false;
+    // Chrome refuses a prompt for a page without focus (a window behind
+    // another one): wait for the focus instead of spending the attempt.
+    var autoStart = function () {
+      if (started || running || document.visibilityState !== "visible") return;
+      if (typeof document.hasFocus === "function" && !document.hasFocus()) {
+        window.addEventListener("focus", autoStart, { once: true });
+        return;
+      }
+      started = true;
+      prepare().then(function (p) { return signIn(p, true); }).catch(function (err) {
+        say(explain(err), true);
+      });
+    };
+    prepare().catch(function () { /* the tap fetches one */ });
+    if (autostart) {
+      if (document.visibilityState === "visible") autoStart();
+      else document.addEventListener("visibilitychange", autoStart);
+    }
+  }
+
   if (form) {
     form.addEventListener("submit", async function (ev) {
       ev.preventDefault();
+      if (login) {
+        var p = fresh();
+        if (p) return signIn(p, false); // no await before get(): the tap's activation is still live
+        if (go) go.disabled = true;
+        say("Odotetaan passkeytä… / Waiting for your passkey…");
+        try {
+          p = await prepare();
+        } catch (err) {
+          say(explain(err), true);
+          if (go) go.disabled = false;
+          return;
+        }
+        if (go) go.disabled = false;
+        return signIn(p, false);
+      }
       if (go) go.disabled = true;
       say("Waiting for your passkey…");
       try {
         var next;
-        if (flow === "login") {
-          var reqOptions = await api("POST", "/auth/login/options", {});
-          var assertion = await W.startAuthentication({ optionsJSON: reqOptions });
-          next = (await api("POST", "/auth/login/verify", assertion)).next;
-        } else if (flow === "enroll") {
+        if (flow === "enroll") {
           var createOptions = await api("POST", "/auth/enroll/options", {});
           var attestation = await W.startRegistration({ optionsJSON: createOptions });
           next = (await api("POST", "/auth/enroll/verify", { response: attestation, name: nameInput ? nameInput.value : "" })).next;

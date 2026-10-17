@@ -77,6 +77,24 @@ describe("discovery", () => {
   });
 });
 
+describe("GET /auth/login", () => {
+  // The webmail's sign-in opens the passkey prompt on load when an
+  // authorization request waits; a direct visit waits for the tap.
+  it("asks for the passkey on load only with a pending authorization request", async () => {
+    const authz = await app.inject({ method: "GET", url: `/oauth/authorize?${authzQuery()}` });
+    const cookie = String(authz.headers["set-cookie"]).split(";")[0];
+    const page = await app.inject({ method: "GET", url: "/auth/login", headers: { cookie } });
+    expect(page.statusCode).toBe(200);
+    expect(page.body).toContain('<form id="flow" data-flow="login" data-autostart="1">');
+    expect(page.body).toContain('<button type="submit" id="go">Kirjaudu passkeyllä / Sign in with passkey</button>');
+    expect(page.body).toContain('<h1>Kirjaudu sisään / Sign in</h1>');
+    const direct = await app.inject({ method: "GET", url: "/auth/login" });
+    expect(direct.statusCode).toBe(200);
+    expect(direct.body).toContain('<form id="flow" data-flow="login">');
+    expect(direct.body).not.toContain("data-autostart");
+  });
+});
+
 describe("GET /oauth/authorize", () => {
   it("seals the request into gw_authz and sends the browser to the login page", async () => {
     const res = await app.inject({ method: "GET", url: `/oauth/authorize?${authzQuery()}` });

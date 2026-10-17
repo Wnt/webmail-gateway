@@ -112,13 +112,21 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
   app.get("/auth/login", async (req, reply) => {
     const pending = readPendingAuthz(s, req);
     if (!pending && (await s.sessions.ofRequest(req))) return reply.code(303).redirect("/auth/passkeys");
+    // With an authorization request waiting (the webmail sent the browser
+    // here), the page asks for the passkey as soon as it loads, where the
+    // browser allows that without a tap; the button is the one-tap fallback
+    // (static/auth/auth.js). Finnish and English side by side, like the
+    // webmail's own sign-in page.
     return sendPage(reply, {
       title: "Sign in",
       lang: pending?.ui_locales.split(/[\s,]/)[0],
       scripts: [WEBAUTHN_SCRIPT, AUTH_SCRIPT],
       body:
-        `<h1>Sign in</h1><p>Use your passkey to continue${pending ? ` to ${escapeHtml(s.ctx.config.auth.rpName)}` : ""}.</p>` +
-        `<form id="flow" data-flow="login"><button type="submit" id="go">Sign in with passkey</button></form>` +
+        `<h1>Kirjaudu sisään / Sign in</h1>` +
+        `<p>Jatka passkeyllä${pending ? ` palveluun ${escapeHtml(s.ctx.config.auth.rpName)}` : ""}. / ` +
+        `Use your passkey to continue${pending ? ` to ${escapeHtml(s.ctx.config.auth.rpName)}` : ""}.</p>` +
+        `<form id="flow" data-flow="login"${pending ? ` data-autostart="1"` : ""}>` +
+        `<button type="submit" id="go">Kirjaudu passkeyllä / Sign in with passkey</button></form>` +
         `<p id="msg" class="msg" role="status" aria-live="polite"></p>`,
     });
   });
