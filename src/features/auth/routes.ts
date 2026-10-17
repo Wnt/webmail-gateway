@@ -12,7 +12,9 @@ import { openJson, sealJson } from "./sealed.js";
 import { appendSetCookie, STEP_UP_WINDOW_MS, stepUpValid, type Session } from "./sessions.js";
 import type { AuthState } from "./state.js";
 import { AUTH_SCRIPT, WEBAUTHN_SCRIPT } from "./static.js";
-import { b64url, escapeHtml, hashToken, parseCookies, serializeCookie } from "./util.js";
+import { b64url, constantTimeEqual, escapeHtml, hashToken, isCodeChallenge, parseCookies, scopes as scopeUtil, serializeCookie } from "./util.js";
+import { redirectAllowed, resolveScopes } from "./clients.js";
+import { randomBytes } from "node:crypto";
 import {
   authenticationOptions,
   CeremonyError,
@@ -201,6 +203,96 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     }
     void audit(s.ctx, { event: "login.ok", accountId: account.id, ip, userAgent, details: { passkey: passkey.name } }, s.now());
     return { next };
+  });
+
+  // --- first-party sign-in (no redirect) ----------------------------------
+  // The webmail on this origin signs in without leaving its page, after
+  // draft-ietf-oauth-first-party-apps: it fetches a passkey challenge here,
+  // runs navigator.credentials.get() itself (same origin, so the same RP ID
+  // and origin the assertion is checked against), and trades the assertion
+  // plus its PKCE challenge for an authorization code in JSON, which its
+  // server redeems at /oauth/token exactly like a code from the redirect
+  // flow. Everything the redirect flow checks holds here too: the
+  // single-use challenge bound by gw_chal, user verification, the
+  // allowlist, the login rate limit, a fresh assertion per code (A5), a
+  // short-lived single-use code bound to client, redirect URI and S256
+  // challenge. On top: only a registered first-party client, a request
+  // from this origin (not merely "no Origin header"), and a CSRF token
+  // handed out with the challenge and sealed into gw_chal.
+  const FP_CSRF_HEADER = "x-gateway-csrf";
+
+  function fromThisOrigin(req: FastifyRequest, reply: FastifyReply): boolean {
+    if (!sameOrigin(req, reply, s.origin, { json: true })) return false;
+    const site = req.headers["sec-fetch-site"];
+    if (site === "same-origin" || (site === undefined && req.headers.origin === s.origin)) return true;
+    void reply.code(403).send({ error: "cross_origin" });
+    return false;
+  }
+
+  app.post("/auth/fp/options", async (req, reply) => {
+    if (!fromThisOrigin(req, reply)) return;
+    if (limited(req, reply, "login", 10)) return;
+    const options = await authenticationOptions(s);
+    const id = await storeChallenge(s, "login", options.challenge, null);
+    const csrf = randomBytes(32).toString("base64url");
+    appendSetCookie(reply, cookie(CHAL_COOKIE, sealJson(s.sealKey, CHAL_COOKIE, { id, csrf }, s.now() + CHALLENGE_TTL_MS), "/auth", CHALLENGE_TTL_MS / 1000));
+    return { options, csrf, expiresIn: CHALLENGE_TTL_MS / 1000 };
+  });
+
+  app.post("/auth/fp/authorize", async (req, reply) => {
+    if (!fromThisOrigin(req, reply)) return;
+    if (limited(req, reply, "login", 10)) return;
+    const { ip, userAgent } = requestMeta(req);
+    const b = body(req);
+    const field = (k: string) => (typeof b[k] === "string" ? (b[k] as string) : "");
+    const reject = (status: number, error: string, reason: string) => {
+      void audit(s.ctx, { event: "fp.authorize.rejected", ip, userAgent, details: { reason } }, s.now());
+      return reply.code(status).send({ error });
+    };
+    const client = s.clients.get(field("client_id"));
+    if (!client || !client.firstParty || !client.secretHash) return reject(400, "invalid_client", "not a first-party client");
+    const redirectUri = field("redirect_uri");
+    if (!redirectAllowed(client, redirectUri)) return reject(400, "invalid_request", "redirect_uri");
+    const codeChallenge = field("code_challenge");
+    if (field("code_challenge_method") !== "S256" || !isCodeChallenge(codeChallenge)) return reject(400, "invalid_request", "PKCE (S256) is required");
+    const scopes = resolveScopes(client, scopeUtil.parse(field("scope")));
+    if (!scopes.ok) return reject(400, "invalid_scope", "scope");
+    // The CSRF token the challenge was handed out with (sealed in gw_chal).
+    const chal = openJson<{ id: string; csrf?: string }>(s.sealKey, CHAL_COOKIE, parseCookies(req.headers.cookie).get(CHAL_COOKIE), s.now());
+    const sent = req.headers[FP_CSRF_HEADER];
+    if (!chal?.csrf || typeof sent !== "string" || !constantTimeEqual(sent, chal.csrf)) return reject(403, "csrf", "csrf token");
+    const assertion = typeof b.assertion === "object" && b.assertion !== null ? b.assertion : {};
+    let passkey: Passkey;
+    let generation: number;
+    try {
+      const challenge = await consumeFor(req, "login", null);
+      ({ passkey, generation } = await verifyAuthentication(s, { response: assertion as unknown as AuthenticationResponseJSON, challenge }));
+    } catch (err) {
+      return fail(req, reply, "login.fail", err);
+    }
+    clearCookie(reply, CHAL_COOKIE, "/auth");
+    const account = await getAccountById(s.ctx, passkey.accountId);
+    if (!account || !s.ctx.config.allowedEmails.includes(account.email)) {
+      void audit(s.ctx, { event: "login.not_allowed", accountId: passkey.accountId, ip, userAgent }, s.now());
+      return reply.code(403).send({ error: "account_not_allowed" });
+    }
+    const issued = await s.ctx.db.transaction(async (tx) => {
+      if (!(await holdAuth(tx, { accountId: account.id, generation, passkeyId: passkey.id }))) return null;
+      const session = await startSession(tx, req, account.id, passkey.id, true);
+      const code = await s.store.issueCode(
+        { clientId: client.id, accountId: account.id, passkeyId: passkey.id, redirectUri, codeChallenge, scopes: scopes.scopes, resource: null },
+        tx,
+      );
+      return { session, code };
+    });
+    if (!issued) return stale(req, reply, "login.fail", account.id, 400, "verification_failed");
+    s.limiter.refund("login", req.ip);
+    s.sessions.setCookie(reply, issued.session);
+    // A redirect-flow request left waiting is superseded by this sign-in.
+    clearPendingAuthz(s, reply);
+    void audit(s.ctx, { event: "oauth.code_issued", accountId: account.id, clientId: client.id, ip, userAgent, details: { flow: "first_party" } }, s.now());
+    void audit(s.ctx, { event: "login.ok", accountId: account.id, ip, userAgent, details: { passkey: passkey.name, flow: "first_party" } }, s.now());
+    return reply.header("Cache-Control", "no-store").send({ code: issued.code, iss: s.ctx.config.publicBaseUrl });
   });
 
   // --- enrollment (bootstrap link) -----------------------------------------

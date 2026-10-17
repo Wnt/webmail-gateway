@@ -71,6 +71,11 @@ export function discoveryDocument(issuer: string): Record<string, unknown> {
     revocation_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
     scopes_supported: ["mail"],
     authorization_response_iss_parameter_supported: true,
+    // First-party sign-in without a redirect (routes.ts, /auth/fp/*), after
+    // draft-ietf-oauth-first-party-apps: the first-party client asks for a
+    // passkey challenge, then trades the assertion for an authorization code.
+    authorization_challenge_endpoint: `${issuer}/auth/fp/authorize`,
+    passkey_challenge_endpoint: `${issuer}/auth/fp/options`,
   };
 }
 

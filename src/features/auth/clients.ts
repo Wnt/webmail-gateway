@@ -16,6 +16,12 @@ export interface OAuthClient {
   postLogoutRedirectUris: readonly string[];
   allowedScopes: readonly string[];
   defaultScopes: readonly string[];
+  /**
+   * A first-party client on this origin may sign in through the passkey
+   * challenge endpoints (`/auth/fp/*`, routes.ts) without leaving its page.
+   * Only Bulwark, the webmail served from this very origin, is.
+   */
+  firstParty?: boolean;
 }
 
 /**
@@ -31,6 +37,7 @@ export function buildClients(config: Pick<Config, "publicBaseUrl" | "auth">): Ma
     postLogoutRedirectUris: [`${base}/`, `${base}/login`],
     allowedScopes: [SCOPE_MAIL],
     defaultScopes: [SCOPE_MAIL],
+    firstParty: true,
   };
   return new Map([[bulwark.id, bulwark]]);
 }
