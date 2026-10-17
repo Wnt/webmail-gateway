@@ -19,6 +19,19 @@ export interface PendingAuthz extends Record<string, unknown> {
   scopes: string[];
   resource: string | null;
   ui_locales: string;
+  /**
+   * The request came from a same-origin page or straight from the user (the
+   * browser's `Sec-Fetch-Site`): only then may the login page ask for the
+   * passkey without a tap. A cross-site page that sends the browser here
+   * gets a page that waits for one.
+   */
+  autostart?: boolean;
+}
+
+/** `Sec-Fetch-Site` says this navigation was the user's own or came from this origin. */
+export function ownNavigation(req: FastifyRequest): boolean {
+  const site = req.headers["sec-fetch-site"];
+  return site === "same-origin" || site === "none";
 }
 
 type Params = Record<string, unknown>;
@@ -141,6 +154,7 @@ export async function oauthRoutes(app: FastifyInstance, s: AuthState): Promise<v
       scopes: scopes.scopes,
       resource: resource || null,
       ui_locales: str(q, "ui_locales").slice(0, 16),
+      autostart: ownNavigation(req),
     };
     appendSetCookie(
       reply,
@@ -251,6 +265,8 @@ export async function oauthRoutes(app: FastifyInstance, s: AuthState): Promise<v
       void audit(s.ctx, { event: "session.end_session", accountId: session.accountId, ip, userAgent }, s.now());
     }
     if (token) s.sessions.clearCookie(reply);
+    // An unfinished sign-in does not outlive the sign-out (it would ask for the passkey again).
+    clearPendingAuthz(s, reply);
     const client = s.clients.get(str(q, "client_id"));
     const target = str(q, "post_logout_redirect_uri");
     if (client && target && postLogoutAllowed(client, target)) {

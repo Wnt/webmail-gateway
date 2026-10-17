@@ -85,21 +85,25 @@
   }
 
   // --- sign-in ---------------------------------------------------------------
-  // The challenge is fetched when the page loads, so a tap on the button goes
-  // straight to navigator.credentials.get(): WebKit only lets a page ask for a
-  // passkey from a tap (or as its one allowance per page load), and a network
-  // round trip between the tap and the call can use that up. With an
-  // authorization request waiting (data-autostart), the prompt opens on load
-  // where the browser allows it - Chrome, Edge, Firefox and Safari 16+ do for
-  // a focused, visible page - and the button is the fallback. A refused or
-  // cancelled prompt leaves the page waiting for that one tap; it never
-  // retries by itself.
+  // With an authorization request this origin (or the user) started
+  // (data-autostart, decided by the server), the challenge is fetched when the
+  // page loads and the passkey prompt opens at once where the browser allows
+  // it without a tap - Chrome, Edge, Firefox and Safari 16+ do for a focused,
+  // visible page. The button is the fallback, and with the challenge already
+  // here a tap goes straight to navigator.credentials.get(): WebKit, where it
+  // still wants a tap, can lose that tap's activation to a network round trip.
+  // A refused or cancelled prompt waits for that one tap; the page never
+  // retries by itself. Without data-autostart nothing is fetched until the tap,
+  // so merely opening the page never replaces another ceremony's challenge.
   var login = flow === "login" && W && W.browserSupportsWebAuthn();
-  // Server challenge lifetime (CHALLENGE_TTL_MS, 120 s) less a margin for the ceremony itself.
-  var CHALLENGE_FRESH_MS = 90 * 1000;
+  var autostart = login && form.getAttribute("data-autostart") === "1";
+  // The server keeps a challenge 120 s (CHALLENGE_TTL_MS); one older than
+  // this leaves too little of that for the ceremony itself, so a tap fetches anew.
+  var CHALLENGE_FRESH_MS = 60 * 1000;
   var prepared = null; // { options, at } - a challenge not yet spent on a verify
   var preparing = null;
   var running = false;
+  var autoDone = false; // the one automatic attempt was made (or a tap came first)
 
   function prepare() {
     if (!preparing) {
@@ -113,6 +117,16 @@
 
   function fresh() {
     return prepared && Date.now() - prepared.at < CHALLENGE_FRESH_MS ? prepared : null;
+  }
+
+  /** The challenge to use: the fresh one, the one on its way, or a new one. */
+  function challenge() {
+    var p = fresh();
+    return p ? Promise.resolve(p) : prepare();
+  }
+
+  function pageActive() {
+    return document.visibilityState === "visible" && (typeof document.hasFocus !== "function" || document.hasFocus());
   }
 
   async function signIn(p, auto) {
@@ -130,7 +144,7 @@
     } catch (err) {
       running = false;
       if (go) go.disabled = false;
-      if (err && (err.name === "AbortError")) return;
+      if (err && err.name === "AbortError") return;
       if (err && err.name === "NotAllowedError") {
         // Cancelled, timed out, or (on load) not allowed without a tap: the same answer either way.
         say(auto ? "Napauta painiketta kirjautuaksesi. / Tap the button to sign in."
@@ -138,44 +152,44 @@
       } else {
         say(explain(err), true);
       }
-      // Have the next challenge ready for the tap.
-      if (!fresh()) prepare().catch(function () { /* the tap fetches one */ });
+      // Have the next challenge ready for the tap (only where one was fetched on load).
+      if (autostart && !fresh()) prepare().catch(function () { /* the tap fetches one */ });
     }
   }
 
-  if (login) {
-    var autostart = form.getAttribute("data-autostart") === "1";
-    var started = false;
-    // Chrome refuses a prompt for a page without focus (a window behind
-    // another one): wait for the focus instead of spending the attempt.
-    var autoStart = function () {
-      if (started || running || document.visibilityState !== "visible") return;
-      if (typeof document.hasFocus === "function" && !document.hasFocus()) {
-        window.addEventListener("focus", autoStart, { once: true });
-        return;
-      }
-      started = true;
-      prepare().then(function (p) { return signIn(p, true); }).catch(function (err) {
-        say(explain(err), true);
-      });
-    };
+  // The one automatic attempt: only on a visible page with focus (Chrome
+  // refuses a prompt for a window behind another one), checked again right
+  // before asking, and never once a tap has started a ceremony.
+  function autoStart() {
+    if (autoDone || running || !pageActive()) return;
+    challenge().then(function (p) {
+      if (autoDone || running) return;
+      if (!pageActive()) return; // a later focus or visibility change tries again
+      autoDone = true;
+      return signIn(p, true);
+    }).catch(function (err) {
+      say(explain(err), true);
+    });
+  }
+
+  if (autostart) {
     prepare().catch(function () { /* the tap fetches one */ });
-    if (autostart) {
-      if (document.visibilityState === "visible") autoStart();
-      else document.addEventListener("visibilitychange", autoStart);
-    }
+    document.addEventListener("visibilitychange", autoStart);
+    window.addEventListener("focus", autoStart);
+    autoStart();
   }
 
   if (form) {
     form.addEventListener("submit", async function (ev) {
       ev.preventDefault();
       if (login) {
+        autoDone = true; // the tap takes over from any automatic attempt
         var p = fresh();
         if (p) return signIn(p, false); // no await before get(): the tap's activation is still live
         if (go) go.disabled = true;
         say("Odotetaan passkeytä… / Waiting for your passkey…");
         try {
-          p = await prepare();
+          p = await prepare(); // the one already on its way, if any: never a second challenge
         } catch (err) {
           say(explain(err), true);
           if (go) go.disabled = false;

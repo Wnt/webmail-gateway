@@ -80,10 +80,14 @@ describe("discovery", () => {
 describe("GET /auth/login", () => {
   // The webmail's sign-in opens the passkey prompt on load when an
   // authorization request waits; a direct visit waits for the tap.
+  const own = { "sec-fetch-site": "none", "sec-fetch-mode": "navigate", "sec-fetch-dest": "document" };
+  const crossSite = { ...own, "sec-fetch-site": "cross-site" };
+  const pendingCookie = async (headers: Record<string, string>) =>
+    String((await app.inject({ method: "GET", url: `/oauth/authorize?${authzQuery()}`, headers })).headers["set-cookie"]).split(";")[0];
+
   it("asks for the passkey on load only with a pending authorization request", async () => {
-    const authz = await app.inject({ method: "GET", url: `/oauth/authorize?${authzQuery()}` });
-    const cookie = String(authz.headers["set-cookie"]).split(";")[0];
-    const page = await app.inject({ method: "GET", url: "/auth/login", headers: { cookie } });
+    const cookie = await pendingCookie(own);
+    const page = await app.inject({ method: "GET", url: "/auth/login", headers: { cookie, ...own } });
     expect(page.statusCode).toBe(200);
     expect(page.body).toContain('<form id="flow" data-flow="login" data-autostart="1">');
     expect(page.body).toContain('<button type="submit" id="go">Kirjaudu passkeyllä / Sign in with passkey</button>');
@@ -92,6 +96,36 @@ describe("GET /auth/login", () => {
     expect(direct.statusCode).toBe(200);
     expect(direct.body).toContain('<form id="flow" data-flow="login">');
     expect(direct.body).not.toContain("data-autostart");
+    // Same-origin navigation (the webmail's redirect) counts as the user's own.
+    const same = await pendingCookie({ ...own, "sec-fetch-site": "same-origin" });
+    expect((await app.inject({ method: "GET", url: "/auth/login", headers: { cookie: same, ...own, "sec-fetch-site": "same-origin" } })).body)
+      .toContain("data-autostart");
+  });
+
+  it("does not ask on load when another site started the request or sent the browser to the page", async () => {
+    // Another site sends the browser to /oauth/authorize ...
+    const foreign = await pendingCookie(crossSite);
+    const viaForeign = await app.inject({ method: "GET", url: "/auth/login", headers: { cookie: foreign, ...own } });
+    expect(viaForeign.statusCode).toBe(200);
+    expect(viaForeign.body).not.toContain("data-autostart");
+    // ... or straight to /auth/login while the webmail's own request waits.
+    const mine = await pendingCookie(own);
+    const linked = await app.inject({ method: "GET", url: "/auth/login", headers: { cookie: mine, ...crossSite } });
+    expect(linked.body).not.toContain("data-autostart");
+    // No provenance at all (no Sec-Fetch-Site): the tap.
+    const bare = await pendingCookie({});
+    expect((await app.inject({ method: "GET", url: "/auth/login", headers: { cookie: bare } })).body).not.toContain("data-autostart");
+  });
+
+  it("an explicit sign-out ends a sign-in in progress (no prompt on the next login page)", async () => {
+    const cookie = await pendingCookie(own);
+    const out = await app.inject({ method: "POST", url: "/auth/logout", headers: { cookie, origin: BASE } });
+    expect(out.statusCode).toBe(200);
+    const cleared = ([] as string[]).concat(out.headers["set-cookie"] ?? []);
+    expect(cleared.some((c) => c.startsWith(`${AUTHZ_COOKIE}=;`) && /Max-Age=0/.test(c))).toBe(true);
+    expect(cleared.some((c) => c.startsWith("gw_chal=;") && /Max-Age=0/.test(c))).toBe(true);
+    const end = await app.inject({ method: "GET", url: "/oauth/end_session", headers: { cookie } });
+    expect(([] as string[]).concat(end.headers["set-cookie"] ?? []).some((c) => c.startsWith(`${AUTHZ_COOKIE}=;`) && /Max-Age=0/.test(c))).toBe(true);
   });
 });
 
@@ -264,7 +298,9 @@ describe("GET /oauth/end_session", () => {
     });
     expect(res.statusCode).toBe(303);
     expect(res.headers.location).toBe(`${BASE}/?state=abc`);
-    expect(String(res.headers["set-cookie"])).toMatch(/^__Host-gw_session=; Path=\/; Max-Age=0; HttpOnly; SameSite=Strict; Secure$/);
+    const set = ([] as string[]).concat(res.headers["set-cookie"] ?? []);
+    expect(set[0]).toMatch(/^__Host-gw_session=; Path=\/; Max-Age=0; HttpOnly; SameSite=Strict; Secure$/);
+    expect(set.some((c) => c.startsWith(`${AUTHZ_COOKIE}=;`) && /Max-Age=0/.test(c)), JSON.stringify(set)).toBe(true);
     expect(await state.sessions.get(token)).toBeNull();
     expect((await ctx.db.query("SELECT 1 FROM auth_session WHERE id_hash = $1", [hashToken(token)])).rows).toHaveLength(0);
 

@@ -6,7 +6,7 @@ import { audit, requestMeta } from "./audit.js";
 import { sameOrigin } from "./csrf.js";
 import { consumeEnrollToken, peekEnrollToken } from "./enroll.js";
 import { holdAuth, holdStepUp } from "./generation.js";
-import { clearPendingAuthz, readPendingAuthz } from "./oauth.js";
+import { clearPendingAuthz, ownNavigation, readPendingAuthz } from "./oauth.js";
 import { messagePage, sendPage } from "./pages.js";
 import { openJson, sealJson } from "./sealed.js";
 import { appendSetCookie, STEP_UP_WINDOW_MS, stepUpValid, type Session } from "./sessions.js";
@@ -112,11 +112,13 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
   app.get("/auth/login", async (req, reply) => {
     const pending = readPendingAuthz(s, req);
     if (!pending && (await s.sessions.ofRequest(req))) return reply.code(303).redirect("/auth/passkeys");
-    // With an authorization request waiting (the webmail sent the browser
-    // here), the page asks for the passkey as soon as it loads, where the
-    // browser allows that without a tap; the button is the one-tap fallback
-    // (static/auth/auth.js). Finnish and English side by side, like the
-    // webmail's own sign-in page.
+    // With an authorization request waiting that this origin or the user
+    // started (not another site: PendingAuthz.autostart), and this page
+    // reached the same way, the page asks for the passkey as soon as it
+    // loads where the browser allows that without a tap; the button is the
+    // one-tap fallback (static/auth/auth.js). Finnish and English side by
+    // side, like the webmail's own sign-in page.
+    const autostart = !!pending?.autostart && ownNavigation(req);
     return sendPage(reply, {
       title: "Sign in",
       lang: pending?.ui_locales.split(/[\s,]/)[0],
@@ -125,7 +127,7 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
         `<h1>Kirjaudu sisään / Sign in</h1>` +
         `<p>Jatka passkeyllä${pending ? ` palveluun ${escapeHtml(s.ctx.config.auth.rpName)}` : ""}. / ` +
         `Use your passkey to continue${pending ? ` to ${escapeHtml(s.ctx.config.auth.rpName)}` : ""}.</p>` +
-        `<form id="flow" data-flow="login"${pending ? ` data-autostart="1"` : ""}>` +
+        `<form id="flow" data-flow="login"${autostart ? ` data-autostart="1"` : ""}>` +
         `<button type="submit" id="go">Kirjaudu passkeyllä / Sign in with passkey</button></form>` +
         `<p id="msg" class="msg" role="status" aria-live="polite"></p>`,
     });
@@ -447,6 +449,10 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
       void audit(s.ctx, { event: "session.logout", accountId: session.accountId, ...requestMeta(req) }, s.now());
     }
     s.sessions.clearCookie(reply);
+    // Nothing of a sign-in in progress survives the sign-out: no pending
+    // authorization (the login page would ask for the passkey again), no challenge.
+    clearPendingAuthz(s, reply);
+    clearCookie(reply, CHAL_COOKIE, "/auth");
     return { next: "/auth/login" };
   });
 }
