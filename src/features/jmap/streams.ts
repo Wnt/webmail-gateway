@@ -43,10 +43,22 @@ export class SseRegistry {
     private readonly maxTotal: number,
   ) {}
 
-  /** Reserve a slot; false when a cap is reached. */
+  /**
+   * Reserve a slot. A full account makes room by ending its OLDEST stream
+   * (reason `evicted`, a clean end the client reconnects from) instead of
+   * refusing the new one: a stream whose client vanished without the close
+   * reaching us (2026-10-18, the forwarder path held them) must never lock the
+   * account's live devices out. The newest stream is the one a client is
+   * reading right now. False only at the global cap, which stays the hard limit.
+   */
   add(h: SseHandle): boolean {
     const set = this.byAccount.get(h.accountId) ?? new Set<SseHandle>();
-    if (set.size >= this.maxPerAccount || this.total >= this.maxTotal) return false;
+    while (set.size >= this.maxPerAccount) {
+      const oldest = set.values().next().value!; // a Set iterates in insertion order
+      this.remove(oldest);
+      oldest.end("evicted");
+    }
+    if (this.total >= this.maxTotal) return false;
     set.add(h);
     this.byAccount.set(h.accountId, set);
     this.total++;

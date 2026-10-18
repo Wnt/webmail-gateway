@@ -215,15 +215,58 @@ describe("EventSource", () => {
     expect(eventSourceStreamCount(account.id)).toBe(0);
   });
 
-  it("caps streams per account", async () => {
+  it("makes room at the per-account cap by ending the oldest stream, which the client can reconnect from", async () => {
     const a = await open();
+    const ai = a.res.body[Symbol.asyncIterator]();
+    await ai.next();
     const b = await open();
-    const c = await request(`${gw.base}/jmap/eventsource`, { headers: AUTH });
-    expect(c.statusCode).toBe(429);
-    expect(c.headers["retry-after"]).toBe("30");
-    await c.body.dump();
-    a.ac.abort();
-    b.ac.abort();
+    const bi = b.res.body[Symbol.asyncIterator]();
+    await bi.next();
+    const c = await open();
+    expect(c.res.statusCode).toBe(200);
+    const ci = c.res.body[Symbol.asyncIterator]();
+    expect(String((await ci.next()).value)).toContain(": connected");
+    // The oldest (a) ended cleanly; b and c stay open.
+    let done = false;
+    for (let i = 0; i < 5 && !done; i++) done = !!(await ai.next()).done;
+    expect(done).toBe(true);
+    expect(eventSourceStreamCount(account.id)).toBe(2);
+    await sleep(50);
+    expect(fake.sse[0]!.closed).toBe(true);
+    expect(fake.sse[1]!.closed).toBe(false);
+    expect(gw.logs.join("\n")).toContain('"closeReason":"evicted"');
+    // The next one evicts b, the oldest left.
+    const d = await open();
+    expect(d.res.statusCode).toBe(200);
+    done = false;
+    for (let i = 0; i < 5 && !done; i++) done = !!(await bi.next()).done;
+    expect(done).toBe(true);
+    expect(eventSourceStreamCount(account.id)).toBe(2);
+    c.ac.abort();
+    d.ac.abort();
+  });
+
+  it("keeps the global cap as the hard limit (429)", async () => {
+    const tight = await startGateway(db, fake.url, { JMAP_SSE_MAX_PER_ACCOUNT: "5", JMAP_SSE_MAX_TOTAL: "1" });
+    try {
+      const other = await upsertAccount(gw.ctx, { email: "other@madekivi.fi", legacySlug: "gandi:other@madekivi.fi" });
+      fake.accounts.add(other.legacySlug);
+      registerAuthenticator(async (req) =>
+        req.headers.authorization === "Bearer other" ? { accountId: other.id, email: "other@madekivi.fi", scopes: ["mail"], via: "oauth" } : null,
+      );
+      const ac = new AbortController();
+      const a = await request(`${tight.base}/jmap/eventsource`, { headers: AUTH, signal: ac.signal });
+      expect(a.statusCode).toBe(200);
+      // Another account cannot evict this one: the global cap refuses it.
+      const b = await request(`${tight.base}/jmap/eventsource`, { headers: { authorization: "Bearer other" } });
+      expect(b.statusCode).toBe(429);
+      expect(b.headers["retry-after"]).toBe("30");
+      await b.body.dump();
+      expect(eventSourceStreamCount(account.id)).toBe(1);
+      ac.abort();
+    } finally {
+      await tight.close();
+    }
   });
 
   it("ends streams on revocation and the upstream connection with them", async () => {
