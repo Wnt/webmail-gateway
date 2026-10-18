@@ -95,7 +95,7 @@ Shared behaviour:
 
 **Test stacks:** `tools/stack up <name> --gateway --upstream jmap` runs the gateway against Stalwart's native JMAP (Basic, no legacy-proxy); the default `--upstream legacy` keeps legacy-proxy. The e2e suite (`tools/stack e2e <name>`) runs in both modes.
 
-**Bootstrap** (`npm run cli -- bootstrap <email> [--reset]`) reads the credential from the terminal without echo, or from stdin when piped; it is never printed or logged. With `jmap` it fetches the upstream session with the token and requires that the session's `username`, or the name of its primary mail account, equals `<email>` (which must be in `ALLOWED_EMAILS`); then it stores the token sealed and prints the passkey enrollment link. Exit 3: rejected, or another mailbox's token. Rotating the token is the same command (the old one is replaced; passkeys stay).
+**Bootstrap** (`npm run cli -- bootstrap <email> [--reset]`) reads the credential from the terminal without echo (the prompt goes to stderr; the terminal is in raw mode until Enter), or from stdin when piped; it is never printed or logged. With `jmap` it fetches the upstream session with the token and requires that the session's `username`, or the name of its primary mail account, equals `<email>` (which must be in `ALLOWED_EMAILS`); then it stores the token sealed and prints the passkey enrollment link. Exit 3: rejected, or another mailbox's token. Exit 130: cancelled at the prompt (Ctrl-C). Rotating the token is the same command (the old one is replaced; passkeys stay).
 
 ### Fastmail
 
