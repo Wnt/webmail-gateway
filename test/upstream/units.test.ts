@@ -53,11 +53,11 @@ describe("template expansion (RFC 6570 level 1)", () => {
     const s = {
       capabilities: {},
       apiUrl: "x",
-      username: "Jonni@Madekivi.fi",
-      accounts: { u1: { name: "jonni@fastmail.com" }, u2: { name: "other" } },
+      username: "Owner@Example.test",
+      accounts: { u1: { name: "user@fastmail.example" }, u2: { name: "other" } },
       primaryAccounts: { "urn:ietf:params:jmap:mail": "u1" },
     } as unknown as JmapSession;
-    expect(sessionIdentities(s)).toEqual(["jonni@madekivi.fi", "jonni@fastmail.com"]);
+    expect(sessionIdentities(s)).toEqual(["owner@example.test", "user@fastmail.example"]);
   });
 });
 

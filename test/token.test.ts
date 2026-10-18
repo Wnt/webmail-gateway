@@ -37,9 +37,9 @@ const now = Math.floor(Date.now() / 1000);
 
 describe("token interop", () => {
   it("candidate token verifies with legacy-proxy reference", () => {
-    const tok = mintToken(key, { accountSlug: "gandi:jonni@madekivi.fi", username: "jonni@madekivi.fi" }, now);
+    const tok = mintToken(key, { accountSlug: "gandi:owner@example.test", username: "owner@example.test" }, now);
     const v = refVerify(key, tok);
-    expect(v).toEqual({ accountSlug: "gandi:jonni@madekivi.fi", username: "jonni@madekivi.fi", iat: now, exp: now + 300 });
+    expect(v).toEqual({ accountSlug: "gandi:owner@example.test", username: "owner@example.test", iat: now, exp: now + 300 });
   });
   it("key order and no padding match reference byte-for-byte", () => {
     const t = { accountSlug: "a:b", username: "ü@x.fi", iat: now, exp: now + 60 };
@@ -66,10 +66,10 @@ describe("token interop", () => {
 
 describe("mintLegacyToken", () => {
   it("is legacy-proxy format with the 300 s TTL and the given key", () => {
-    const tok = mintLegacyToken("gandi:jonni@madekivi.fi", "jonni@madekivi.fi", key, now);
+    const tok = mintLegacyToken("gandi:owner@example.test", "owner@example.test", key, now);
     expect(refVerify(key, tok)).toEqual({
-      accountSlug: "gandi:jonni@madekivi.fi",
-      username: "jonni@madekivi.fi",
+      accountSlug: "gandi:owner@example.test",
+      username: "owner@example.test",
       iat: now,
       exp: now + 300,
     });

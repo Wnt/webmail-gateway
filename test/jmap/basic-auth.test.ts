@@ -5,7 +5,7 @@ import { makeTestDb } from "../helpers.js";
 import type { FakeLegacyJmap } from "./fake-legacy-jmap.js";
 import { basic, resetDb, startFake, startGateway, type Gateway } from "./harness.js";
 
-const EMAIL = "jonni@madekivi.fi";
+const EMAIL = "owner@example.test";
 const PASS = "correct horse battery staple";
 
 let fake: FakeLegacyJmap;
@@ -31,13 +31,13 @@ beforeEach(async () => {
   fake.failNext.clear();
   fake.basicDelayMs = 0;
   fake.passwords.set(EMAIL, PASS);
-  fake.passwords.set("other@madekivi.fi", "other-pass");
+  fake.passwords.set("other@example.test", "other-pass");
   ipCounter++;
   ip = `198.51.100.${ipCounter}`;
   // A fresh gateway per test: fresh limiter windows and login cache (the database is shared).
   gw = await startGateway(db, fake.url, {
     JMAP_PASSWORD_MODE: "true",
-    ALLOWED_EMAILS: `Jonni@Madekivi.fi, other@madekivi.fi`,
+    ALLOWED_EMAILS: `Owner@Example.test, other@example.test`,
     JMAP_RL_IP: "6",
     JMAP_RL_ACCOUNT: "3",
     JMAP_RL_GLOBAL: "8",
@@ -53,7 +53,7 @@ const basicCalls = () => fake.seen.filter((s) => s.scheme === "Basic");
 
 describe("password mode", () => {
   it("verifies against legacy-proxy with the lower-cased email, stores the password sealed, then mints tokens", async () => {
-    const res = await session(basic("JONNI@madekivi.FI", PASS));
+    const res = await session(basic("OWNER@example.TEST", PASS));
     expect(res.status).toBe(200);
     expect(((await res.json()) as { username: string }).username).toBe(EMAIL);
     const b = basicCalls();
@@ -83,17 +83,17 @@ describe("password mode", () => {
   });
 
   it("never forwards a non-allowlisted email", async () => {
-    fake.passwords.set("stranger@madekivi.fi", "pw");
-    const res = await session(basic("stranger@madekivi.fi", "pw"));
+    fake.passwords.set("stranger@example.test", "pw");
+    const res = await session(basic("stranger@example.test", "pw"));
     expect(res.status).toBe(401);
     expect(res.headers.get("www-authenticate")).toBe('Bearer realm="webmail"');
     expect(fake.seen).toHaveLength(0);
   });
 
   it("limits forwarded failures per account; attempt N+1 never reaches legacy-proxy", async () => {
-    for (let i = 0; i < 3; i++) expect((await session(basic("other@madekivi.fi", `wrong${i}`), `203.0.113.${i}`)).status).toBe(401);
+    for (let i = 0; i < 3; i++) expect((await session(basic("other@example.test", `wrong${i}`), `203.0.113.${i}`)).status).toBe(401);
     expect(basicCalls()).toHaveLength(3);
-    const locked = await session(basic("other@madekivi.fi", "other-pass"), "203.0.113.99");
+    const locked = await session(basic("other@example.test", "other-pass"), "203.0.113.99");
     expect(locked.status).toBe(429);
     expect(Number(locked.headers.get("retry-after"))).toBeGreaterThan(0);
     expect(basicCalls()).toHaveLength(3);
@@ -107,12 +107,12 @@ describe("password mode", () => {
   });
 
   it("limits failures per IP, forwarded or not", async () => {
-    for (let i = 0; i < 6; i++) await session(basic(`nobody${i}@madekivi.fi`, "x"));
-    const res = await session(basic(`nobody@madekivi.fi`, "x"));
+    for (let i = 0; i < 6; i++) await session(basic(`nobody${i}@example.test`, "x"));
+    const res = await session(basic(`nobody@example.test`, "x"));
     expect(res.status).toBe(429);
     expect(fake.seen).toHaveLength(0);
     // another address is unaffected
-    expect((await session(basic(`nobody@madekivi.fi`, "x"), "198.18.0.1")).status).toBe(401);
+    expect((await session(basic(`nobody@example.test`, "x"), "198.18.0.1")).status).toBe(401);
   });
 
   it("answers 502 without counting a failure when legacy-proxy errors", async () => {
@@ -144,7 +144,7 @@ describe("password mode", () => {
     await gw.close(); // authenticators are process-wide: only one password-mode gateway at a time
     const tight = await startGateway(db, fake.url, {
       JMAP_PASSWORD_MODE: "true",
-      ALLOWED_EMAILS: `${EMAIL},other@madekivi.fi`,
+      ALLOWED_EMAILS: `${EMAIL},other@example.test`,
       JMAP_RL_ACCOUNT: "3",
       JMAP_RL_GLOBAL: "4",
     });
@@ -152,9 +152,9 @@ describe("password mode", () => {
       const at = (user: string, pass: string, n: number) =>
         fetch(tight.base + "/jmap/session", { headers: { authorization: basic(user, pass), "x-forwarded-for": `10.1.0.${n}` } });
       for (let i = 0; i < 3; i++) expect((await at(EMAIL, `bad${i}`, i)).status).toBe(401);
-      expect((await at("other@madekivi.fi", "bad", 10)).status).toBe(401);
+      expect((await at("other@example.test", "bad", 10)).status).toBe(401);
       const before = basicCalls().length;
-      expect((await at("other@madekivi.fi", "other-pass", 11)).status).toBe(429);
+      expect((await at("other@example.test", "other-pass", 11)).status).toBe(429);
       expect(basicCalls()).toHaveLength(before);
     } finally {
       gw = tight; // closed by afterEach

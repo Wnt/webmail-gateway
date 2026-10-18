@@ -13,7 +13,7 @@ import type { AppContext } from "../../src/types.js";
 import { makeTestConfig, makeTestDb } from "../helpers.js";
 import { ACCOUNT_ID, SHARED_ACCOUNT_ID, startFakeJmap, type FakeJmap } from "./fake-jmap.js";
 
-const EMAIL = "jonni@madekivi.fi";
+const EMAIL = "owner@example.test";
 const TOKEN = "fmu1-test-token-" + randomBytes(8).toString("hex");
 const CORE = "urn:ietf:params:jmap:core";
 const MAIL = "urn:ietf:params:jmap:mail";

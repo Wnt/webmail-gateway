@@ -18,9 +18,9 @@ afterAll(() => ctx.db.close());
 
 describe("accounts repository", () => {
   it("upserts, lower-cases the email and defaults the legacy slug", async () => {
-    const a = await upsertAccount(ctx, { email: "  Jonni@Madekivi.FI " });
-    expect(a.email).toBe("jonni@madekivi.fi");
-    expect(a.legacySlug).toBe("gandi:jonni@madekivi.fi");
+    const a = await upsertAccount(ctx, { email: "  Owner@Example.TEST " });
+    expect(a.email).toBe("owner@example.test");
+    expect(a.legacySlug).toBe("gandi:owner@example.test");
     expect(a.id).toMatch(/^[0-9a-f-]{36}$/);
     expect(a.createdAt).toBeInstanceOf(Date);
   });
