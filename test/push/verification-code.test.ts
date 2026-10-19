@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import type { EmailBody } from "../../src/features/push/summary-text.js";
 import { htmlToText } from "../../src/features/push/summary-text.js";
 import {
+  CUT_MARK,
   findVerificationCode,
   findVerificationCodeInBody,
+  markCut,
   MAX_BODY_CHARS,
   MAX_PREVIEW_CHARS,
   MAX_SUBJECT_CHARS,
@@ -137,6 +139,7 @@ describe("hostile mail stays cheap (linear, capped)", () => {
     return { small, large };
   };
   const body = (value: string): EmailBody => ({ text: [{ type: "text/plain", value }], html: [] });
+  const pad = (n: number) => "Lorem ipsum ".repeat(Math.ceil(n / 12)).slice(0, n);
   const html = (value: string): EmailBody => ({ text: [], html: [{ type: "text/html", value }] });
   const shapes: [string, (n: number) => () => unknown][] = [
     ["one long word under a code subject", (n) => () => findVerificationCodeInBody("Your verification code", body("x".repeat(n)))],
@@ -172,18 +175,50 @@ describe("hostile mail stays cheap (linear, capped)", () => {
 
   it("reads the subject, a preview and a body only up to their caps, never half a code", () => {
     expect([MAX_SUBJECT_CHARS, MAX_PREVIEW_CHARS, MAX_BODY_CHARS]).toEqual([1_000, 1_000, 20_000]);
-    const pad = (n: number) => "Lorem ipsum ".repeat(Math.ceil(n / 12)).slice(0, n);
     expect(findVerificationCode(`${pad(900)} Your code is 482913`, "")).toBe("482913");
     expect(findVerificationCode(`${pad(1_000)} Your code is 482913`, "")).toBeNull();
     expect(findVerificationCode("", `${pad(900)} Your code is 482913`, "preview")).toBe("482913");
     expect(findVerificationCode("", `${pad(1_000)} Your code is 482913`, "preview")).toBeNull();
     expect(findVerificationCode("", `${pad(19_000)} Your code is 482913`)).toBe("482913");
     expect(findVerificationCode("", `${pad(20_000)} Your code is 482913`)).toBeNull();
-    // A cap through the code drops the cut word, as a preview's "..." does: never "4829".
+    // Near the cut, nothing is offered: never "4829" for 482913 cut after its fourth digit.
     const ending = (n: number) => `${pad(MAX_BODY_CHARS - n - 9)} code is `;
-    expect(findVerificationCode("", `${ending(7)}482913 and more`)).toBe("482913");
+    expect(findVerificationCode("", `${ending(120)}482913 ${pad(200)}`)).toBe("482913");
+    expect(findVerificationCode("", `${ending(40)}482913 ${pad(200)}`)).toBeNull();
     expect(findVerificationCode("", `${ending(4)}482913 and more`)).toBeNull();
     expect(mentionsVerificationCode(`${pad(1_000)} code`)).toBe(false);
     expect(findVerificationCodeInBody("Your code", body(`${pad(21_000)} 482913`))).toBeNull();
+  });
+
+  it("a spaced or grouped code cut at a cap never comes back as its first group (subject, preview, body)", () => {
+    const at = (max: number, lead: string) => `${" ".repeat(max - lead.length)}${lead}`;
+    for (const lead of ["Your code is 1234 ", "Your code is 1234-", "Your code is 1 2 3 4 "]) {
+      expect(findVerificationCode(`${at(MAX_SUBJECT_CHARS, lead)}5678`, "")).toBeNull();
+      expect(findVerificationCode("", `${at(MAX_PREVIEW_CHARS, lead)}5678`, "preview")).toBeNull();
+      expect(findVerificationCode("", `${at(MAX_BODY_CHARS, lead)}5678`)).toBeNull();
+      expect(findVerificationCodeInBody("", body(`${at(MAX_BODY_CHARS, lead)}5678`))).toBeNull();
+    }
+    // Uncut, the whole code.
+    expect(findVerificationCode("", "Your code is 1234 5678", "preview")).toBe("12345678");
+  });
+
+  it("keeps the cut through HTML extraction: a large removed <style> before the cut leaves a short text that is still cut", () => {
+    const tail = "</style>Your code is 1234";
+    const markup = `<style>${"x".repeat(200_000 - "<style>".length - tail.length)}${tail}56`;
+    expect(markup.slice(0, 200_000).endsWith("1234")).toBe(true);
+    const [text] = verificationCodeBodyTexts(html(markup));
+    expect(text!.endsWith(CUT_MARK)).toBe(true);
+    expect(findVerificationCodeInBody("", html(markup))).toBeNull();
+    // A body value the server cut is cut too.
+    const truncated: EmailBody = { text: [{ type: "text/plain", value: "Your code is 1234", isTruncated: true }], html: [] };
+    expect(findVerificationCodeInBody("", truncated)).toBeNull();
+    const early: EmailBody = { text: [{ type: "text/plain", value: `Your code is 482913. ${pad(200)}`, isTruncated: true }], html: [] };
+    expect(findVerificationCodeInBody("", early)).toBe("482913");
+    // The guard counts from where the cut was: a code far before a long cut word still counts.
+    expect(findVerificationCode("", markCut(`Your code is 482913 ${"x".repeat(5_000)}`, true))).toBe("482913");
+    expect(findVerificationCode("", `Your code is 482913 ${"x".repeat(30_000)}`)).toBe("482913");
+    expect(findVerificationCodeInBody("", html(`<p>Your code is 482913</p>${"x".repeat(400_000)}`))).toBe("482913");
+    expect(findVerificationCode("", markCut("Your code is 1234 5678", true))).toBeNull();
+    expect(findVerificationCode("", markCut("Your code is 1234 5678", false))).toBe("12345678");
   });
 });
