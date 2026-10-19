@@ -137,10 +137,14 @@ export function decodeEntities(s: string): string {
 const HTML_QUOTE_START =
   /<div[^>]*class=["'][^"']*\b(?:gmail_quote|moz-cite-prefix|yahoo_quoted)\b|<blockquote[^>]*type=["']?cite|<div[^>]*id=["']?(?:divRplyFwdMsg|appendonsend|mail-editor-reference-message-container)\b|<hr[^>]*id=["']?stopSpelling/i;
 
-/** HTML to plain text: drops head/style/script/comments, everything from a reply quote on, and block quotes. */
-export function htmlToText(html: string): string {
+/**
+ * HTML to plain text: drops head/style/script/comments, everything from a
+ * reply quote on, and block quotes. `keepQuotes` keeps the quoted text (the
+ * one-time-code reader wants all of the visible text).
+ */
+export function htmlToText(html: string, opts: { keepQuotes?: boolean } = {}): string {
   let s = html;
-  const q = HTML_QUOTE_START.exec(s);
+  const q = opts.keepQuotes ? null : HTML_QUOTE_START.exec(s);
   if (q) s = s.slice(0, q.index);
   s = s
     .replace(/<!--[\s\S]*?(?:-->|$)/g, " ")
@@ -148,7 +152,7 @@ export function htmlToText(html: string): string {
     // a block left open (a value cut at maxBodyValueBytes): the rest is not text
     .replace(/<(style|script|template|svg)\b[\s\S]*$/i, " ")
     .replace(/<[^>]*$/, "")
-    .replace(/<blockquote\b[\s\S]*?<\/blockquote\s*>/gi, "\n")
+    .replace(/<blockquote\b[\s\S]*?<\/blockquote\s*>/gi, (m) => (opts.keepQuotes ? m : "\n"))
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/?(p|div|li|ul|ol|tr|table|h[1-6]|section|article|header|footer|hr)\b[^>]*>/gi, "\n")
     .replace(/<\/?(td|th)\b[^>]*>/gi, " ")
