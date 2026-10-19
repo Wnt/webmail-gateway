@@ -67,8 +67,9 @@ export function discoveryDocument(issuer: string): Record<string, unknown> {
     response_modes_supported: ["query"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
-    token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
-    revocation_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
+    // `none`: public clients (the native app), identified by client_id alone.
+    token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"],
+    revocation_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"],
     scopes_supported: ["mail"],
     authorization_response_iss_parameter_supported: true,
     // First-party sign-in without a redirect (routes.ts, /auth/fp/*), after
@@ -79,10 +80,17 @@ export function discoveryDocument(issuer: string): Record<string, unknown> {
   };
 }
 
-/** Client authentication for the token and revocation endpoints: body (`client_secret_post`) or HTTP Basic. */
+/**
+ * Client authentication for the token and revocation endpoints: body
+ * (`client_secret_post`) or HTTP Basic for a confidential client; `client_id`
+ * in the body and nothing else (`none`) for a public one. A public client that
+ * presents any secret (in the body, even empty, or with Basic) is refused, as
+ * is a confidential client without its secret.
+ */
 function authenticateClient(s: AuthState, req: FastifyRequest, body: Params): { client: OAuthClient; basic: boolean } | null {
   let id = str(body, "client_id");
   let secret = str(body, "client_secret");
+  const secretInBody = Object.hasOwn(body, "client_secret");
   let basic = false;
   const h = req.headers.authorization;
   if (typeof h === "string" && /^Basic\s+/i.test(h)) {
@@ -99,7 +107,9 @@ function authenticateClient(s: AuthState, req: FastifyRequest, body: Params): { 
     }
   }
   const client = s.clients.get(id);
-  if (!client || !secret || !clientSecretMatches(client, secret)) return null;
+  if (!client) return null;
+  if (client.public) return basic || secretInBody ? null : { client, basic: false };
+  if (!secret || !clientSecretMatches(client, secret)) return null;
   return { client, basic };
 }
 

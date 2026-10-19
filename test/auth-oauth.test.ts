@@ -71,7 +71,8 @@ describe("discovery", () => {
       revocation_endpoint: `${BASE}/oauth/revoke`,
       end_session_endpoint: `${BASE}/oauth/end_session`,
       code_challenge_methods_supported: ["S256"],
-      token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
+      token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"],
+      revocation_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"],
       scopes_supported: ["mail"],
     });
   });

@@ -128,14 +128,20 @@ export async function authRoutes(app: FastifyInstance, s: AuthState): Promise<vo
     // one-tap fallback (static/auth/auth.js). Finnish and English side by
     // side, like the webmail's own sign-in page.
     const autostart = !!pending?.autostart && ownNavigation(req);
+    // Another application than the webmail (the native app) is named, so the
+    // owner sees what the passkey tap signs in to.
+    const named = pending ? s.clients.get(pending.client_id)?.displayName : undefined;
+    const intro = named
+      ? `<p>Kirjaudu sovellukseen ${escapeHtml(named.fi)} passkeyllä. / Sign in to ${escapeHtml(named.en)} with your passkey.</p>`
+      : `<p>Jatka passkeyllä${pending ? ` palveluun ${escapeHtml(s.ctx.config.auth.rpName)}` : ""}. / ` +
+        `Use your passkey to continue${pending ? ` to ${escapeHtml(s.ctx.config.auth.rpName)}` : ""}.</p>`;
     return sendPage(reply, {
       title: "Sign in",
       lang: pending?.ui_locales.split(/[\s,]/)[0],
       scripts: [WEBAUTHN_SCRIPT, AUTH_SCRIPT],
       body:
         `<h1>Kirjaudu sisään / Sign in</h1>` +
-        `<p>Jatka passkeyllä${pending ? ` palveluun ${escapeHtml(s.ctx.config.auth.rpName)}` : ""}. / ` +
-        `Use your passkey to continue${pending ? ` to ${escapeHtml(s.ctx.config.auth.rpName)}` : ""}.</p>` +
+        intro +
         `<form id="flow" data-flow="login"${autostart ? ` data-autostart="1"` : ""}>` +
         `<button type="submit" id="go">Kirjaudu passkeyllä / Sign in with passkey</button></form>` +
         `<p id="msg" class="msg" role="status" aria-live="polite"></p>`,

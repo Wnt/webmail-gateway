@@ -9,8 +9,17 @@ export const IGNORED_SCOPES: readonly string[] = ["openid", "email", "profile", 
 
 export interface OAuthClient {
   id: string;
-  /** sha256 hex of the client secret; null for a disabled (unconfigured) client. */
+  /** sha256 hex of the client secret; null for a disabled (unconfigured) confidential client, and for a public one. */
   secretHash: string | null;
+  /**
+   * A public client (RFC 6749 section 2.1, `token_endpoint_auth_method:
+   * none`): a native app that cannot keep a secret. It identifies itself by
+   * `client_id` alone and must never present a secret; PKCE (required for
+   * every client) and the exact redirect URI bind its codes.
+   */
+  public?: boolean;
+  /** The name the sign-in page shows for a client other than the webmail on this origin. */
+  displayName?: { fi: string; en: string };
   /** Exact redirect URIs, where `*` stands for exactly one path segment. */
   redirectUris: readonly string[];
   postLogoutRedirectUris: readonly string[];
@@ -24,9 +33,15 @@ export interface OAuthClient {
   firstParty?: boolean;
 }
 
+/** The native iPhone app's client id (design/ios-native-app.md, "Sign-in"). */
+export const IOS_CLIENT_ID = "madekivi-ios";
+
 /**
  * Static registry (no DB until MCP's dynamic clients, §12 of the design).
  * Bulwark's callback is `<base>/<locale>/auth/callback` for each of its locales.
+ * The iPhone app signs in in the system browser sheet and comes back on a
+ * private-use URI scheme (RFC 8252 section 7.1): its bundle id, and the
+ * free-team development build's.
  */
 export function buildClients(config: Pick<Config, "publicBaseUrl" | "auth">): Map<string, OAuthClient> {
   const base = config.publicBaseUrl;
@@ -39,7 +54,20 @@ export function buildClients(config: Pick<Config, "publicBaseUrl" | "auth">): Ma
     defaultScopes: [SCOPE_MAIL],
     firstParty: true,
   };
-  return new Map([[bulwark.id, bulwark]]);
+  const ios: OAuthClient = {
+    id: IOS_CLIENT_ID,
+    secretHash: null,
+    public: true,
+    redirectUris: ["fi.madekivi.mail:/oauth/callback", "fi.madekivi.mail.dev:/oauth/callback"],
+    postLogoutRedirectUris: [],
+    allowedScopes: [SCOPE_MAIL],
+    defaultScopes: [SCOPE_MAIL],
+    displayName: { fi: "Madekivi Mail iPhonelle", en: "Madekivi Mail for iPhone" },
+  };
+  return new Map([
+    [bulwark.id, bulwark],
+    [ios.id, ios],
+  ]);
 }
 
 /** Bulwark locales are `xx` or `xx-YY` (`i18n/routing.ts`); the `*` segment accepts exactly that. */
@@ -49,6 +77,9 @@ const LOCALE_SEGMENT = String.raw`[a-z]{2}(?:-[A-Za-z]{2,4})?`;
  * Exact match (legacy-proxy's `redirectAllowed`): the URI must be in the form a
  * browser sends (`new URL(uri).href === uri`), so dot segments, backslashes and
  * percent-encoded slashes cannot land the code elsewhere. No query, no fragment.
+ * A private-use scheme URI (`fi.madekivi.mail:/oauth/callback`) matches only
+ * itself: the scheme is lower-cased by the parser, a `//host` form, another
+ * path or a trailing slash is a different string.
  */
 export function redirectAllowed(client: OAuthClient, uri: string): boolean {
   let parsed: URL;
@@ -72,7 +103,7 @@ export function postLogoutAllowed(client: OAuthClient, uri: string): boolean {
 }
 
 export function clientSecretMatches(client: OAuthClient, secret: string): boolean {
-  if (!client.secretHash) return false;
+  if (client.public || !client.secretHash) return false;
   return constantTimeEqual(sha256hex(secret), client.secretHash);
 }
 
