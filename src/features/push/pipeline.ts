@@ -533,7 +533,7 @@ export class Pipeline implements SummarySource {
    * (one bounded read). Never throws.
    */
   private async codeFor(account: Account, legacyAccountId: string, e: EmailLite): Promise<string | null> {
-    const fromPreview = findVerificationCode(e.subject, e.preview);
+    const fromPreview = findVerificationCode(e.subject, e.preview, "preview");
     if (fromPreview) {
       this.stats.inc("apns_code_preview");
       return fromPreview;

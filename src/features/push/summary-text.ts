@@ -133,31 +133,99 @@ export function decodeEntities(s: string): string {
   });
 }
 
-/** Where a quoted earlier message starts in common clients' HTML (Gmail, Apple Mail/Thunderbird, Outlook). */
+/**
+ * Where a quoted earlier message starts in common clients' HTML (Gmail, Apple
+ * Mail/Thunderbird, Outlook). The attribute scans stop at the next `<` or `>`
+ * (and a class value at its quote), so a run of unclosed tags is not rescanned
+ * from every one of them.
+ */
 const HTML_QUOTE_START =
-  /<div[^>]*class=["'][^"']*\b(?:gmail_quote|moz-cite-prefix|yahoo_quoted)\b|<blockquote[^>]*type=["']?cite|<div[^>]*id=["']?(?:divRplyFwdMsg|appendonsend|mail-editor-reference-message-container)\b|<hr[^>]*id=["']?stopSpelling/i;
+  /<div[^<>]*class=["'][^"'<>]*\b(?:gmail_quote|moz-cite-prefix|yahoo_quoted)\b|<blockquote[^<>]*type=["']?cite|<div[^<>]*id=["']?(?:divRplyFwdMsg|appendonsend|mail-editor-reference-message-container)\b|<hr[^<>]*id=["']?stopSpelling/i;
+
+/** HTML read for text at most (bodies are fetched far smaller; this bounds the work on anything else). */
+export const MAX_HTML_CHARS = 200_000;
+/** Elements whose content is not text; a closing tag ends them. */
+const NOT_TEXT = new Set(["head", "style", "script", "title", "template", "svg"]);
+/** ...and of those, the ones whose missing closing tag drops the rest (a value cut at maxBodyValueBytes). */
+const NOT_TEXT_TO_END = new Set(["style", "script", "template", "svg"]);
+const LINE_BREAKING = new Set(["p", "div", "li", "ul", "ol", "tr", "table", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "header", "footer", "hr"]);
+const CELL = new Set(["td", "th"]);
+const TAG_NAME = /^(\/?)(\w+)/;
 
 /**
  * HTML to plain text: drops head/style/script/comments, everything from a
  * reply quote on, and block quotes. `keepQuotes` keeps the quoted text (the
  * one-time-code reader wants all of the visible text).
+ *
+ * One pass over the markup, linear in its length whatever it holds (long
+ * words, unclosed tags or comments, thousands of unclosed elements): each
+ * tag is read up to its `>`, and each search for a closing tag either moves
+ * the scan past it or is remembered as having found none.
  */
 export function htmlToText(html: string, opts: { keepQuotes?: boolean } = {}): string {
-  let s = html;
+  let s = html.length > MAX_HTML_CHARS ? html.slice(0, MAX_HTML_CHARS) : html;
   const q = opts.keepQuotes ? null : HTML_QUOTE_START.exec(s);
   if (q) s = s.slice(0, q.index);
-  s = s
-    .replace(/<!--[\s\S]*?(?:-->|$)/g, " ")
-    .replace(/<(head|style|script|title|template|svg)\b[\s\S]*?<\/\1\s*>/gi, " ")
-    // a block left open (a value cut at maxBodyValueBytes): the rest is not text
-    .replace(/<(style|script|template|svg)\b[\s\S]*$/i, " ")
-    .replace(/<[^>]*$/, "")
-    .replace(/<blockquote\b[\s\S]*?<\/blockquote\s*>/gi, (m) => (opts.keepQuotes ? m : "\n"))
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/?(p|div|li|ul|ol|tr|table|h[1-6]|section|article|header|footer|hr)\b[^>]*>/gi, "\n")
-    .replace(/<\/?(td|th)\b[^>]*>/gi, " ")
-    .replace(/<[^>]*>/g, "");
-  return decodeEntities(s);
+  const out: string[] = [];
+  const unclosed = new Set<string>();
+  /** End of the first `</name\s*>` at or after `from`, or -1 (then never searched for again). */
+  const closing = (name: string, from: number): number => {
+    if (unclosed.has(name)) return -1;
+    const re = new RegExp(`<\\/${name}\\s*>`, "gi");
+    re.lastIndex = from;
+    const m = re.exec(s);
+    if (!m) {
+      unclosed.add(name);
+      return -1;
+    }
+    return m.index + m[0].length;
+  };
+  let i = 0;
+  while (i < s.length) {
+    const lt = s.indexOf("<", i);
+    if (lt < 0) {
+      out.push(s.slice(i));
+      break;
+    }
+    out.push(s.slice(i, lt));
+    if (s.startsWith("<!--", lt)) {
+      const end = s.indexOf("-->", lt + 4);
+      out.push(" ");
+      i = end < 0 ? s.length : end + 3;
+      continue;
+    }
+    const m = TAG_NAME.exec(s.slice(lt + 1, lt + 66));
+    const name = m && !m[1] ? m[2]!.toLowerCase() : null;
+    if (name && NOT_TEXT.has(name)) {
+      const end = closing(name, lt + 1 + name.length);
+      if (end >= 0) {
+        out.push(" ");
+        i = end;
+        continue;
+      }
+      if (NOT_TEXT_TO_END.has(name)) {
+        out.push(" ");
+        break;
+      }
+    }
+    const gt = s.indexOf(">", lt + 1);
+    // A tag cut off at the end (a value cut at maxBodyValueBytes) is not text.
+    if (gt < 0) break;
+    if (name === "blockquote" && !opts.keepQuotes) {
+      const end = closing(name, lt + 1 + name.length);
+      if (end >= 0) {
+        out.push("\n");
+        i = end;
+        continue;
+      }
+    }
+    const tag = m ? m[2]!.toLowerCase() : "";
+    if (tag === "br" && /^br\s*\/?$/i.test(s.slice(lt + 1, gt))) out.push("\n");
+    else if (LINE_BREAKING.has(tag)) out.push("\n");
+    else if (CELL.has(tag)) out.push(" ");
+    i = gt + 1;
+  }
+  return decodeEntities(out.join(""));
 }
 
 /** "On <date>, <name> wrote:" and its translations (Finnish clients: "<date> <name> kirjoitti:"). */
