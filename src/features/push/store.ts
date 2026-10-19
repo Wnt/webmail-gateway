@@ -396,8 +396,19 @@ export async function targetsForAccount(db: Queryable, accountId: string, allowe
  * which its preview ticket names).
  */
 export async function targetStillAuthorized(db: Queryable, target: PushTarget, allowed: readonly string[]): Promise<boolean> {
-  const { rows } = await db.query(
-    `SELECT 1 FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
+  return (await targetCheck(db, target, allowed)) !== null;
+}
+
+/**
+ * `targetStillAuthorized`, and, when it is, whether the endpoint now also
+ * serves another account (read again for every attempt: a second login may
+ * have subscribed the same browser while the push waited).
+ */
+export async function targetCheck(db: Queryable, target: PushTarget, allowed: readonly string[]): Promise<{ shared: boolean } | null> {
+  const { rows } = await db.query<{ shared: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM push_jmap_sub s2 JOIN push_relay_sub r2 ON r2.relay_id = s2.relay_id
+                     WHERE r2.endpoint = r.endpoint AND s2.account_id <> s.account_id AND r2.gone_at IS NULL) AS shared
+       FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
       WHERE s.account_id = $1 AND s.relay_id = $2 AND r.gone_at IS NULL
         AND r.endpoint = $4 AND r.p256dh = $5 AND r.auth = $6
         AND ($7::text IS NULL OR s.id = $7) AND ($8::text IS NULL OR r.incarnation = $8)
@@ -405,7 +416,7 @@ export async function targetStillAuthorized(db: Queryable, target: PushTarget, a
         AND ${DELIVERABLE} AND ${ALLOWED(3)} LIMIT 1`,
     [target.accountId, target.relayId, [...allowed], target.endpoint, target.p256dh, target.auth, target.subId ?? null, target.incarnation ?? null],
   );
-  return rows.length > 0;
+  return rows[0] ? { shared: rows[0].shared === true } : null;
 }
 
 /**

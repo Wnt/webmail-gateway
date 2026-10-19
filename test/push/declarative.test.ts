@@ -208,6 +208,28 @@ describe("declarative push is the deployment's choice, and never for a shared en
   });
 });
 
+describe("payload bounds with the longest ids (review round 3, R3-C)", () => {
+  it("stays within the push budget, falling back to the classic payload, and keeps a ticket that opens", async () => {
+    const { openPreviewTicket } = await import("../../src/features/push/preview-ticket.js");
+    const target = {
+      accountId: "6f1c1d1e-0000-4000-8000-000000000001", relayId: "r".repeat(128), endpoint: `https://${APPLE_PUSH_HOST}/push/${"e".repeat(64)}`,
+      p256dh: "p".repeat(87), auth: "a".repeat(22), subId: "s".repeat(22), incarnation: "0f0e0d0c-0000-4000-8000-00000000000a", shared: false,
+    };
+    const long = "x".repeat(255);
+    const payload: PushPayload = {
+      kind: "email", accountLabel: `${"m".repeat(64)}@${"d".repeat(185)}.test`, accountId: long, emailIds: [long],
+      changed: { [long]: { EmailDelivery: long } },
+      email: { from: "F".repeat(120), subject: "S".repeat(200), preview: "P".repeat(200) },
+    };
+    const body = h.rt.sender.bodyFor(target, payload);
+    expect(Buffer.byteLength(JSON.stringify(body))).toBeLessThanOrEqual(PAYLOAD_BUDGET_BYTES);
+    expect(body.previewTicket, "the ticket stays").toBeTruthy();
+    expect(openPreviewTicket(h.ctx.config.encKey, body.previewTicket)).not.toBeNull();
+    expect(body.emailIds).toEqual([long]);
+    expect(body.accountId).toBe(long);
+  });
+});
+
 describe("quiet replacement push to Apple's push service", () => {
   it("stays classic, so the service worker runs and takes the notification over", async () => {
     const fake = await startFakeLlm();
@@ -260,3 +282,46 @@ describe("declarative push is off by default (review round 2, N2)", () => {
     }
   });
 });
+
+describe("the shared-endpoint decision is read again for every attempt (review round 3, R3-B)", () => {
+  it("a second login subscribing the same browser during a retry makes the retry classic", async () => {
+    let duringRetry: (() => Promise<void>) | null = null;
+    const hs = await makeHarness(
+      { sender: { retryDelaysMs: [5], sleep: async () => { await duringRetry?.(); } } },
+      { PUSH_APPLE_DECLARATIVE: "true" },
+    );
+    try {
+      const a = await hs.newAccount();
+      const b = await hs.newAccount();
+      const iphone = makeBrowser();
+      await hs.enable(a.principal, "decl-rtr-a01", iphone, APPLE_PUSH_HOST);
+      hs.pushSvc.script.set("decl-rtr-a01", [{ status: 503 }]);
+      duringRetry = async () => {
+        duringRetry = null;
+        // B signs in on the same browser: same endpoint, another relay record (inline: Harness.enable waits for this run)
+        const reg = await hs.app.inject({
+          method: "POST", url: "/relay/api/push/register/web", remoteAddress: "198.51.100.40",
+          payload: { subscriptionId: "decl-rtr-b01", subscription: { endpoint: `https://${APPLE_PUSH_HOST}/push/decl-rtr-a01`, keys: iphone.keys } },
+        });
+        expect(reg.statusCode).toBe(200);
+        await hs.jmap(b.principal, "PushSubscription/get", { ids: null });
+        const set = await hs.jmap(b.principal, "PushSubscription/set", { create: { n: {
+          deviceClientId: "decl-rtr-b01", url: `${PUBLIC}/relay/api/push/jmap/decl-rtr-b01`, types: ["EmailDelivery"],
+          expires: new Date(Date.now() + 86_400_000).toISOString(),
+        } } });
+        const subId = (set.created as Record<string, { id: string }>).n!.id;
+        const code = (await hs.app.inject({ method: "GET", url: "/relay/api/push/verify/decl-rtr-b01" })).json().verificationCode as string;
+        await hs.jmap(b.principal, "PushSubscription/set", { update: { [subId]: { verificationCode: code } } });
+      };
+      await hs.legacy.deliver(a.slug, { id: "rt1" });
+      await hs.rt.idle();
+      const sent = hs.pushSvc.requests.filter((r) => r.id === "decl-rtr-a01").map((r) => JSON.parse(iphone.decrypt(r.body)) as Record<string, unknown>);
+      expect(sent).toHaveLength(2);
+      expect(sent[0]!.web_push).toBe(8030);
+      expect(sent[1]!.web_push, "the retry after B subscribed").toBeUndefined();
+    } finally {
+      await hs.close();
+    }
+  });
+});
+

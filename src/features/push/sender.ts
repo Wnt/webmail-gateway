@@ -5,7 +5,7 @@ import { declarativePayload, fitPayload, minimalPayload, PAYLOAD_BUDGET_BYTES, t
 import { mintPreviewTicket, relayKeyHash } from "./preview-ticket.js";
 import { safeHost } from "./relay-routes.js";
 import type { PushStats } from "./stats.js";
-import { recordRelayResult, targetStillAuthorized, type PushTarget, type SendOutcome } from "./store.js";
+import { recordRelayResult, targetCheck, type PushTarget, type SendOutcome } from "./store.js";
 import { endpointAllowed, isApplePushEndpoint } from "./validation.js";
 
 /**
@@ -77,11 +77,13 @@ export class Sender {
     for (let attempt = 0; ; attempt++) {
       // Revocation is durable state: re-read it before every attempt, so a
       // retry queued before a revocation does not go out after it.
-      if (!(await targetStillAuthorized(this.ctx.db, target, this.ctx.config.allowedEmails))) {
+      const check = await targetCheck(this.ctx.db, target, this.ctx.config.allowedEmails);
+      if (!check) {
         this.stats.inc("push_send_revoked");
         return "revoked";
       }
-      const { status, retryAfterMs } = await this.post(target, this.bodyFor(target, base), topic);
+      const now = { ...target, shared: check.shared };
+      const { status, retryAfterMs } = await this.post(target, this.bodyFor(now, base), topic);
       if (status >= 200 && status < 300) return this.done(target, "ok", "push_send_ok");
       if (status === 404 || status === 410) {
         this.ctx.log.info({ relay: target.relayId.slice(0, 6), host: safeHost(target.endpoint), status }, "push: endpoint gone");
@@ -146,7 +148,20 @@ export class Sender {
         )
       : null;
     const { previewTicket: _stale, ...rest } = payload;
-    return wrap(fitPayload({ ...rest, sentAt: now, ...(previewTicket ? { previewTicket } : {}) }, PAYLOAD_BUDGET_BYTES, wrap));
+    const base: PushPayload = { ...rest, sentAt: now, ...(previewTicket ? { previewTicket } : {}) };
+    const size = (q: PushPayload) => Buffer.byteLength(JSON.stringify(q), "utf8");
+    // A final, measured bound (very long ids): declarative only when it fits,
+    // then the classic payload, and the ticket goes last.
+    if (declarative) {
+      const d = wrap(fitPayload(base, PAYLOAD_BUDGET_BYTES, wrap));
+      if (size(d) <= PAYLOAD_BUDGET_BYTES) return d;
+      this.stats.inc("push_declarative_too_large");
+    }
+    const classic = fitPayload(base);
+    if (size(classic) <= PAYLOAD_BUDGET_BYTES || !previewTicket) return classic;
+    this.stats.inc("push_ticket_dropped");
+    const { previewTicket: _drop, ...noTicket } = classic;
+    return fitPayload(noTicket);
   }
 
   private async done(target: PushTarget, outcome: SendOutcome, counter: string): Promise<SendOutcome> {

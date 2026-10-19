@@ -221,6 +221,10 @@ export function fitPayload(p: PushPayload, budget = PAYLOAD_BUDGET_BYTES, wrap: 
       const { email: _drop, ...rest } = q;
       return rest;
     },
+    // Last, for very long ids: the label (only a title suffix) and the
+    // StateChange echo (the worker reads `accountId` first).
+    (q) => ({ ...q, accountLabel: "" }),
+    (q) => ({ ...q, changed: {} }),
   ];
   for (const step of steps) {
     if (size(cur) <= budget) return cur;
