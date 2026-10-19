@@ -117,7 +117,7 @@ describe("new mail to the native app", () => {
     });
     const outside = req.body.replace(req.json!.m!, "");
     for (const v of [id, `Tx.otp.${mailN}`, "482913", "examplepaja", "Alice", "verification", a.accountId]) expect(outside).not.toContain(v);
-    expect(h.rt.stats.get("apns_code_preview")).toBe(1);
+    expect(h.rt.stats.get("apns_code_subject")).toBe(1); // a code in the subject is visible as it is: no body read
   });
 
   it("mail without a code: no code field, and no body read", async () => {
@@ -162,6 +162,47 @@ describe("new mail to the native app", () => {
     expect(a.device.open(requests[0]!.json!.m!).code).toBe("123456");
     expect(h.rt.stats.get("apns_code_preview")).toBe(0);
     expect(h.rt.stats.get("apns_code_body")).toBe(1);
+  });
+
+  it("a code only in the preview is confirmed by the body: a hidden preheader code loses to the visible one", async () => {
+    const a = await appDevice();
+    const html =
+      '<div style="display:none">Your verification code is 111111.</div>' +
+      "<p>Hello Alice,</p><p>Your verification code is 222222.</p>";
+    // A server-made preview reads the hidden preheader too.
+    const preview = "Your verification code is 111111. Hello Alice, Your verification code is 222222.";
+    const { requests } = await deliver(a.slug, { subject: "Sign in", preview, body: [{ type: "text/html", value: html, in: "both" }] });
+    expect(requests).toHaveLength(1);
+    expect(a.device.open(requests[0]!.json!.m!).code).toBe("222222");
+    expect(h.rt.stats.get("apns_code_body")).toBe(1);
+  });
+
+  it("a code only in hidden text gets none, even though the preview shows it", async () => {
+    const a = await appDevice();
+    const html = '<div style="display:none">Your verification code is 111111.</div><p>Welcome to Examplepaja.</p>';
+    const { requests } = await deliver(a.slug, {
+      subject: "Welcome",
+      preview: "Your verification code is 111111. Welcome to Examplepaja.",
+      body: [{ type: "text/html", value: html, in: "both" }],
+    });
+    expect(requests).toHaveLength(1);
+    expect(a.device.open(requests[0]!.json!.m!).code).toBeUndefined();
+  });
+
+  it("when the body cannot be read, the preview's code is used", async () => {
+    const a = await appDevice();
+    const original = h.ctx.fetch;
+    h.ctx.fetch = async (input, init) =>
+      typeof init?.body === "string" && init.body.includes('"maxBodyValueBytes":40000') ? new Response("", { status: 500 }) : original(input, init);
+    try {
+      const { requests } = await deliver(a.slug, { subject: "Sign in", preview: "Your verification code is 482913. It expires soon." });
+      expect(requests).toHaveLength(1);
+      expect(a.device.open(requests[0]!.json!.m!).code).toBe("482913");
+      expect(h.rt.stats.get("apns_code_body_failed")).toBe(1);
+      expect(h.rt.stats.get("apns_code_preview")).toBe(1);
+    } finally {
+      h.ctx.fetch = original;
+    }
   });
 
   it("a body that names a code but has none: the push goes without one", async () => {

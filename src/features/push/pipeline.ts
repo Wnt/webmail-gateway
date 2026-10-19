@@ -562,18 +562,21 @@ export class Pipeline implements SummarySource {
   }
 
   /**
-   * The one-time code: from the subject and the preview first (the detector
-   * reads a long preview as possibly cut by the upstream, and offers nothing
-   * near its end); when none is there but the subject or preview names one,
-   * from the body (one bounded read). Never throws.
+   * The one-time code. A code in the subject is visible as it is and is used
+   * at once. Otherwise the body decides, read once and bounded: the reader
+   * shows the body, while a server-made preview may carry hidden preheader
+   * text or be cut, so a code found only in the preview is used only when the
+   * body cannot be read in time. Without a code word in the subject or the
+   * preview nothing is read. Never throws.
    */
   private async codeFor(account: Account, legacyAccountId: string, e: EmailLite): Promise<string | null> {
-    const fromPreview = findVerificationCode(e.subject, e.preview, "preview");
-    if (fromPreview) {
-      this.stats.inc("apns_code_preview");
-      return fromPreview;
+    const fromSubject = findVerificationCode(e.subject, "", "preview");
+    if (fromSubject) {
+      this.stats.inc("apns_code_subject");
+      return fromSubject;
     }
-    if (!mentionsVerificationCode(e.subject) && !mentionsVerificationCode(e.preview)) return null;
+    const fromPreview = findVerificationCode(e.subject, e.preview, "preview");
+    if (!fromPreview && !mentionsVerificationCode(e.subject) && !mentionsVerificationCode(e.preview)) return null;
     const started = Date.now();
     try {
       const res = await this.upstream.jmap(
@@ -596,13 +599,17 @@ export class Pipeline implements SummarySource {
         { maxResponseBytes: CODE_BODY_RESPONSE_BYTES, signal: AbortSignal.timeout(this.codeBodyTimeoutMs) },
       );
       const got = emailList(response(res, "b", "Email/get")).find((x) => x.id === e.id);
-      const code = got ? findVerificationCodeInBody(e.subject, emailBody(got as Parameters<typeof emailBody>[0])) : null;
+      if (!got) return fromPreview;
+      const code = findVerificationCodeInBody(e.subject, emailBody(got as Parameters<typeof emailBody>[0]));
       this.stats.inc(code ? "apns_code_body" : "apns_code_body_none");
       return code;
     } catch (err) {
       this.stats.inc("apns_code_body_failed");
       this.ctx.log.debug({ accountId: account.id, err: (err as Error).message, ms: Date.now() - started }, "push: code body read failed");
-      return null;
+      // The body could not be read in time: the preview's code (it is never one cut at the preview's end) is
+      // the best there is.
+      if (fromPreview) this.stats.inc("apns_code_preview");
+      return fromPreview;
     }
   }
 }
