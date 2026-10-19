@@ -1,0 +1,26 @@
+{
+  "about": "Synthetic test vectors for the Madekivi Mail APNs payload envelope v1 (see design/ios-native-app.md). Invented keys and data only.",
+  "devicePrivateKeyHex": "1f5f3c1c2b9d4e6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c",
+  "devicePublicKey": "BL5JPEkq6DOa-JE82sxI6I9eK6m2LHDoUfUtEooyFuXPt8MQnpKpo33oAtiEzNoo-9F7uvZ1o7U67EsdeiQ-F_A",
+  "ephemeralPrivateKeyHex": "6b3f9a1c2d4e5f60718293a4b5c6d7e8f9011223344556677889900aabbccdde",
+  "saltHex": "00112233445566778899aabbccddeeff",
+  "nonceHex": "0102030405060708090a0b0c",
+  "vectors": [
+    {
+      "name": "mail with a code",
+      "plaintext": "{\"v\":1,\"kind\":\"email\",\"accountId\":\"a1\",\"emailId\":\"Mexample0001\",\"threadId\":\"Texample0001\",\"from\":\"Examplepaja <info@examplepaja.test>\",\"subject\":\"Your verification code is 123456\",\"preview\":\"Use 123456 to sign in. It expires in 10 minutes.\",\"code\":\"123456\",\"receivedAt\":\"2026-10-19T12:00:00Z\",\"sentAt\":1792411200000}",
+      "envelope": "AQRJAYN9xSSovb-RgqwgtjVV1-bpaxnYPUaDGuSZB5G-HSxBoVTkkSg4NRnP5Is0nEbZrFMlG8mL2JUnw5IHTK2ZABEiM0RVZneImaq7zN3u_wECAwQFBgcICQoLDJAP7e9cOrM9_IILGS-wSxim0ouj44j38EY4wXJRppqTmhJhr4mCjPJaHENAqNGpYc4vsf-vZtGd7qZYXEu8FRTUpVU3eUurd_VgIXOXo3HDb4iCk_KUwYk5EH4GoKuNPr0Jy-rQTbcRX4vjhhioX6M4ZnBrZG7pwZVq18dP9-FYTMd3qtjg0csdAaHXPr9IJOuzca2JaoIWDMjRnX16eN_5unW8CAXo-cjPHS1KWySJ3rKfgU8Eg5f0DeLsvpu93qLGkMUlnwHJFWRgdNIzjgw8iiXMHAeH4MrWRIMYR9DNXa6IRO45r8wfYJTwVogcOBL3N-nTRzYLI7JEdYLNLc6QOPdF8KMdxG5gFRjMLgbILRbpmMKOjr8r_aXtECYmvKYr8DxPilctxSLPpFAl-r0qh1gqbPXDKVZQmUv-rvBEoLTT77lPG4qv9hI4"
+    },
+    {
+      "name": "mail without a code",
+      "plaintext": "{\"v\":1,\"kind\":\"email\",\"accountId\":\"a1\",\"emailId\":\"Mexample0002\",\"threadId\":\"Texample0002\",\"from\":\"Bob Example <bob@example.test>\",\"subject\":\"Lunch on Friday?\",\"preview\":\"Shall we meet at noon at the usual place – ääkköset ja emoji 🎉 work too.\",\"receivedAt\":\"2026-10-19T12:05:00Z\",\"sentAt\":1792411500000}",
+      "envelope": "AQRJAYN9xSSovb-RgqwgtjVV1-bpaxnYPUaDGuSZB5G-HSxBoVTkkSg4NRnP5Is0nEbZrFMlG8mL2JUnw5IHTK2ZABEiM0RVZneImaq7zN3u_wECAwQFBgcICQoLDJAP7e9cOrM9_IILGS-wSxim0ouj44j38EY4wXJRppqTmhJhr4mCjPJaHENAqNGpYc4vsf-vZtGd7qZYXEu_FRTUpVU3eUurd_VgIXOXo3HDb4iCk_KUwYo5EH4GoKuNPr0JzP3TAIIFW5bygByoX6g5Yl9OeXfl3IljnMNL7vRIGo4mrZOgl4wNAOGHeZBJaLL5CK2SOOQSAN7Zgis7NYngp37qAg_7vtKEPWUaBXudnOGdwAgRhdLjEKf1887xq7DXkIB_yRWJUDF1d9Iwiwoxz2xAsrTuV05wmJga9gPNGLPGDr4p6swZZIikw2S8kx6iO_TcAmBebq1UapSKfo_Zc_NF94cAkDEmZlzcIgnLLQnujKePkbQinK7vGkw0qrRoz3AX6VBqkWe56UAr-rsmhVwrbfeOKBbkyieRXLS1-MCgI7sVrA"
+    },
+    {
+      "name": "test push",
+      "plaintext": "{\"v\":1,\"kind\":\"test\",\"code\":\"654321\",\"sentAt\":1792411800000}",
+      "envelope": "AQRJAYN9xSSovb-RgqwgtjVV1-bpaxnYPUaDGuSZB5G-HSxBoVTkkSg4NRnP5Is0nEbZrFMlG8mL2JUnw5IHTK2ZABEiM0RVZneImaq7zN3u_wECAwQFBgcICQoLDJAP7e9cOrM9_IILGS-wSwmuwJbt7Ya2_kE-jD0d5ObDixpy7JSC07VRBWNd5qL8dM0_yKvmP4zdsvNYEeu1yvugYl-ox9J8CVHh-yQ"
+    }
+  ],
+  "wrongKeyEnvelope": "AQRJAYN9xSSovb-RgqwgtjVV1-bpaxnYPUaDGuSZB5G-HSxBoVTkkSg4NRnP5Is0nEbZrFMlG8mL2JUnw5IHTK2ZABEiM0RVZneImaq7zN3u_wECAwQFBgcICQoLDJstBHuuIdHgmLrljNAUTUnLcA"
+}

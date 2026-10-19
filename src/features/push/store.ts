@@ -202,13 +202,16 @@ export async function recordRelayResult(db: Queryable, relayId: string, outcome:
  *    unlike a grant's own expiry, that one ends push at once, before the
  *    sweeper revokes the grant.
  */
-const AUTHORIZED = `EXISTS (SELECT 1 FROM account a
-          WHERE a.id = s.account_id AND a.auth_generation = s.auth_generation
-            AND (s.grant_id IS NOT NULL OR a.auth_revoked_at IS NULL OR a.auth_revoked_at < s.created_at))
+const authorizedSql = (t: string) => `EXISTS (SELECT 1 FROM account a
+          WHERE a.id = ${t}.account_id AND a.auth_generation = ${t}.auth_generation
+            AND (${t}.grant_id IS NOT NULL OR a.auth_revoked_at IS NULL OR a.auth_revoked_at < ${t}.created_at))
   AND NOT EXISTS (SELECT 1 FROM oauth_grant g
-                  WHERE g.id = s.grant_id AND g.revoked_at IS NOT NULL AND g.revoked_reason <> 'expired')
+                  WHERE g.id = ${t}.grant_id AND g.revoked_at IS NOT NULL AND g.revoked_reason <> 'expired')
   AND NOT EXISTS (SELECT 1 FROM oauth_grant g JOIN passkey p ON p.id = g.passkey_id
-                  WHERE g.id = s.grant_id AND p.expires_at <= now())`;
+                  WHERE g.id = ${t}.grant_id AND p.expires_at <= now())`;
+const AUTHORIZED = authorizedSql("s");
+/** The same rules for an APNs device registration (alias `d`, migration 240): it always has a grant. */
+const APNS_AUTHORIZED = authorizedSql("d");
 
 /** A subscription that can receive pushes: verified, unexpired, authorized. */
 const DELIVERABLE = `s.verified_at IS NOT NULL AND s.expires > now() AND ${AUTHORIZED}`;
@@ -337,14 +340,19 @@ export async function deleteJmapSub(db: Queryable, id: string, accountId: string
   return true;
 }
 
-/** Does the account have a subscription that can receive pushes (P1: only then keep an upstream)? */
+/**
+ * Does the account have a browser subscription or an APNs device that can
+ * receive pushes (P1: only then keep an upstream subscription, and so an
+ * IDLE connection)? An account with only the native app counts too.
+ */
 export async function hasActiveSubs(db: Queryable, accountId: string): Promise<boolean> {
-  const { rows } = await db.query<{ n: number }>(
-    `SELECT count(*)::int AS n FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
-      WHERE s.account_id = $1 AND ${DELIVERABLE} AND r.gone_at IS NULL`,
+  const { rows } = await db.query<{ web: boolean; apns: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
+                     WHERE s.account_id = $1 AND ${DELIVERABLE} AND r.gone_at IS NULL) AS web,
+            EXISTS (SELECT 1 FROM push_apns_device d WHERE d.account_id = $1 AND d.gone_at IS NULL AND ${APNS_AUTHORIZED}) AS apns`,
     [accountId],
   );
-  return (rows[0]?.n ?? 0) > 0;
+  return rows[0]?.web === true || rows[0]?.apns === true;
 }
 
 export interface PushTarget {
@@ -362,7 +370,7 @@ export interface PushTarget {
 }
 
 /** The account is (still) in `ALLOWED_EMAILS` (`$n` is that list): removing it ends its pushes at once. */
-const ALLOWED = (n: number) => `EXISTS (SELECT 1 FROM account ae WHERE ae.id = s.account_id AND ae.email = ANY ($${n}::text[]))`;
+const ALLOWED = (n: number, t = "s") => `EXISTS (SELECT 1 FROM account ae WHERE ae.id = ${t}.account_id AND ae.email = ANY ($${n}::text[]))`;
 
 /** Distinct endpoints that should get the account's EmailDelivery pushes. `allowed`: the configured allowlist. */
 export async function targetsForAccount(db: Queryable, accountId: string, allowed: readonly string[]): Promise<PushTarget[]> {
@@ -593,11 +601,12 @@ export async function storeUpstreamCode(
   return (res.rowCount ?? 0) > 0;
 }
 
-/** Accounts the reconciler looks at: anything with an upstream row in use, active subs, or (always-mode) an upstream credential. */
+/** Accounts the reconciler looks at: anything with an upstream row in use, active subs or APNs devices, or (always-mode) an upstream credential. */
 export async function accountsToReconcile(db: Queryable, always: boolean): Promise<string[]> {
   const { rows } = await db.query<{ id: string }>(
     `SELECT account_id AS id FROM push_upstream WHERE status <> 'none'
      UNION SELECT s.account_id FROM push_jmap_sub s WHERE ${DELIVERABLE}
+     UNION SELECT d.account_id FROM push_apns_device d WHERE d.gone_at IS NULL AND ${APNS_AUTHORIZED}
      UNION SELECT id FROM account WHERE $1::boolean AND (gandi_secret IS NOT NULL OR upstream_secret IS NOT NULL)`,
     [always],
   );
@@ -631,7 +640,11 @@ export async function notifiedIds(db: Queryable, accountId: string, ids: string[
   return new Set(rows.map((r) => r.email_id));
 }
 
-/** Housekeeping: old dedupe rows, long-expired or never-verified emulated subs, dead, orphaned or expired pending relay records. */
+/**
+ * Housekeeping: old dedupe rows, long-expired or never-verified emulated
+ * subs, dead, orphaned or expired pending relay records, revoked APNs
+ * devices and ones APNs called gone a month ago.
+ */
 export async function garbageCollect(db: Queryable, pendingWindowMs = PENDING_WINDOW_MS): Promise<void> {
   const window = "make_interval(secs => $1::double precision / 1000)";
   await db.query("DELETE FROM push_notified WHERE notified_at < now() - interval '7 days'");
@@ -639,6 +652,8 @@ export async function garbageCollect(db: Queryable, pendingWindowMs = PENDING_WI
   await db.query("DELETE FROM push_jmap_sub WHERE expires < now() - interval '7 days'");
   await db.query(`DELETE FROM push_jmap_sub s WHERE NOT (${AUTHORIZED})`);
   await db.query(`DELETE FROM push_jmap_sub WHERE verified_at IS NULL AND created_at < now() - ${window}`, [pendingWindowMs]);
+  await db.query(`DELETE FROM push_apns_device d WHERE NOT (${APNS_AUTHORIZED})`);
+  await db.query("DELETE FROM push_apns_device WHERE gone_at < now() - interval '30 days'");
   await db.query(`DELETE FROM push_relay_sub WHERE linked_at IS NULL AND updated_at < now() - ${window}`, [pendingWindowMs]);
   await db.query(
     `DELETE FROM push_relay_sub r
@@ -646,4 +661,167 @@ export async function garbageCollect(db: Queryable, pendingWindowMs = PENDING_WI
          OR (r.updated_at < now() - interval '30 days'
              AND NOT EXISTS (SELECT 1 FROM push_jmap_sub s WHERE s.relay_id = r.relay_id))`,
   );
+}
+
+// ------------------------------------------------------------- APNs devices (native app)
+
+/** Most APNs registrations per account (design/ios-native-app.md). */
+export const MAX_APNS_DEVICES_PER_ACCOUNT = 10;
+
+export type ApnsEnvironment = "production" | "sandbox";
+
+export interface ApnsDevice {
+  id: string;
+  accountId: string;
+  grantId: string;
+  token: string;
+  environment: ApnsEnvironment;
+  topic: string;
+  /** base64url of the device's 65-byte P-256 point. */
+  publicKey: string;
+  name: string | null;
+  locale: "fi" | "en" | null;
+  createdAt: Date;
+  lastPushAt: Date | null;
+  failCount: number;
+  goneAt: Date | null;
+}
+
+interface ApnsRow {
+  id: string;
+  account_id: string;
+  grant_id: string;
+  token: string;
+  environment: ApnsEnvironment;
+  topic: string;
+  public_key: string;
+  name: string | null;
+  locale: "fi" | "en" | null;
+  created_at: Date;
+  last_push_at: Date | null;
+  fail_count: number;
+  gone_at: Date | null;
+}
+
+const toApns = (r: ApnsRow): ApnsDevice => ({
+  id: r.id,
+  accountId: r.account_id,
+  grantId: r.grant_id,
+  token: r.token,
+  environment: r.environment,
+  topic: r.topic,
+  publicKey: r.public_key,
+  name: r.name,
+  locale: r.locale,
+  createdAt: r.created_at,
+  lastPushAt: r.last_push_at,
+  failCount: r.fail_count,
+  goneAt: r.gone_at,
+});
+
+export type ApnsRegisterResult = { ok: true; id: string } | { ok: false; reason: "quota" | "revoked" };
+
+/**
+ * Register (or re-register) a device token for `accountId`, bound to
+ * `grantId` and the account's current auth generation. The same token
+ * replaces its earlier row whoever registered it (new key, new grant; a
+ * device signed in to another account moves over), keeping the row's id
+ * within one account. At most `max` live registrations per account.
+ *
+ * Under the account row lock, which `bootstrap --reset` and every grant
+ * revocation also take first: a grant revoked (or an account reset) after
+ * the caller's token was checked refuses the registration instead of
+ * binding it to the new generation.
+ */
+export async function registerApnsDevice(
+  db: Db,
+  d: {
+    newId: string;
+    accountId: string;
+    grantId: string;
+    token: string;
+    environment: ApnsEnvironment;
+    topic: string;
+    publicKey: string;
+    name: string | null;
+    locale: "fi" | "en" | null;
+  },
+  max = MAX_APNS_DEVICES_PER_ACCOUNT,
+): Promise<ApnsRegisterResult> {
+  return db.transaction(async (tx) => {
+    const acc = await tx.query<{ auth_generation: number }>("SELECT auth_generation FROM account WHERE id = $1 FOR UPDATE", [d.accountId]);
+    if (!acc.rows[0]) return { ok: false, reason: "revoked" };
+    const live = await tx.query("SELECT 1 FROM oauth_grant WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL", [d.grantId, d.accountId]);
+    if (live.rows.length === 0) return { ok: false, reason: "revoked" };
+    const { rows } = await tx.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM push_apns_device d
+        WHERE d.account_id = $1 AND d.token <> $2 AND d.gone_at IS NULL AND ${APNS_AUTHORIZED}`,
+      [d.accountId, d.token],
+    );
+    if ((rows[0]?.n ?? 0) >= max) return { ok: false, reason: "quota" };
+    const ins = await tx.query<{ id: string }>(
+      `INSERT INTO push_apns_device (id, account_id, grant_id, auth_generation, token, environment, topic, public_key, name, locale)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (token) DO UPDATE SET
+         id = CASE WHEN push_apns_device.account_id = EXCLUDED.account_id THEN push_apns_device.id ELSE EXCLUDED.id END,
+         account_id = EXCLUDED.account_id, grant_id = EXCLUDED.grant_id, auth_generation = EXCLUDED.auth_generation,
+         environment = EXCLUDED.environment, topic = EXCLUDED.topic, public_key = EXCLUDED.public_key,
+         name = EXCLUDED.name, locale = EXCLUDED.locale, updated_at = now(), gone_at = NULL, fail_count = 0,
+         created_at = CASE WHEN push_apns_device.account_id = EXCLUDED.account_id THEN push_apns_device.created_at ELSE now() END
+       RETURNING id`,
+      [d.newId, d.accountId, d.grantId, acc.rows[0].auth_generation, d.token, d.environment, d.topic, d.publicKey, d.name, d.locale],
+    );
+    return { ok: true, id: ins.rows[0]!.id };
+  });
+}
+
+/** One of the account's registrations, in any state, or null. */
+export async function getApnsDevice(db: Queryable, id: string, accountId: string): Promise<ApnsDevice | null> {
+  const { rows } = await db.query<ApnsRow>("SELECT * FROM push_apns_device WHERE id = $1 AND account_id = $2", [id, accountId]);
+  return rows[0] ? toApns(rows[0]) : null;
+}
+
+/** Remove one of the account's registrations. */
+export async function deleteApnsDevice(db: Queryable, id: string, accountId: string): Promise<boolean> {
+  const res = await db.query("DELETE FROM push_apns_device WHERE id = $1 AND account_id = $2", [id, accountId]);
+  return (res.rowCount ?? 0) > 0;
+}
+
+/** The account's registrations that should get its pushes: not gone, authorized, the account allowlisted. */
+export async function apnsTargetsForAccount(db: Queryable, accountId: string, allowed: readonly string[]): Promise<ApnsDevice[]> {
+  const { rows } = await db.query<ApnsRow>(
+    `SELECT d.* FROM push_apns_device d
+      WHERE d.account_id = $1 AND d.gone_at IS NULL AND ${APNS_AUTHORIZED} AND ${ALLOWED(2, "d")}
+      ORDER BY d.created_at, d.id`,
+    [accountId, [...allowed]],
+  );
+  return rows.map(toApns);
+}
+
+/**
+ * Before every send attempt (retries included): the registration is still
+ * the one the push was made for (same id, account, grant, token and key),
+ * not gone, authorized, and its account allowlisted.
+ */
+export async function apnsTargetStillAuthorized(db: Queryable, d: ApnsDevice, allowed: readonly string[]): Promise<boolean> {
+  const { rows } = await db.query(
+    `SELECT 1 FROM push_apns_device d
+      WHERE d.id = $1 AND d.account_id = $2 AND d.grant_id = $3 AND d.token = $4 AND d.public_key = $5
+        AND d.gone_at IS NULL AND ${APNS_AUTHORIZED} AND ${ALLOWED(6, "d")} LIMIT 1`,
+    [d.id, d.accountId, d.grantId, d.token, d.publicKey, [...allowed]],
+  );
+  return rows.length > 0;
+}
+
+export type ApnsSendOutcome = "ok" | "gone" | "failed" | "revoked";
+
+/** Record a send result for the registration (matched by id and token, so a replaced row is not touched). */
+export async function recordApnsResult(db: Queryable, d: Pick<ApnsDevice, "id" | "token">, outcome: ApnsSendOutcome): Promise<void> {
+  if (outcome === "ok") {
+    await db.query("UPDATE push_apns_device SET last_push_at = now(), fail_count = 0 WHERE id = $1 AND token = $2", [d.id, d.token]);
+  } else if (outcome === "gone") {
+    await db.query("UPDATE push_apns_device SET gone_at = now() WHERE id = $1 AND token = $2", [d.id, d.token]);
+  } else if (outcome === "failed") {
+    await db.query("UPDATE push_apns_device SET fail_count = fail_count + 1 WHERE id = $1 AND token = $2", [d.id, d.token]);
+  }
 }

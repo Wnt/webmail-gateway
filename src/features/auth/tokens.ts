@@ -490,12 +490,14 @@ export class TokenStore {
       new Date(t - REFRESH_GRACE_MS),
     ]);
     // Used refresh tokens stay until they expire: reuse detection needs them.
-    // Expired ones stay while a push subscription still belongs to their grant
-    // (push outlives expiry, and renewal keeps the grant): presented to
-    // /oauth/revoke, they revoke the grant and so those pushes.
+    // Expired ones stay while a push subscription or an APNs device still
+    // belongs to their grant (push outlives expiry, and renewal keeps the
+    // grant): presented to /oauth/revoke, they revoke the grant and so those
+    // pushes (the native app signs out that way).
     await db.query(
       `DELETE FROM oauth_refresh_token rt WHERE rt.expires_at <= $1
-         AND NOT EXISTS (SELECT 1 FROM push_jmap_sub s WHERE s.grant_id = rt.grant_id)`,
+         AND NOT EXISTS (SELECT 1 FROM push_jmap_sub s WHERE s.grant_id = rt.grant_id)
+         AND NOT EXISTS (SELECT 1 FROM push_apns_device d WHERE d.grant_id = rt.grant_id)`,
       [new Date(t)],
     );
     await db.query(

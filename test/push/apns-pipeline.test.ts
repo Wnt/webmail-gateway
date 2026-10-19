@@ -1,0 +1,253 @@
+import { readFileSync } from "node:fs";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { registerAuthenticator, resetAuthenticators } from "../../src/core/auth-context.js";
+import { resetAccountAuth } from "../../src/features/auth/generation.js";
+import { createAuthState } from "../../src/features/auth/state.js";
+import { TokenStore } from "../../src/features/auth/tokens.js";
+import { CODE_BODY_VALUE_BYTES } from "../../src/features/push/pipeline.js";
+import { getUpstream } from "../../src/features/push/store.js";
+import { apnsEnv, makeDevice, makeProviderKey, signInApp, startFakeApns, type FakeApns, type FakeDevice } from "./apns-fake.js";
+import type { FakeBodyPart } from "./fakes.js";
+import { makeHarness, type Harness } from "./harness.js";
+
+// New mail reaches the native app (design/ios-native-app.md): one APNs push
+// per device for the newest message of a run, encrypted to the device, with
+// the one-time code from the subject, the preview or (when they name a code
+// they do not show) the body.
+
+const key = makeProviderKey();
+let fake: FakeApns;
+let h: Harness;
+let ip = 0;
+let mailN = 0;
+
+beforeAll(async () => {
+  fake = await startFakeApns(key);
+  h = await makeHarness({ apns: { ca: fake.ca, retryDelaysMs: [5] } }, apnsEnv(fake, key));
+  registerAuthenticator(new TokenStore(h.ctx).authenticator());
+});
+afterAll(async () => {
+  resetAuthenticators();
+  await h.close();
+  await fake.close();
+});
+beforeEach(async () => {
+  await h.reset();
+  fake.requests.length = 0;
+  fake.script.length = 0;
+});
+
+/** An account whose only device is the native app. */
+async function appDevice(): Promise<{ accountId: string; slug: string; grantId: string; refreshToken: string; passkeyId: Buffer; device: FakeDevice; id: string }> {
+  const a = await h.newAccount();
+  const s = await signInApp(h.ctx, a.account.id);
+  const device = makeDevice();
+  const res = await h.app.inject({
+    method: "POST",
+    url: "/relay/api/push/apns/devices",
+    remoteAddress: `198.20.${(++ip >> 8) & 255}.${ip & 255}`,
+    headers: { authorization: `Bearer ${s.accessToken}`, "content-type": "application/json" },
+    payload: JSON.stringify({ token: device.token, environment: "production", publicKey: device.publicKey, name: "iPhone", locale: "fi" }),
+  });
+  expect(res.statusCode, res.body).toBe(200);
+  await h.rt.idle(); // the upstream subscription comes up for the app alone
+  expect((await getUpstream(h.ctx.db, a.account.id))?.status).toBe("active");
+  return { accountId: a.account.id, slug: a.slug, grantId: s.grantId, refreshToken: s.refreshToken, passkeyId: s.passkeyId, device, id: (res.json() as { id: string }).id };
+}
+
+interface Mail {
+  subject: string;
+  preview: string;
+  body?: FakeBodyPart[];
+  from?: { name: string | null; email: string }[];
+}
+
+/** New mail arrives (the catch-up sweep picks it up); returns the APNs requests it caused. */
+async function deliver(slug: string, m: Mail) {
+  const before = fake.requests.length;
+  const id = `Mx.otp.${String(++mailN).padStart(4, "0")}`;
+  h.legacy.addEmail(slug, { id, threadId: `Tx.otp.${mailN}`, from: m.from ?? [{ name: "Examplepaja", email: "info@examplepaja.test" }], subject: m.subject, preview: m.preview, ...(m.body ? { body: m.body } : {}) });
+  await h.rt.tick();
+  await h.rt.idle();
+  return { id, requests: fake.requests.slice(before) };
+}
+
+const OTP = { subject: "Your Examplepaja verification code is 482913", preview: "Hi Alice, Use this code to finish signing in: 482913 It expires in 10 minutes." };
+
+describe("new mail to the native app", () => {
+  it("a one-time-code mail: one push, the code and ids inside the envelope, nothing about it outside", async () => {
+    const a = await appDevice();
+    const { id, requests } = await deliver(a.slug, OTP);
+    expect(requests).toHaveLength(1);
+    const req = requests[0]!;
+    expect(req.status).toBe(200);
+    expect(req.token).toBe(a.device.token);
+    const plain = a.device.open(req.json!.m!);
+    const legacyAccountId = h.legacy.account(a.slug).legacyAccountId;
+    expect(plain).toEqual({
+      v: 1,
+      kind: "email",
+      accountId: legacyAccountId,
+      emailId: id,
+      threadId: `Tx.otp.${mailN}`,
+      from: "Examplepaja <info@examplepaja.test>",
+      subject: OTP.subject,
+      preview: OTP.preview,
+      code: "482913",
+      receivedAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/),
+      sentAt: expect.any(Number),
+    });
+    expect(Object.keys(req.json!)).toEqual(["aps", "m"]);
+    expect(req.json!.aps).toEqual({
+      alert: { "title-loc-key": "PUSH_TITLE", "loc-key": "PUSH_BODY" },
+      sound: "default",
+      "mutable-content": 1,
+      category: "MAIL",
+      "thread-id": "mail",
+    });
+    const outside = req.body.replace(req.json!.m!, "");
+    for (const v of [id, `Tx.otp.${mailN}`, "482913", "examplepaja", "Alice", "verification", a.accountId]) expect(outside).not.toContain(v);
+    expect(h.rt.stats.get("apns_code_preview")).toBe(1);
+  });
+
+  it("mail without a code: no code field, and no body read", async () => {
+    const a = await appDevice();
+    const gets = () => h.legacy.calls.filter((c) => c === "Email/get").length;
+    const before = gets();
+    const { requests } = await deliver(a.slug, { subject: "Lunch on Friday?", preview: "Shall we meet at noon at the usual place?" });
+    expect(requests).toHaveLength(1);
+    const plain = a.device.open(requests[0]!.json!.m!);
+    expect(plain.code).toBeUndefined();
+    expect(plain.subject).toBe("Lunch on Friday?");
+    expect(gets() - before).toBe(1); // the sweep's own Email/get only
+  });
+
+  it("a code the preview does not show is read from the body (once, bounded)", async () => {
+    const a = await appDevice();
+    const gets = () => h.legacy.calls.filter((c) => c === "Email/get").length;
+    const before = gets();
+    const html =
+      '<html><head><style>td{font-size:32px}</style></head><body><table><tr><td>Vahvista sähköpostiosoitteesi syöttämällä alla oleva koodi.</td></tr>' +
+      "<tr><td>914602</td></tr><tr><td>Asiakasnumero 10023, viite 2026-10-19</td></tr></table></body></html>";
+    const { requests } = await deliver(a.slug, {
+      subject: "Laskutin: vahvista sähköpostiosoitteesi",
+      preview: "Vahvista sähköpostiosoitteesi syöttämällä alla oleva koodi. Koodi on voimassa 10 minuuttia.",
+      body: [{ type: "text/html", value: html, in: "both" }],
+    });
+    expect(requests).toHaveLength(1);
+    expect(a.device.open(requests[0]!.json!.m!).code).toBe("914602");
+    expect(gets() - before).toBe(2);
+    expect(h.rt.stats.get("apns_code_body")).toBe(1);
+    expect(CODE_BODY_VALUE_BYTES).toBeLessThanOrEqual(64 * 1024);
+  });
+
+  it("a body that names a code but has none: the push goes without one", async () => {
+    const a = await appDevice();
+    const { requests } = await deliver(a.slug, { subject: "Your sign-in code", preview: "Open the app to see your code.", body: [{ type: "text/plain", value: "Open the app to see your code." }] });
+    expect(requests).toHaveLength(1);
+    expect(a.device.open(requests[0]!.json!.m!).code).toBeUndefined();
+    expect(h.rt.stats.get("apns_code_body_none")).toBe(1);
+  });
+
+  it("a burst: one push, for the newest message", async () => {
+    const a = await appDevice();
+    for (const [i, subject] of ["First", "Second", "Your code is 551471"].entries()) {
+      h.legacy.addEmail(a.slug, { id: `burst.${i}`, subject, preview: subject, receivedAt: new Date(Date.now() - (3 - i) * 1000).toISOString() });
+    }
+    await h.rt.tick();
+    await h.rt.idle();
+    expect(fake.requests).toHaveLength(1);
+    expect(a.device.open(fake.requests[0]!.json!.m!)).toMatchObject({ emailId: "burst.2", code: "551471" });
+  });
+
+  it("browsers and the native app of one account both get the mail", async () => {
+    const a = await appDevice();
+    const principal = (await new TokenStore(h.ctx).authenticate((await signInApp(h.ctx, a.accountId)).accessToken))!;
+    const { browser } = await h.enable(principal, "apns-pipeline-browser");
+    const before = h.pushSvc.requests.length;
+    const { id, requests } = await deliver(a.slug, OTP);
+    expect(requests).toHaveLength(1);
+    const web = h.pushSvc.requests.slice(before);
+    expect(web).toHaveLength(1);
+    const payload = JSON.parse(browser.decrypt(web[0]!.body)) as { emailIds: string[]; email: { subject: string } };
+    expect(payload.emailIds).toEqual([id]);
+    expect(payload.email.subject).toBe(OTP.subject);
+    expect(a.device.open(requests[0]!.json!.m!).emailId).toBe(id);
+  });
+
+  it("each shared one-time-code mail of the test stacks gets its code (subject and preview, or the body)", async () => {
+    const cases = (JSON.parse(readFileSync(new URL("../fixtures/verification-code-cases.json", import.meta.url), "utf8")) as {
+      name: string;
+      subject: string;
+      text: string;
+      code: string | null;
+    }[]).filter((c) => c.name.startsWith("otp fixture"));
+    expect(cases.length).toBeGreaterThanOrEqual(10);
+    const a = await appDevice();
+    for (const c of cases) {
+      const preview = c.text.replace(/\s+/g, " ").trim().slice(0, 256);
+      const { requests } = await deliver(a.slug, { subject: c.subject, preview, body: [{ type: "text/plain", value: c.text }] });
+      expect(requests, c.name).toHaveLength(1);
+      expect(a.device.open(requests[0]!.json!.m!).code ?? null, c.name).toBe(c.code);
+    }
+  });
+});
+
+describe("who gets it (the Web Push rules)", () => {
+  it("not a device whose grant was revoked (the app signed out)", async () => {
+    const a = await appDevice();
+    await new TokenStore(h.ctx).revokeToken(a.refreshToken, "madekivi-ios");
+    expect((await deliver(a.slug, OTP)).requests).toEqual([]);
+    // Nothing else wants the upstream any more (P1).
+    await h.rt.tick();
+    await h.rt.idle();
+    expect((await getUpstream(h.ctx.db, a.accountId))?.status).toBe("none");
+  });
+
+  it("not a deleted device", async () => {
+    const a = await appDevice();
+    const s = await signInApp(h.ctx, a.accountId);
+    const del = await h.app.inject({ method: "DELETE", url: `/relay/api/push/apns/devices/${a.id}`, headers: { authorization: `Bearer ${s.accessToken}` } });
+    expect(del.statusCode).toBe(200);
+    await h.rt.idle();
+    expect((await deliver(a.slug, OTP)).requests).toEqual([]);
+  });
+
+  it("not after bootstrap --reset", async () => {
+    const a = await appDevice();
+    await resetAccountAuth(createAuthState(h.ctx), a.accountId);
+    expect((await deliver(a.slug, OTP)).requests).toEqual([]);
+  });
+
+  it("not once the account's auth generation moved on, even with the grant left alone", async () => {
+    const a = await appDevice();
+    await h.ctx.db.query("UPDATE account SET auth_generation = auth_generation + 1 WHERE id = $1", [a.accountId]);
+    expect((await deliver(a.slug, OTP)).requests).toEqual([]);
+  });
+
+  it("not once a temporary passkey behind the grant has expired", async () => {
+    const a = await appDevice();
+    await h.ctx.db.query("UPDATE passkey SET expires_at = now() - interval '1 second' WHERE id = $1", [a.passkeyId]);
+    expect((await deliver(a.slug, OTP)).requests).toEqual([]);
+  });
+
+  it("still after the grant merely expired (notifications outlive sign-in)", async () => {
+    const a = await appDevice();
+    await h.ctx.db.query("UPDATE oauth_grant SET expires_at = now(), revoked_at = now(), revoked_reason = 'expired' WHERE id = $1", [a.grantId]);
+    expect((await deliver(a.slug, OTP)).requests).toHaveLength(1);
+  });
+
+  it("not a device APNs called gone", async () => {
+    const a = await appDevice();
+    fake.script.push({ status: 410, reason: "Unregistered" });
+    expect((await deliver(a.slug, OTP)).requests).toHaveLength(1);
+    expect((await deliver(a.slug, OTP)).requests).toEqual([]);
+  });
+
+  it("not for an account removed from ALLOWED_EMAILS", async () => {
+    const a = await appDevice();
+    const email = (await h.ctx.db.query<{ email: string }>("SELECT email FROM account WHERE id = $1", [a.accountId])).rows[0]!.email;
+    h.ctx.config.allowedEmails.splice(h.ctx.config.allowedEmails.indexOf(email), 1);
+    expect((await deliver(a.slug, OTP)).requests).toEqual([]);
+  });
+});

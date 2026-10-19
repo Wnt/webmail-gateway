@@ -1,6 +1,8 @@
 import webpush from "web-push";
 import { onLegacyRelogin, registerPushSubscriptionHandler } from "../../core/hooks.js";
 import type { AppContext, CliCommand, FeaturePlugin } from "../../types.js";
+import { ApnsSender, type ApnsOptions } from "./apns.js";
+import { registerApnsRoutes } from "./apns-routes.js";
 import { createPushSubscriptionHandler } from "./jmap-emulation.js";
 import { Pipeline, type PipelineOptions } from "./pipeline.js";
 import { registerRelayRoutes } from "./relay-routes.js";
@@ -16,11 +18,15 @@ import { UpstreamManager, type ReconcileReason, type UpstreamOptions } from "./u
  * subscription per account in legacy-proxy, and encrypted Web Push with a
  * from/subject/preview summary for every new INBOX message, optionally
  * followed by a quiet replacement push carrying an AI summary (Phase 5).
+ * The native iPhone app's devices register under /relay/api/push/apns and
+ * get the same new-mail pushes through APNs, end-to-end encrypted to the
+ * device, with the one-time code when the message has one.
  */
 
 export interface PushRuntime {
   stats: PushStats;
   sender: Sender;
+  apns: ApnsSender;
   pipeline: Pipeline;
   upstream: UpstreamManager;
   /** Fire-and-forget reconcile of one account (logs its own errors). */
@@ -33,6 +39,7 @@ export interface PushRuntime {
 
 export interface PushTestOptions {
   sender?: SenderOptions;
+  apns?: ApnsOptions;
   pipeline?: PipelineOptions;
   upstream?: UpstreamOptions;
   summarizer?: SummarizerOptions;
@@ -45,7 +52,8 @@ const GC_EVERY_TICKS = 12;
 export function createPushRuntime(ctx: AppContext, opts: PushTestOptions = {}): PushRuntime {
   const stats = new PushStats();
   const sender = new Sender(ctx, stats, opts.sender);
-  const pipeline = new Pipeline(ctx, stats, sender, { ...opts.pipeline, summarizer: opts.summarizer ?? opts.pipeline?.summarizer });
+  const apns = new ApnsSender(ctx, stats, opts.apns);
+  const pipeline = new Pipeline(ctx, stats, sender, { ...opts.pipeline, summarizer: opts.summarizer ?? opts.pipeline?.summarizer }, apns);
   const upstream = new UpstreamManager(ctx, stats, pipeline, opts.upstream);
   const pending = new Set<Promise<void>>();
   let ticks = 0;
@@ -68,7 +76,7 @@ export function createPushRuntime(ctx: AppContext, opts: PushTestOptions = {}): 
     await pipeline.idle();
   };
 
-  return { stats, sender, pipeline, upstream, kick, tick, idle };
+  return { stats, sender, apns, pipeline, upstream, kick, tick, idle };
 }
 
 /** Build the plugin; tests pass options (fast retries, a runtime callback). */
@@ -77,6 +85,7 @@ export function makePushPlugin(opts: PushTestOptions = {}): FeaturePlugin {
     const rt = createPushRuntime(ctx, opts);
     const cfg = ctx.config.push;
     if (!cfg.vapid) ctx.log.warn("push: VAPID keys not configured - web push disabled");
+    if (!cfg.apns.key) ctx.log.warn("push: APNs key not configured (APNS_PRIVATE_KEY, APNS_KEY_ID, APNS_TEAM_ID) - native app devices register, nothing is sent");
 
     const offHandler = registerPushSubscriptionHandler(
       createPushSubscriptionHandler({ ctx, stats: rt.stats, onChange: (id) => rt.kick(id, "subs-changed") }),
@@ -87,6 +96,7 @@ export function makePushPlugin(opts: PushTestOptions = {}): FeaturePlugin {
     });
 
     await registerRelayRoutes(app, ctx, rt.stats);
+    await registerApnsRoutes(app, ctx, { stats: rt.stats, apns: rt.apns, onChange: (id) => rt.kick(id, "subs-changed") });
     rt.upstream.registerInternalRoute(app);
 
     let timer: NodeJS.Timeout | null = null;
@@ -107,6 +117,7 @@ export function makePushPlugin(opts: PushTestOptions = {}): FeaturePlugin {
       offRelogin();
       rt.pipeline.stop();
       rt.upstream.stop();
+      rt.apns.close();
       rt.stats.flush(ctx.log);
     });
 

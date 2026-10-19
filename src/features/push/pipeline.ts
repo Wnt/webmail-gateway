@@ -9,6 +9,7 @@ import {
   type Upstream as MailUpstream,
 } from "../../core/upstream/index.js";
 import type { AppContext } from "../../types.js";
+import type { ApnsResult, ApnsSender } from "./apns.js";
 import {
   cleanPreview,
   cleanSubject,
@@ -20,9 +21,10 @@ import {
 } from "./payload.js";
 import { Sender, topicFor } from "./sender.js";
 import type { PushStats } from "./stats.js";
-import { claimEmails, getUpstream, targetsForAccount, updateUpstream } from "./store.js";
+import { apnsTargetsForAccount, claimEmails, getUpstream, targetsForAccount, updateUpstream } from "./store.js";
 import { Summarizer, type SummarizerOptions, type SummaryJob, type SummarySource } from "./summarizer.js";
 import { emailBody, type EmailBody } from "./summary-text.js";
+import { findVerificationCode, findVerificationCodeInBody, mentionsVerificationCode } from "./verification-code.js";
 
 /**
  * New-mail pipeline (design/push.md section 5), written against plain JMAP so
@@ -109,6 +111,15 @@ function skipReason(
 
 /** Enough for any real message once quotes are stripped; the model input is capped far lower. */
 const MAX_BODY_VALUE_BYTES = 64 * 1024;
+/**
+ * The one-time-code body read (native app pushes only, when the subject or
+ * preview names a code the preview does not show): a code sits near the top,
+ * so a few tens of KB per part, a bounded answer and a short wait. The push
+ * goes out without a code when the read fails or takes longer.
+ */
+export const CODE_BODY_VALUE_BYTES = 40_000;
+const CODE_BODY_RESPONSE_BYTES = 256_000;
+export const CODE_BODY_TIMEOUT_MS = 3_000;
 
 const emailList = (g: Record<string, unknown>): EmailLite[] =>
   Array.isArray(g.list) ? (g.list as EmailLite[]).filter((e) => e && typeof e.id === "string") : [];
@@ -130,6 +141,8 @@ export class Pipeline implements SummarySource {
     private readonly stats: PushStats,
     private readonly sender: Sender,
     opts: PipelineOptions = {},
+    /** The native app's pushes (APNs); null: none. */
+    private readonly apns: ApnsSender | null = null,
   ) {
     this.errorDelays = opts.errorRetryDelaysMs ?? [5_000, 30_000];
     this.changesPage = opts.changesPageSize ?? CHANGES_PAGE;
@@ -433,31 +446,128 @@ export class Pipeline implements SummarySource {
       email: { from: newest.from, subject: newest.subject, preview: newest.preview },
     });
 
-    const targets = await targetsForAccount(this.ctx.db, accountId, this.ctx.config.allowedEmails);
-    if (targets.length === 0 || !this.sender.enabled) {
+    const targets = this.sender.enabled ? await targetsForAccount(this.ctx.db, accountId, this.ctx.config.allowedEmails) : [];
+    const topic = topicFor(accountId, legacyAccountId);
+    const pushWeb = async (): Promise<{ outcomes: string[]; sentAt: number } | null> => {
+      if (targets.length === 0) return null;
+      const outcomes = await this.sender.sendAll(targets, payload, topic);
+      const sentAt = Date.now();
+      // Phase 5: summarise the newest message and replace the preview quietly (same topic, same tag).
+      if (this.summarizer && payload.email) {
+        this.summarizer.enqueue({ accountId, legacyAccountId, emailId: newest.emailId, payload, topic, pushedAt: sentAt });
+      }
+      return { outcomes, sentAt };
+    };
+    // Browsers and the native app at once: neither waits for the other (nor for a summary).
+    const [web, native] = await Promise.all([pushWeb(), this.pushApns(account, legacyAccountId, newest, fresh[fresh.length - 1]!)]);
+    if (!web && !native) {
       this.ctx.log.debug({ accountId, messages: items.length, targets: targets.length }, "push: new mail, nobody to push to");
       return;
     }
-    const topic = topicFor(accountId, legacyAccountId);
-    const outcomes = await this.sender.sendAll(targets, payload, topic);
-    const sentAt = Date.now();
-    // Phase 5: summarise the newest message and replace the preview quietly (same topic, same tag).
-    if (this.summarizer && payload.email) {
-      this.summarizer.enqueue({ accountId, legacyAccountId, emailId: newest.emailId, payload, topic, pushedAt: sentAt });
-    }
+    const sentAt = web?.sentAt ?? native!.sentAt;
     this.ctx.log.info(
       {
         accountId,
         messages: items.length,
         devices: targets.length,
-        ok: outcomes.filter((o) => o === "ok").length,
+        ok: web ? web.outcomes.filter((o) => o === "ok").length : 0,
+        apnsDevices: native?.results.length ?? 0,
+        apnsOk: native ? native.results.filter((r) => r.outcome === "ok").length : 0,
         via: sweep ? "sweep" : "event",
         // newest message's receivedAt -> push sent (includes the server's clock skew)
         latencyMs: sentAt - newestReceivedAt,
+        apnsLatencyMs: native ? native.sentAt - newestReceivedAt : null,
         // StateChange arrival -> push sent, when a StateChange triggered this run
         eventLatencyMs: ev ? sentAt - ev.at.getTime() : null,
       },
       "push: new mail pushed",
     );
+  }
+
+  /**
+   * The native app's push for the newest message of a run: one envelope per
+   * registered device, with the one-time code when there is one. No summary
+   * replacement follows (v1). Never throws: the browsers' push of the same
+   * run goes on, and the message stays claimed (at most once, as for them).
+   */
+  private async pushApns(
+    account: Account,
+    legacyAccountId: string,
+    item: { emailId: string; threadId: string; from: string; subject: string; preview: string },
+    raw: EmailLite & { at: number },
+  ): Promise<{ results: ApnsResult[]; sentAt: number } | null> {
+    const apns = this.apns;
+    if (!apns) return null;
+    try {
+      const devices = await apnsTargetsForAccount(this.ctx.db, account.id, this.ctx.config.allowedEmails);
+      if (devices.length === 0) return null;
+      if (!apns.enabled) {
+        this.stats.inc("apns_send_unconfigured", devices.length);
+        return null;
+      }
+      const code = await this.codeFor(account, legacyAccountId, raw);
+      const base = {
+        v: 1 as const,
+        kind: "email" as const,
+        accountId: legacyAccountId,
+        emailId: item.emailId,
+        threadId: item.threadId,
+        from: item.from,
+        subject: item.subject,
+        preview: item.preview,
+        ...(code ? { code } : {}),
+        receivedAt: new Date(raw.at).toISOString(),
+      };
+      const results = await apns.sendAll(devices, (sentAt) => ({ ...base, sentAt }));
+      return { results, sentAt: Date.now() };
+    } catch (err) {
+      this.stats.inc("apns_push_error");
+      this.ctx.log.error({ accountId: account.id, err: (err as Error).message }, "push: apns push failed");
+      return null;
+    }
+  }
+
+  /**
+   * The one-time code: from the subject and the whole (uncut) preview first;
+   * when none is there but the subject or preview names one, from the body
+   * (one bounded read). Never throws.
+   */
+  private async codeFor(account: Account, legacyAccountId: string, e: EmailLite): Promise<string | null> {
+    const fromPreview = findVerificationCode(e.subject, e.preview);
+    if (fromPreview) {
+      this.stats.inc("apns_code_preview");
+      return fromPreview;
+    }
+    if (!mentionsVerificationCode(e.subject) && !mentionsVerificationCode(e.preview)) return null;
+    const started = Date.now();
+    try {
+      const res = await this.upstream.jmap(
+        account,
+        [
+          [
+            "Email/get",
+            {
+              accountId: legacyAccountId,
+              ids: [e.id],
+              properties: ["id", "textBody", "htmlBody", "bodyValues"],
+              fetchTextBodyValues: true,
+              fetchHTMLBodyValues: true,
+              maxBodyValueBytes: CODE_BODY_VALUE_BYTES,
+            },
+            "b",
+          ],
+        ],
+        [JMAP_CORE, JMAP_MAIL],
+        { maxResponseBytes: CODE_BODY_RESPONSE_BYTES, signal: AbortSignal.timeout(CODE_BODY_TIMEOUT_MS) },
+      );
+      const got = emailList(response(res, "b", "Email/get")).find((x) => x.id === e.id);
+      const code = got ? findVerificationCodeInBody(e.subject, emailBody(got as Parameters<typeof emailBody>[0])) : null;
+      this.stats.inc(code ? "apns_code_body" : "apns_code_body_none");
+      return code;
+    } catch (err) {
+      this.stats.inc("apns_code_body_failed");
+      this.ctx.log.debug({ accountId: account.id, err: (err as Error).message, ms: Date.now() - started }, "push: code body read failed");
+      return null;
+    }
   }
 }

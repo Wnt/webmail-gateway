@@ -1,3 +1,4 @@
+import { createPrivateKey } from "node:crypto";
 import { z } from "zod";
 
 /**
@@ -31,6 +32,42 @@ export const DEFAULT_ENDPOINT_HOSTS = [
   "web.push.apple.com",
   "*.notify.windows.com",
 ];
+
+/** Apple's APNs provider API (production and development environments). */
+export const APNS_PRODUCTION_URL = "https://api.push.apple.com";
+export const APNS_SANDBOX_URL = "https://api.sandbox.push.apple.com";
+/** The native iPhone app's bundle id: the APNs topic its devices register with. */
+export const DEFAULT_APNS_TOPIC = "fi.madekivi.mail";
+
+/** An https origin (`https://host[:port]`, nothing else): where `/3/device/<token>` is posted. */
+const httpsOrigin = z
+  .url()
+  .refine(
+    (v) => {
+      try {
+        const u = new URL(v);
+        return u.protocol === "https:" && !u.username && !u.password && u.pathname === "/" && !u.search && !u.hash;
+      } catch {
+        return false;
+      }
+    },
+    { message: "must be an https origin, like https://api.push.apple.com" },
+  )
+  .transform((v) => new URL(v).origin);
+
+const BUNDLE_ID_RE = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
+
+/** A PKCS#8 PEM P-256 private key (an APNs .p8); a value with literal `\n` escapes (one env line) is accepted too. */
+export function parseApnsPrivateKey(v: string): string | null {
+  const pem = v.includes("\n") ? v.trim() : v.trim().replace(/\\n/g, "\n");
+  try {
+    const key = createPrivateKey({ key: pem, format: "pem" });
+    if (key.asymmetricKeyType !== "ec" || key.asymmetricKeyDetails?.namedCurve !== "prime256v1") return null;
+    return pem;
+  } catch {
+    return null;
+  }
+}
 
 export const pushConfigSchema = z
   .object({
@@ -84,6 +121,26 @@ export const pushConfigSchema = z
     /** Put a preview ticket (preview-ticket.ts) in every push, for the worker's fetch once the session has expired. */
     PUSH_PREVIEW_TICKETS: bool("true"),
 
+    // --- the native iPhone app: APNs (design/ios-native-app.md)
+    /** APNs provider API for `production` device tokens. */
+    APNS_URL: opt(httpsOrigin),
+    /** The same for `sandbox` tokens (development builds). Unset: Apple's sandbox, or APNS_URL when that is set (test stacks). */
+    APNS_SANDBOX_URL: opt(httpsOrigin),
+    /** Comma-separated bundle ids devices may register with (the APNs topic); the first is the default. */
+    APNS_TOPIC: z
+      .string()
+      .default(DEFAULT_APNS_TOPIC)
+      .transform((v) => [...new Set(v.split(",").map((t) => t.trim()).filter(Boolean))])
+      .refine((l) => l.length > 0 && l.every((t) => BUNDLE_ID_RE.test(t) && t.length <= 155), {
+        message: "must be a comma-separated list of bundle ids",
+      }),
+    /** The APNs auth key (.p8 content: PKCS#8 PEM, P-256). Secret. Unset: devices register, nothing is sent. */
+    APNS_PRIVATE_KEY: opt(z.string()),
+    /** The key's 10-character key id. */
+    APNS_KEY_ID: opt(z.string().trim().regex(/^[A-Z0-9]{10}$/, "must be 10 characters A-Z, 0-9")),
+    /** The Apple developer team id (10 characters). */
+    APNS_TEAM_ID: opt(z.string().trim().regex(/^[A-Z0-9]{10}$/, "must be 10 characters A-Z, 0-9")),
+
     // --- AI summaries (Phase 5): a quiet replacement push with `email.summary`
     /** Summarise new mail and send a quiet replacement push. */
     SUMMARY_ENABLED: bool("false"),
@@ -110,6 +167,14 @@ export const pushConfigSchema = z
     }
     if (n === 2 && !c.PUSH_VAPID_SUBJECT) {
       ctx.addIssue({ code: "custom", path: ["PUSH_VAPID_SUBJECT"], message: "required when VAPID keys are set" });
+    }
+    const apns = [c.APNS_PRIVATE_KEY, c.APNS_KEY_ID, c.APNS_TEAM_ID].filter(Boolean).length;
+    if (apns > 0 && apns < 3) {
+      ctx.addIssue({ code: "custom", path: ["APNS_PRIVATE_KEY"], message: "set APNS_PRIVATE_KEY, APNS_KEY_ID and APNS_TEAM_ID together, or none" });
+    }
+    if (c.APNS_PRIVATE_KEY && !parseApnsPrivateKey(c.APNS_PRIVATE_KEY)) {
+      // Never echo the value.
+      ctx.addIssue({ code: "custom", path: ["APNS_PRIVATE_KEY"], message: "must be a PKCS#8 PEM P-256 private key (an APNs .p8)" });
     }
     if (c.SUMMARY_ENABLED) {
       for (const k of ["SUMMARY_API_URL", "SUMMARY_MODEL"] as const) {
@@ -140,6 +205,17 @@ export interface SummaryConfig {
   appleMinGapMs: number;
 }
 
+export interface ApnsConfig {
+  /** Origin for `production` device tokens. */
+  url: string;
+  /** Origin for `sandbox` device tokens. */
+  sandboxUrl: string;
+  /** Allowed topics (bundle ids); the first is the default. */
+  topics: string[];
+  /** The provider key; null: registration works, sending is skipped. */
+  key: { privateKeyPem: string; keyId: string; teamId: string } | null;
+}
+
 export interface PushConfig {
   /** null: web push disabled (the relay routes answer 503, nothing is sent). */
   vapid: VapidConfig | null;
@@ -159,6 +235,8 @@ export interface PushConfig {
   previewTickets: boolean;
   /** null: no AI summaries (SUMMARY_ENABLED=false). */
   summary: SummaryConfig | null;
+  /** The native iPhone app's pushes. */
+  apns: ApnsConfig;
 }
 
 export function parsePushConfig(env: NodeJS.ProcessEnv): PushConfig {
@@ -190,5 +268,15 @@ export function parsePushConfig(env: NodeJS.ProcessEnv): PushConfig {
             appleMinGapMs: c.SUMMARY_APPLE_MIN_GAP_MS,
           }
         : null,
+    apns: {
+      url: c.APNS_URL ?? APNS_PRODUCTION_URL,
+      // An explicit APNS_URL (a stand-in) takes the sandbox tokens too, so a test stack never reaches Apple.
+      sandboxUrl: c.APNS_SANDBOX_URL ?? c.APNS_URL ?? APNS_SANDBOX_URL,
+      topics: c.APNS_TOPIC,
+      key:
+        c.APNS_PRIVATE_KEY && c.APNS_KEY_ID && c.APNS_TEAM_ID
+          ? { privateKeyPem: parseApnsPrivateKey(c.APNS_PRIVATE_KEY)!, keyId: c.APNS_KEY_ID, teamId: c.APNS_TEAM_ID }
+          : null,
+    },
   };
 }
