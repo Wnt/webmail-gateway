@@ -4,6 +4,7 @@ import { loadConfig } from "../../src/config.js";
 import {
   APNS_MAX_PAYLOAD_BYTES,
   ApnsSender,
+  MAX_PARALLEL,
   apnsBytes,
   fitApnsPlaintext,
   ProviderToken,
@@ -21,6 +22,7 @@ import {
 } from "../../src/features/push/store.js";
 import type { AppContext } from "../../src/types.js";
 import { makeTestConfig, makeTestContext } from "../helpers.js";
+import { until } from "./harness.js";
 import { apnsEnv, makeDevice, makeProviderKey, signInApp, startFakeApns, type FakeApns, type FakeDevice } from "./apns-fake.js";
 
 const key = makeProviderKey();
@@ -391,6 +393,127 @@ describe("a registration renewed while a push is on its way (review ios-apns-r1 
     const now2 = (await getApnsDevice(ctx.db, dev.id, accountId))!;
     expect(now2.environment).toBe("sandbox");
     expect(await apnsTargetStillAuthorized(ctx.db, now2, ctx.config.allowedEmails)).toBe(true);
+  });
+});
+
+describe("a send waiting for a network slot (review ios-apns-r2 R2-1)", () => {
+  /**
+   * A sender whose transport holds every post for the `busy` devices until
+   * released, answers the `target` device from `answers` (then 200), and
+   * records which tokens were posted.
+   */
+  function saturated(target: FakeDevice, answers: number[], sleep?: () => Promise<void>) {
+    const s2 = new ApnsSender(ctx, stats, { ca: fake.ca, retryDelaysMs: [5], ...(sleep ? { sleep } : {}) });
+    const posted: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    s2.pool.post = async (_origin, headers) => {
+      const token = String(headers[":path"]).split("/").pop()!;
+      posted.push(token);
+      if (token === target.token) return { status: answers.shift() ?? 200 };
+      await held;
+      return { status: 200 };
+    };
+    return { s2, posted, release };
+  }
+
+  /** MAX_PARALLEL other devices whose posts are held, filling every slot. */
+  async function fillSlots(s2: ApnsSender, posted: string[]) {
+    const busy = await Promise.all(Array.from({ length: MAX_PARALLEL }, () => register(makeDevice())));
+    const sends = busy.map((d) => s2.sendOne(d, mail()));
+    await until(() => posted.length >= MAX_PARALLEL);
+    return sends;
+  }
+
+  async function separateGrant(d: FakeDevice): Promise<ApnsDevice> {
+    const g = await signInApp(ctx, accountId);
+    const r = await registerApnsDevice(ctx.db, {
+      newId: `own-${d.token.slice(0, 16)}`, accountId, grantId: g.grantId, token: d.token, environment: "production",
+      topic: "fi.madekivi.mail", publicKey: d.publicKey, name: null, locale: null,
+    });
+    if (!r.ok) throw new Error(r.reason);
+    return (await getApnsDevice(ctx.db, r.id, accountId))!;
+  }
+
+  const kills: [string, (dev: ApnsDevice, d: FakeDevice) => Promise<void>][] = [
+    ["its grant is revoked", async (dev) => {
+      await ctx.db.query("UPDATE oauth_grant SET revoked_at = now(), revoked_reason = 'client_revoke' WHERE id = $1", [dev.grantId]);
+    }],
+    ["its token is registered again with a new key", async (dev, d) => {
+      const r = await registerApnsDevice(ctx.db, {
+        newId: "unused-id-0000000000", accountId, grantId: dev.grantId, token: d.token, environment: "production",
+        topic: "fi.madekivi.mail", publicKey: makeDevice().publicKey, name: null, locale: null,
+      });
+      expect(r.ok).toBe(true);
+    }],
+  ];
+
+  it.each(kills)("a first attempt queued behind %s is not posted", async (_, kill) => {
+    const d = makeDevice();
+    const dev = await separateGrant(d);
+    const { s2, posted, release } = saturated(d, []);
+    try {
+      const busy = await fillSlots(s2, posted);
+      const queued = s2.sendOne(dev, mail()); // all slots busy: it waits for one
+      await kill(dev, d);
+      expect(await apnsTargetStillAuthorized(ctx.db, dev, ctx.config.allowedEmails)).toBe(false);
+      release();
+      expect((await queued).outcome).toBe("revoked");
+      expect((await Promise.all(busy)).map((r) => r.outcome)).toEqual(Array(MAX_PARALLEL).fill("ok"));
+      expect(posted).toHaveLength(MAX_PARALLEL);
+      expect(posted).not.toContain(d.token);
+    } finally {
+      release();
+      s2.close();
+    }
+  });
+
+  it.each(kills)("a retry queued behind %s is not posted", async (_, kill) => {
+    const d = makeDevice();
+    const dev = await separateGrant(d);
+    let wake!: () => void;
+    let waiting!: () => void;
+    const asleep = new Promise<void>((r) => (waiting = r));
+    const { s2, posted, release } = saturated(d, [503], () => {
+      waiting();
+      return new Promise<void>((r) => (wake = r));
+    });
+    try {
+      const sending = s2.sendOne(dev, mail());
+      await asleep; // the first attempt got 503 and released its slot
+      const busy = await fillSlots(s2, posted);
+      wake(); // the retry now waits for a slot...
+      await new Promise((r) => setTimeout(r, 30));
+      await kill(dev, d); // ...while the registration is revoked or replaced
+      release();
+      expect((await sending).outcome).toBe("revoked");
+      await Promise.all(busy);
+      expect(posted.filter((t) => t === d.token)).toHaveLength(1);
+      expect(posted).toHaveLength(MAX_PARALLEL + 1);
+    } finally {
+      release();
+      wake?.();
+      s2.close();
+    }
+  });
+
+  it("a send that keeps its authorization while it waits goes out once a slot frees", async () => {
+    const d = makeDevice();
+    const dev = await separateGrant(d);
+    const { s2, posted, release } = saturated(d, []);
+    try {
+      const busy = await fillSlots(s2, posted);
+      const queued = s2.sendOne(dev, mail());
+      await new Promise((r) => setTimeout(r, 20));
+      expect(posted).not.toContain(d.token);
+      release();
+      expect((await queued).outcome).toBe("ok");
+      await Promise.all(busy);
+      expect(posted.at(-1)).toBe(d.token);
+    } finally {
+      release();
+      s2.close();
+    }
   });
 });
 

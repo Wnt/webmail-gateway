@@ -19,7 +19,8 @@ import { apnsTargetStillAuthorized, recordApnsResult, type ApnsDevice, type Apns
 /** APNs refuses a payload over this many bytes (alert pushes). */
 export const APNS_MAX_PAYLOAD_BYTES = 4096;
 const SEND_TIMEOUT_MS = 10_000;
-const MAX_PARALLEL = 8;
+/** Requests in flight to APNs at once (each attempt holds one slot; retry waits hold none). */
+export const MAX_PARALLEL = 8;
 /** A session with no traffic this long is closed; the next push opens a new one. */
 const IDLE_CLOSE_MS = 15 * 60_000;
 /** Apple: renew the provider token no more often than every 20 min and no less often than every 60. */
@@ -358,19 +359,22 @@ export class ApnsSender {
     let minimal = false;
     let renewed = false;
     for (let attempt = 0; ; attempt++) {
-      if (this.closed) return { outcome: "failed" };
-      // Revocation is durable state: re-read before every attempt.
-      if (!(await apnsTargetStillAuthorized(this.ctx.db, device, this.ctx.config.allowedEmails))) {
-        this.stats.inc("apns_send_revoked");
-        return { outcome: "revoked" };
-      }
-      const sentAt = this.now();
-      let plaintext = fitApnsPlaintext(build(sentAt));
-      if (minimal) plaintext = minimalApnsPlaintext(plaintext);
-      const envelope = sealEnvelope(JSON.stringify(plaintext), devicePublicKey, this.opts.randomness?.() ?? {});
-      const jwt = this.token.current();
-      const { status, reason } = await this.limited(() =>
-        this.pool.post(
+      // One attempt per network slot. Everything that decides what goes out
+      // happens inside it, right before the post: the durable authorization
+      // (grant, generation, passkey, allowlist, and this very incarnation,
+      // destination and key), the send time, the envelope and the provider
+      // token. A send that waited for a slot while the registration was
+      // revoked or replaced is never posted. The slot is released before
+      // any retry backoff, and every retry is checked the same way.
+      const sent = await this.limited(async () => {
+        if (this.closed) return "closed" as const;
+        if (!(await apnsTargetStillAuthorized(this.ctx.db, device, this.ctx.config.allowedEmails))) return "revoked" as const;
+        const sentAt = this.now();
+        let plaintext = fitApnsPlaintext(build(sentAt));
+        if (minimal) plaintext = minimalApnsPlaintext(plaintext);
+        const envelope = sealEnvelope(JSON.stringify(plaintext), devicePublicKey, this.opts.randomness?.() ?? {});
+        const jwt = this.token!.current();
+        const answer = await this.pool.post(
           origin,
           {
             ":path": `/3/device/${device.token}`,
@@ -381,8 +385,15 @@ export class ApnsSender {
             "apns-expiration": String(Math.floor(sentAt / 1000) + this.ctx.config.push.ttlSec),
           },
           apnsJson(envelope),
-        ),
-      );
+        );
+        return { ...answer, jwt };
+      });
+      if (sent === "closed") return { outcome: "failed" };
+      if (sent === "revoked") {
+        this.stats.inc("apns_send_revoked");
+        return { outcome: "revoked" };
+      }
+      const { status, reason, jwt } = sent;
       const answer = { status, ...(reason ? { reason } : {}) };
       if (status === 200) return this.done(device, { outcome: "ok", ...answer }, "apns_send_ok");
       if (status === 410 || (status === 400 && reason && GONE_REASONS.has(reason))) {
