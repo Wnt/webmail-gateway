@@ -74,7 +74,10 @@ describe("discovery", () => {
       token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"],
       revocation_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"],
       scopes_supported: ["mail"],
+      public_clients: ["madekivi-ios"],
     });
+    // Only public clients' ids, never a confidential client's.
+    expect(res.json().public_clients).not.toContain("bulwark");
   });
 });
 

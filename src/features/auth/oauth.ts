@@ -56,9 +56,16 @@ function back(reply: FastifyReply, redirectUri: string, state: string, issuer: s
   return reply.code(303).redirect(url.toString());
 }
 
-export function discoveryDocument(issuer: string): Record<string, unknown> {
+/**
+ * RFC 8414 metadata. `public_clients` (an extension field) lists the public
+ * clients this server accepts, by id only, so a native app can tell "this
+ * server has not been updated for me" before it opens a sign-in sheet that
+ * would end on "Not registered". Client ids of public clients are not secret.
+ */
+export function discoveryDocument(issuer: string, publicClients: readonly string[] = []): Record<string, unknown> {
   return {
     issuer,
+    public_clients: [...publicClients],
     authorization_endpoint: `${issuer}/oauth/authorize`,
     token_endpoint: `${issuer}/oauth/token`,
     revocation_endpoint: `${issuer}/oauth/revoke`,
@@ -122,7 +129,9 @@ export async function oauthRoutes(app: FastifyInstance, s: AuthState): Promise<v
   );
 
   app.get("/.well-known/oauth-authorization-server", async (_req, reply) =>
-    reply.header("Cache-Control", "public, max-age=3600").send(discoveryDocument(issuer)),
+    reply
+      .header("Cache-Control", "public, max-age=3600")
+      .send(discoveryDocument(issuer, [...s.clients.values()].filter((c) => c.public).map((c) => c.id))),
   );
 
   app.get("/oauth/authorize", { logLevel: "silent" }, async (req, reply) => {
