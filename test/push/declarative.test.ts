@@ -47,7 +47,7 @@ const shownByWebKit = (p: Record<string, unknown>) =>
 
 let h: Harness;
 beforeAll(async () => {
-  h = await makeHarness();
+  h = await makeHarness({}, { PUSH_APPLE_DECLARATIVE: "true" });
 });
 afterAll(async () => h.close());
 beforeEach(async () => h.reset());
@@ -179,6 +179,35 @@ describe("new-mail push to Apple's push service", () => {
   });
 });
 
+describe("declarative push is the deployment's choice, and never for a shared endpoint (review round 2, N2)", () => {
+  it("an endpoint that also serves another account gets the classic push", async () => {
+    const a = await h.newAccount();
+    const b = await h.newAccount();
+    const iphone = makeBrowser();
+    // one browser, two logins: the same push endpoint behind two relay records
+    await h.enable(a.principal, "decl-shr-a01", iphone, APPLE_PUSH_HOST);
+    const sameEndpoint = await h.app.inject({
+      method: "POST", url: "/relay/api/push/register/web", remoteAddress: "198.51.100.30",
+      payload: { subscriptionId: "decl-shr-b01", subscription: { endpoint: `https://${APPLE_PUSH_HOST}/push/decl-shr-a01`, keys: iphone.keys } },
+    });
+    expect(sameEndpoint.statusCode).toBe(200);
+    await h.jmap(b.principal, "PushSubscription/get", { ids: null });
+    const set = await h.jmap(b.principal, "PushSubscription/set", { create: { n: {
+      deviceClientId: "decl-shr-b01", url: `${PUBLIC}/relay/api/push/jmap/decl-shr-b01`, types: ["EmailDelivery"],
+      expires: new Date(Date.now() + 86_400_000).toISOString(),
+    } } });
+    const subId = (set.created as Record<string, { id: string }>).n!.id;
+    const code = (await h.app.inject({ method: "GET", url: "/relay/api/push/verify/decl-shr-b01" })).json().verificationCode as string;
+    await h.jmap(b.principal, "PushSubscription/set", { update: { [subId]: { verificationCode: code } } });
+    await h.rt.idle();
+    await h.legacy.deliver(a.slug, { id: "sh1" });
+    await h.rt.idle();
+    const [p] = h.pushSvc.requests.filter((r) => r.id === "decl-shr-a01").map((r) => JSON.parse(iphone.decrypt(r.body)) as Record<string, unknown>);
+    expect(p).toBeDefined();
+    expect(p!.web_push).toBeUndefined();
+  });
+});
+
 describe("quiet replacement push to Apple's push service", () => {
   it("stays classic, so the service worker runs and takes the notification over", async () => {
     const fake = await startFakeLlm();
@@ -190,6 +219,7 @@ describe("quiet replacement push to Apple's push service", () => {
         SUMMARY_API_URL: fake.url,
         SUMMARY_MODEL: "tiny-test-model",
         SUMMARY_APPLE_MIN_GAP_MS: "50",
+        PUSH_APPLE_DECLARATIVE: "true",
       },
     );
     try {
@@ -209,6 +239,24 @@ describe("quiet replacement push to Apple's push service", () => {
     } finally {
       await hs.close();
       await fake.close();
+    }
+  });
+});
+
+describe("declarative push is off by default (review round 2, N2)", () => {
+  it("is off by default", async () => {
+    const hs = await makeHarness();
+    try {
+      expect(hs.ctx.config.push.appleDeclarative).toBe(false);
+      const acc = await hs.newAccount();
+      const iphone = makeBrowser();
+      await hs.enable(acc.principal, "decl-def-ios", iphone, APPLE_PUSH_HOST);
+      await hs.legacy.deliver(acc.slug, { id: "d1" });
+      await hs.rt.idle();
+      const [p] = hs.pushSvc.requests.filter((r) => r.id === "decl-def-ios").map((r) => JSON.parse(iphone.decrypt(r.body)) as Record<string, unknown>);
+      expect(p!.web_push).toBeUndefined();
+    } finally {
+      await hs.close();
     }
   });
 });

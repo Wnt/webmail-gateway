@@ -15,14 +15,14 @@ import { APPLE_PUSH_HOST, makeHarness, PUBLIC, until, type Harness } from "./har
 const KEY = randomBytes(32);
 const T = {
   accountId: "6f1c1d1e-0000-4000-8000-000000000001", relayId: "dev-ticket-0001", subId: "c3ViLWlkLTAwMDAwMDAwMDE", keyHash: "a2V5LWhhc2gtMDAwMDAwMDE",
-  legacyAccountId: "7", emailId: "m1",
+  incarnation: "0f0e0d0c-0000-4000-8000-00000000000a", legacyAccountId: "7", emailId: "m1",
 };
 
 describe("preview ticket (unit)", () => {
   const now = 1_800_000_000_000;
 
   it("opens what it sealed, until it expires", () => {
-    const t = mintPreviewTicket(KEY, T, now);
+    const t = mintPreviewTicket(KEY, T, now)!;
     expect(t).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(t.length).toBeLessThan(400);
     expect(openPreviewTicket(KEY, t, now + 1000)).toEqual({ ...T, expiresAt: now + PREVIEW_TICKET_TTL_MS });
@@ -31,17 +31,28 @@ describe("preview ticket (unit)", () => {
   });
 
   it("refuses another key, a changed byte, other sealed blobs, junk and a ticket dated too far ahead", () => {
-    const t = mintPreviewTicket(KEY, T, now);
+    const t = mintPreviewTicket(KEY, T, now)!;
     expect(openPreviewTicket(randomBytes(32), t, now)).toBeNull();
     const raw = Buffer.from(t, "base64url");
     raw[raw.length - 1]! ^= 1;
     expect(openPreviewTicket(KEY, raw.toString("base64url"), now)).toBeNull();
     // the same key and layout, another purpose (no purpose key, no AAD)
-    const foreign = seal(JSON.stringify({ v: 2, a: T.accountId, r: T.relayId, s: T.subId, k: T.keyHash, l: "7", m: "m1", x: now + 1000 }), KEY).toString("base64url");
+    const foreign = seal(JSON.stringify({ v: 3, a: T.accountId, r: T.relayId, s: T.subId, k: T.keyHash, i: T.incarnation, l: "7", m: "m1", x: now + 1000 }), KEY).toString("base64url");
     expect(openPreviewTicket(KEY, foreign, now)).toBeNull();
     for (const junk of [undefined, null, 42, "", "a b", "x".repeat(2000), {}]) expect(openPreviewTicket(KEY, junk, now)).toBeNull();
     const future = mintPreviewTicket(KEY, T, now + 60_000);
     expect(openPreviewTicket(KEY, future, now)).toBeNull();
+  });
+
+  it("every ticket it mints opens, up to the longest fields; longer fields mint none (review round 2, N5)", () => {
+    const longest = {
+      accountId: T.accountId, relayId: "r".repeat(128), subId: "s".repeat(64), keyHash: "k".repeat(64), incarnation: "i".repeat(64),
+      legacyAccountId: "l".repeat(255), emailId: "m".repeat(255),
+    };
+    const t = mintPreviewTicket(KEY, longest, now);
+    expect(t).not.toBeNull();
+    expect(openPreviewTicket(KEY, t, now)).toMatchObject(longest);
+    expect(mintPreviewTicket(KEY, { ...longest, emailId: "m".repeat(256) }, now)).toBeNull();
   });
 });
 
@@ -133,9 +144,9 @@ describe("POST /relay/api/push/preview", () => {
 
   it("refuses a forged, foreign-key or expired ticket", async () => {
     const d = await signedInDevice("dev-ticket-0301");
-    const forged = mintPreviewTicket(randomBytes(32), { ...T, accountId: d.account.id, relayId: "dev-ticket-0301", legacyAccountId: "1", emailId: "x" });
+    const forged = mintPreviewTicket(randomBytes(32), { ...T, accountId: d.account.id, relayId: "dev-ticket-0301", legacyAccountId: "1", emailId: "x" })!;
     expect((await redeem({ ticket: forged })).statusCode).toBe(403);
-    const expired = mintPreviewTicket(h.ctx.config.encKey, { ...T, accountId: d.account.id, relayId: "dev-ticket-0301", legacyAccountId: "1", emailId: "x" }, Date.now() - PREVIEW_TICKET_TTL_MS - 1);
+    const expired = mintPreviewTicket(h.ctx.config.encKey, { ...T, accountId: d.account.id, relayId: "dev-ticket-0301", legacyAccountId: "1", emailId: "x" }, Date.now() - PREVIEW_TICKET_TTL_MS - 1)!;
     expect((await redeem({ ticket: expired })).statusCode).toBe(403);
   });
 
@@ -347,6 +358,106 @@ describe("preview ticket hardening (review round 1)", () => {
       } finally {
         h.ctx.fetch = orig;
       }
+    }
+  });
+});
+
+// Codex Astra review round 2 (audit/reviews/late-push-gateway-r2.md).
+describe("preview ticket hardening (review round 2)", () => {
+  async function ticketFor(d: Awaited<ReturnType<typeof signedInDevice>>, relayId: string, id: string) {
+    await h.legacy.deliver(d.slug, { id });
+    await h.rt.idle();
+    const t = ticketsFor(d.browser, relayId).at(-1);
+    expect((await redeem({ ticket: t })).statusCode).toBe(200);
+    return t!;
+  }
+  const register = (relayId: string, endpoint: string, keys: { p256dh: string; auth: string }) =>
+    h.app.inject({
+      method: "POST", url: "/relay/api/push/register/web", remoteAddress: `198.51.100.${20 + Math.floor(Math.random() * 200)}`,
+      payload: { subscriptionId: relayId, subscription: { endpoint, keys } },
+    });
+
+  it("N1: the relay record alone deleted and registered again with the same endpoint and keys does not revive it", async () => {
+    const d = await signedInDevice("dev-ticket-0901");
+    const ticket = await ticketFor(d, "dev-ticket-0901", "inc1");
+    await h.app.inject({ method: "DELETE", url: "/relay/api/push/register/dev-ticket-0901", remoteAddress: "198.51.100.12" });
+    expect((await redeem({ ticket })).statusCode).toBe(403);
+    const again = await register("dev-ticket-0901", "https://push.example.test/push/dev-ticket-0901", d.browser.keys);
+    expect(again.statusCode).toBe(200);
+    expect((await redeem({ ticket })).statusCode).toBe(403);
+    // ...while a fresh push to the same device works again, with a fresh ticket
+    expect(await ticketFor(d, "dev-ticket-0901", "inc1b")).toBeTruthy();
+  });
+
+  it("N1: keys changed and changed back do not revive it; an unchanged re-registration (daily re-sync) keeps it", async () => {
+    const d = await signedInDevice("dev-ticket-0902");
+    const ticket = await ticketFor(d, "dev-ticket-0902", "inc2");
+    expect((await register("dev-ticket-0902", "https://push.example.test/push/dev-ticket-0902", d.browser.keys)).statusCode).toBe(200);
+    expect((await redeem({ ticket })).statusCode, "unchanged refresh").toBe(200);
+    await register("dev-ticket-0902", "https://push.example.test/push/dev-ticket-0902", makeBrowser().keys);
+    await register("dev-ticket-0902", "https://push.example.test/push/dev-ticket-0902", d.browser.keys);
+    expect((await redeem({ ticket })).statusCode).toBe(403);
+  });
+
+  it("N4: a client that leaves while the upstream is still busy frees its slot at once", async () => {
+    const d = await signedInDevice("dev-ticket-0903");
+    const ticket = await ticketFor(d, "dev-ticket-0903", "slow2");
+    const orig = h.ctx.fetch;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    // A shared upstream step (discovery, a re-login) that ignores the caller's signal.
+    h.ctx.fetch = async (input, init) => {
+      if (String(input).endsWith("/jmap")) await gate;
+      return orig(input, init as RequestInit);
+    };
+    try {
+      const clients = [new AbortController(), new AbortController()];
+      const pending = clients.map((c) => fetch(`${h.appUrl}/relay/api/push/preview`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ticket }), signal: c.signal,
+      }).catch(() => null));
+      await new Promise((r) => setTimeout(r, 150));
+      expect((await redeem({ ticket })).statusCode, "both slots taken").toBe(429);
+      for (const c of clients) c.abort();
+      await Promise.all(pending);
+      // Both requests gave up (and freed their slots) while the upstream step is still held.
+      await until(() => h.rt.stats.get("preview_ticket_client_gone") === 2);
+      release();
+      expect((await redeem({ ticket, properties: ["id"] })).statusCode).toBe(200);
+    } finally {
+      release();
+      h.ctx.fetch = orig;
+    }
+  });
+});
+
+describe("a retry whose subscription was replaced meanwhile (review round 2, N3)", () => {
+  it("is dropped: it never goes out under another subscription than the one its ticket names", async () => {
+    let duringRetry: (() => Promise<void>) | null = null;
+    const hs = await makeHarness({ sender: { retryDelaysMs: [5], sleep: async () => { await duringRetry?.(); } } });
+    try {
+      const acc = await hs.newAccount();
+      const browser = makeBrowser();
+      const { subId } = await hs.enable(acc.principal, "dev-ticket-1001", browser, APPLE_PUSH_HOST);
+      hs.pushSvc.script.set("dev-ticket-1001", [{ status: 503 }]);
+      duringRetry = async () => {
+        duringRetry = null;
+        // Bulwark re-enables push on this device: a new subscription on the same relay record.
+        // (Inline: Harness.enable waits for the pipeline, which is this very retry.)
+        await hs.jmap(acc.principal, "PushSubscription/set", { destroy: [subId] });
+        const set = await hs.jmap(acc.principal, "PushSubscription/set", { create: { n: {
+          deviceClientId: "dev-ticket-1001", url: `${PUBLIC}/relay/api/push/jmap/dev-ticket-1001`, types: ["EmailDelivery"],
+          expires: new Date(Date.now() + 86_400_000).toISOString(),
+        } } });
+        const newSub = (set.created as Record<string, { id: string }>).n!.id;
+        const code = (await hs.app.inject({ method: "GET", url: "/relay/api/push/verify/dev-ticket-1001" })).json().verificationCode as string;
+        await hs.jmap(acc.principal, "PushSubscription/set", { update: { [newSub]: { verificationCode: code } } });
+      };
+      await hs.legacy.deliver(acc.slug, { id: "rp1" });
+      await hs.rt.idle();
+      expect(hs.pushSvc.requests.filter((r) => r.id === "dev-ticket-1001")).toHaveLength(1);
+      expect(hs.rt.stats.get("push_send_revoked")).toBe(1);
+    } finally {
+      await hs.close();
     }
   });
 });

@@ -80,6 +80,31 @@ export const PREVIEW_MAX_RESPONSE_CHARS = 600_000;
 export const PREVIEW_MAX_UPSTREAM_BYTES = 1_000_000;
 /** Preview reads running at once per account; more get 429. */
 export const PREVIEW_MAX_INFLIGHT_PER_ACCOUNT = 2;
+/** A preview read gives up after this long, whatever the upstream is doing (session discovery, a re-login). */
+export const PREVIEW_DEADLINE_MS = 20_000;
+
+/**
+ * `work`, or a rejection as soon as `signal` aborts: the caller stops waiting
+ * (and frees its slot) even while shared upstream work it joined, such as
+ * session discovery or a re-login other callers need, goes on.
+ */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(e);
+      },
+    );
+  });
+}
 
 /** The one Email/get answer of a preview read, or null when the upstream's answer is not shaped like one. */
 export function previewEmailList(res: unknown): unknown[] | null {
@@ -221,7 +246,7 @@ export async function registerRelayRoutes(app: FastifyInstance, ctx: AppContext,
         // The very subscription the push went out under, still deliverable, and
         // the relay record still the one it was minted for.
         const target = await previewTicketTarget(ctx.db, ticket, ctx.config.allowedEmails);
-        if (!target || !sameKeyHash(relayKeyHash(target), ticket.keyHash)) {
+        if (!target || !sameKeyHash(relayKeyHash(target), ticket.keyHash) || !sameKeyHash(target.incarnation, ticket.incarnation)) {
           stats.inc("preview_ticket_revoked");
           return refused();
         }
@@ -236,9 +261,10 @@ export async function registerRelayRoutes(app: FastifyInstance, ctx: AppContext,
           if (!reply.raw.writableFinished) gone.abort();
         };
         reply.raw.once("close", onClose);
+        const stop = AbortSignal.any([gone.signal, AbortSignal.timeout(PREVIEW_DEADLINE_MS)]);
         let list: unknown[] | null;
         try {
-          const res = await getUpstream(ctx).jmap(
+          const read = getUpstream(ctx).jmap(
             account,
             [[
               "Email/get",
@@ -254,11 +280,13 @@ export async function registerRelayRoutes(app: FastifyInstance, ctx: AppContext,
               "g",
             ]],
             [JMAP_CORE, JMAP_MAIL],
-            { maxResponseBytes: PREVIEW_MAX_UPSTREAM_BYTES, signal: gone.signal },
+            { maxResponseBytes: PREVIEW_MAX_UPSTREAM_BYTES, signal: stop },
           );
-          list = previewEmailList(res);
+          read.catch(() => undefined); // may settle after this request gave up
+          list = previewEmailList(await untilAborted(read, stop));
         } catch (e) {
           if (e instanceof UpstreamTooLargeError) return done(413, "too_large", { error: "Message too large" });
+          if (stop.aborted) return done(gone.signal.aborted ? 499 : 504, gone.signal.aborted ? "client_gone" : "deadline", { error: "Mail server too slow" });
           ctx.log.warn({ err: (e as Error).message }, "push: preview ticket read failed");
           return done(502, "upstream_error", { error: "Mail server unavailable" });
         } finally {

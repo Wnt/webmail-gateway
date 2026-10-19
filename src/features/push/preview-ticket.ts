@@ -8,8 +8,8 @@ import { CryptoError, open, seal } from "../../core/crypto.js";
  * Bulwark's /api/push/preview lives an hour).
  *
  * A ticket names exactly one message of one account for one push target: the
- * browser's relay record as it was (its endpoint and keys) and the very
- * emulated subscription that authorized the push. It lives
+ * browser's relay record as it was (its incarnation, endpoint and keys) and
+ * the very emulated subscription that authorized the push. It lives
  * `PREVIEW_TICKET_TTL_MS`. It is sealed
  * with a purpose key derived from GATEWAY_ENC_KEY (A6), travels only inside
  * the push payload (RFC 8291: encrypted to the subscribed browser) and in the
@@ -23,10 +23,15 @@ import { CryptoError, open, seal } from "../../core/crypto.js";
  */
 
 export const PREVIEW_TICKET_TTL_MS = 10 * 60_000;
-/** Longest ticket string accepted (a real one is ~250 characters). */
-export const PREVIEW_TICKET_MAX_CHARS = 1024;
+/**
+ * Longest ticket string minted or accepted. A ticket with every field at its
+ * longest (uuid, 128-character relay id, 64-character subscription id and
+ * incarnation, 22-character key hash, 255-character upstream ids) is about
+ * 1,300 characters; a real one about 350. Minting refuses anything longer.
+ */
+export const PREVIEW_TICKET_MAX_CHARS = 2048;
 
-const AAD = "webmail-gateway/push-preview-ticket/v2";
+const AAD = "webmail-gateway/push-preview-ticket/v3";
 
 export interface PreviewTicket {
   /** Gateway account id. */
@@ -37,6 +42,8 @@ export interface PreviewTicket {
   subId: string;
   /** `relayKeyHash` of the relay record's endpoint and keys at minting. */
   keyHash: string;
+  /** The relay record's incarnation at minting (store.ts, migration 230). */
+  incarnation: string;
   /** The upstream's JMAP account id (the payload's `accountId`). */
   legacyAccountId: string;
   /** The one message it names. */
@@ -68,18 +75,27 @@ export function sameKeyHash(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
+/** A sealed ticket, or null when a field is out of bounds (then the push simply carries none). */
 export function mintPreviewTicket(
   encKey: Buffer,
   t: Omit<PreviewTicket, "expiresAt">,
   now = Date.now(),
-): string {
+): string | null {
+  if (!fieldsOk(t.accountId, t.relayId, t.subId, t.keyHash, t.incarnation, t.legacyAccountId, t.emailId)) return null;
   const body = JSON.stringify({
-    v: 2, a: t.accountId, r: t.relayId, s: t.subId, k: t.keyHash, l: t.legacyAccountId, m: t.emailId, x: now + PREVIEW_TICKET_TTL_MS,
+    v: 3, a: t.accountId, r: t.relayId, s: t.subId, k: t.keyHash, i: t.incarnation, l: t.legacyAccountId, m: t.emailId,
+    x: now + PREVIEW_TICKET_TTL_MS,
   });
-  return seal(body, ticketKey(encKey), AAD).toString("base64url");
+  const ticket = seal(body, ticketKey(encKey), AAD).toString("base64url");
+  return ticket.length <= PREVIEW_TICKET_MAX_CHARS ? ticket : null;
 }
 
 const str = (v: unknown, max: number): v is string => typeof v === "string" && v.length > 0 && v.length <= max;
+
+/** The same per-field bounds for minting and opening, so every minted ticket opens. */
+function fieldsOk(a: unknown, r: unknown, s: unknown, k: unknown, i: unknown, l: unknown, m: unknown): boolean {
+  return str(a, 64) && str(r, 128) && str(s, 64) && str(k, 64) && str(i, 64) && str(l, 255) && str(m, 255);
+}
 
 /** The ticket's contents, or null when it is malformed, forged, from another key, expired or dated too far ahead. */
 export function openPreviewTicket(encKey: Buffer, ticket: unknown, now = Date.now()): PreviewTicket | null {
@@ -92,9 +108,12 @@ export function openPreviewTicket(encKey: Buffer, ticket: unknown, now = Date.no
     throw err;
   }
   const p = parsed as Record<string, unknown> | null;
-  if (!p || typeof p !== "object" || p.v !== 2) return null;
-  if (!str(p.a, 64) || !str(p.r, 128) || !str(p.s, 64) || !str(p.k, 64) || !str(p.l, 255) || !str(p.m, 255)) return null;
+  if (!p || typeof p !== "object" || p.v !== 3) return null;
+  if (!fieldsOk(p.a, p.r, p.s, p.k, p.i, p.l, p.m)) return null;
   const x = p.x;
   if (typeof x !== "number" || !Number.isFinite(x) || x <= now || x > now + PREVIEW_TICKET_TTL_MS) return null;
-  return { accountId: p.a, relayId: p.r, subId: p.s, keyHash: p.k, legacyAccountId: p.l, emailId: p.m, expiresAt: x };
+  return {
+    accountId: p.a as string, relayId: p.r as string, subId: p.s as string, keyHash: p.k as string, incarnation: p.i as string,
+    legacyAccountId: p.l as string, emailId: p.m as string, expiresAt: x,
+  };
 }

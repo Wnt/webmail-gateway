@@ -120,12 +120,17 @@ export class Sender {
    */
   bodyFor(target: PushTarget, payload: PushPayload, now = Date.now()): PushPayload {
     const cfg = this.ctx.config.push;
-    const declarative = cfg.appleDeclarative && payload.renotify !== false && isApplePushEndpoint(target.endpoint);
+    // Never to an endpoint that also serves another account (a browser with
+    // several logins): signing one of them out keeps the browser subscription
+    // for the others, and only the worker's sign-out check, which a
+    // declarative notification bypasses, would then hold back that account's
+    // queued pushes.
+    const declarative = cfg.appleDeclarative && payload.renotify !== false && isApplePushEndpoint(target.endpoint) && !target.shared;
     const wrap = declarative
       ? (q: PushPayload): PushPayload => declarativePayload(q, this.ctx.config.publicBaseUrl)
       : (q: PushPayload): PushPayload => q;
     const emailId = payload.emailIds[payload.emailIds.length - 1];
-    const previewTicket = cfg.previewTickets && emailId && target.subId
+    const previewTicket = cfg.previewTickets && emailId && target.subId && target.incarnation
       ? mintPreviewTicket(
           this.ctx.config.encKey,
           {
@@ -133,12 +138,13 @@ export class Sender {
             relayId: target.relayId,
             subId: target.subId,
             keyHash: relayKeyHash(target),
+            incarnation: target.incarnation,
             legacyAccountId: payload.accountId,
             emailId,
           },
           now,
         )
-      : undefined;
+      : null;
     const { previewTicket: _stale, ...rest } = payload;
     return wrap(fitPayload({ ...rest, sentAt: now, ...(previewTicket ? { previewTicket } : {}) }, PAYLOAD_BUDGET_BYTES, wrap));
   }

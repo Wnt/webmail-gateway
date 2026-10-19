@@ -76,8 +76,11 @@ export const pushConfigSchema = z
      * Push message (payload.ts declarativePayload), which iOS shows at once
      * without launching the Home Screen app. The quiet replacement push stays
      * a classic one, so the service worker takes the notification over.
+     * Off by default: such a notification is shown without the worker's
+     * explicit-sign-out check (README "Apple devices"); turning it on is the
+     * deployment's choice of prompt display over that check.
      */
-    PUSH_APPLE_DECLARATIVE: bool("true"),
+    PUSH_APPLE_DECLARATIVE: bool("false"),
     /** Put a preview ticket (preview-ticket.ts) in every push, for the worker's fetch once the session has expired. */
     PUSH_PREVIEW_TICKETS: bool("true"),
 
