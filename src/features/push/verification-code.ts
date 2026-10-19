@@ -357,9 +357,22 @@ export function markCut(text: string, cut: boolean): string {
   return cut ? text + CUT_MARK : text;
 }
 
-function capped(text: string | null | undefined, max: number): { text: string; cut: boolean } {
+// A preview may have been cut by the server that made it, with no mark at
+// all: JMAP's preview is "up to 256 characters", and legacy-proxy cuts there
+// and trims (so a cut one is at most a few characters shorter). A preview this
+// long is read as possibly cut; a shorter one is complete.
+const PREVIEW_MAY_BE_CUT = 200;
+
+/** Whether `text` ends with "..." or "…" (and whitespace): cut, by its own say. */
+function endsWithEllipsis(text: string): boolean {
+  let end = text.length;
+  while (end > 0 && SPACE.test(text.charAt(end - 1))) end--;
+  return text.endsWith('...', end) || text.endsWith('…', end);
+}
+
+function capped(text: string | null | undefined, max: number, mayBeCut = false): { text: string; cut: boolean } {
   let t = text ?? '';
-  let cut = false;
+  let cut = mayBeCut;
   if (t.endsWith(CUT_MARK)) {
     t = t.slice(0, -CUT_MARK.length);
     cut = true;
@@ -368,11 +381,12 @@ function capped(text: string | null | undefined, max: number): { text: string; c
     t = t.slice(0, max);
     cut = true;
   }
+  if (endsWithEllipsis(t)) return { text: t, cut: true };
   return { text: cut ? `${t}…` : t, cut };
 }
 
-function cappedCandidate(text: string | null | undefined, max: number): Candidate | null {
-  const c = capped(text, max);
+function cappedCandidate(text: string | null | undefined, max: number, mayBeCut = false): Candidate | null {
+  const c = capped(text, max, mayBeCut);
   return bestCandidate(c.text, c.cut);
 }
 
@@ -380,7 +394,10 @@ function cappedCandidate(text: string | null | undefined, max: number): Candidat
  * The one-time code in a mail, or null. `text` is the preview for a list
  * row (`source` 'preview') and the body for the reader. A code in the
  * subject wins, since senders that put it there ("Your code is 177945")
- * also tend to repeat it next to unrelated numbers in the body.
+ * also tend to repeat it next to unrelated numbers in the body. Wherever a
+ * text was, or may have been, cut (a cap, a CUT_MARK, a closing "..." or
+ * "…", a preview of PREVIEW_MAY_BE_CUT characters or more), no code is
+ * offered near the cut: the body then has to show it whole.
  */
 export function findVerificationCode(
   subject: string | null | undefined,
@@ -389,7 +406,11 @@ export function findVerificationCode(
 ): string | null {
   return (
     cappedCandidate(subject, MAX_SUBJECT_CHARS)?.code ??
-    cappedCandidate(text, source === 'preview' ? MAX_PREVIEW_CHARS : MAX_BODY_CHARS)?.code ??
+    cappedCandidate(
+      text,
+      source === 'preview' ? MAX_PREVIEW_CHARS : MAX_BODY_CHARS,
+      source === 'preview' && (text ?? '').length >= PREVIEW_MAY_BE_CUT,
+    )?.code ??
     null
   );
 }

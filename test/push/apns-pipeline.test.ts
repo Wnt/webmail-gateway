@@ -151,6 +151,19 @@ describe("new mail to the native app", () => {
     expect(CODE_BODY_VALUE_BYTES).toBeLessThanOrEqual(64 * 1024);
   });
 
+  it("a preview the upstream cut through the code (256 characters, no mark): the code comes whole from the body (review ios-apns-r3 R3-1)", async () => {
+    const a = await appDevice();
+    const lead = " Your code is 1234";
+    const full = `${"Please sign in. ".repeat(30).slice(0, 256 - lead.length)}${lead}56. Use this to sign in.`;
+    const preview = full.slice(0, 256); // legacy-proxy's cut: no ellipsis, no flag
+    expect(preview.endsWith("1234")).toBe(true);
+    const { requests } = await deliver(a.slug, { subject: "Your verification code", preview, body: [{ type: "text/plain", value: full }] });
+    expect(requests).toHaveLength(1);
+    expect(a.device.open(requests[0]!.json!.m!).code).toBe("123456");
+    expect(h.rt.stats.get("apns_code_preview")).toBe(0);
+    expect(h.rt.stats.get("apns_code_body")).toBe(1);
+  });
+
   it("a body that names a code but has none: the push goes without one", async () => {
     const a = await appDevice();
     const { requests } = await deliver(a.slug, { subject: "Your sign-in code", preview: "Open the app to see your code.", body: [{ type: "text/plain", value: "Open the app to see your code." }] });

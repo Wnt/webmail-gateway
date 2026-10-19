@@ -177,7 +177,7 @@ describe("hostile mail stays cheap (linear, capped)", () => {
     expect([MAX_SUBJECT_CHARS, MAX_PREVIEW_CHARS, MAX_BODY_CHARS]).toEqual([1_000, 1_000, 20_000]);
     expect(findVerificationCode(`${pad(900)} Your code is 482913`, "")).toBe("482913");
     expect(findVerificationCode(`${pad(1_000)} Your code is 482913`, "")).toBeNull();
-    expect(findVerificationCode("", `${pad(900)} Your code is 482913`, "preview")).toBe("482913");
+    expect(findVerificationCode("", `${pad(800)} Your code is 482913 ${pad(100)}`, "preview")).toBe("482913");
     expect(findVerificationCode("", `${pad(1_000)} Your code is 482913`, "preview")).toBeNull();
     expect(findVerificationCode("", `${pad(19_000)} Your code is 482913`)).toBe("482913");
     expect(findVerificationCode("", `${pad(20_000)} Your code is 482913`)).toBeNull();
@@ -220,5 +220,33 @@ describe("hostile mail stays cheap (linear, capped)", () => {
     expect(findVerificationCodeInBody("", html(`<p>Your code is 482913</p>${"x".repeat(400_000)}`))).toBe("482913");
     expect(findVerificationCode("", markCut("Your code is 1234 5678", true))).toBeNull();
     expect(findVerificationCode("", markCut("Your code is 1234 5678", false))).toBe("12345678");
+  });
+
+  it("a preview the upstream may have cut (JMAP: up to 256 characters, no mark) offers no code near its end", () => {
+    const at256 = (lead: string, rest: string) => {
+      const full = `${pad(256 - lead.length)}${lead}${rest}`;
+      return { preview: full.slice(0, 256), full };
+    };
+    // Cut inside the code, with nothing to say so.
+    const inside = at256(" Your code is 1234", "56. Use it to sign in.");
+    expect(inside.preview).toHaveLength(256);
+    expect(findVerificationCode("Your verification code", inside.preview, "preview")).toBeNull();
+    expect(findVerificationCode("Your verification code", inside.full)).toBe("123456");
+    // Cut after a group and the space trimmed, and cut inside a grouped or hyphenated code.
+    expect(findVerificationCode("", at256(" Your code is 1234 ", "5678").preview.trimEnd(), "preview")).toBeNull();
+    expect(findVerificationCode("", at256(" Your code is 123 4", "56").preview, "preview")).toBeNull();
+    expect(findVerificationCode("", at256(" Your code is 1234-", "5678").preview, "preview")).toBeNull();
+    // An explicit "..." or "…" is a cut in any source, grouped codes included.
+    for (const source of ["preview", "body"] as const) {
+      expect(findVerificationCode("", "Your code is 1234 ...", source)).toBeNull();
+      expect(findVerificationCode("", "Your code is 1234 5678…", source)).toBeNull();
+      expect(findVerificationCode("", "Your code is 1234...", source)).toBeNull();
+    }
+    expect(findVerificationCode("Your code is 1234 ...", "")).toBeNull();
+    // No over-correction: a short preview is complete, and a long one still gives a code far from its end.
+    expect(findVerificationCode("", "Your code is 482913. It expires in 10 minutes.", "preview")).toBe("482913");
+    expect(findVerificationCode("", `Your code is 482913. ${pad(230)}`, "preview")).toBe("482913");
+    expect(findVerificationCode("", `Your code is 482913. ${pad(150)}...`, "preview")).toBe("482913");
+    expect(findVerificationCode("", `${pad(170)} Your code is 482913`, "preview")).toBe("482913"); // 190 characters: complete
   });
 });

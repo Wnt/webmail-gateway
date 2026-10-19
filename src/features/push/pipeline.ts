@@ -562,9 +562,10 @@ export class Pipeline implements SummarySource {
   }
 
   /**
-   * The one-time code: from the subject and the whole (uncut) preview first;
-   * when none is there but the subject or preview names one, from the body
-   * (one bounded read). Never throws.
+   * The one-time code: from the subject and the preview first (the detector
+   * reads a long preview as possibly cut by the upstream, and offers nothing
+   * near its end); when none is there but the subject or preview names one,
+   * from the body (one bounded read). Never throws.
    */
   private async codeFor(account: Account, legacyAccountId: string, e: EmailLite): Promise<string | null> {
     const fromPreview = findVerificationCode(e.subject, e.preview, "preview");
