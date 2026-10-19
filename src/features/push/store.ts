@@ -685,6 +685,8 @@ export interface ApnsDevice {
   lastPushAt: Date | null;
   failCount: number;
   goneAt: Date | null;
+  /** New on every (re-)registration of the row (migration 240): what a send and its result are for. */
+  incarnation: string;
 }
 
 interface ApnsRow {
@@ -701,6 +703,7 @@ interface ApnsRow {
   last_push_at: Date | null;
   fail_count: number;
   gone_at: Date | null;
+  incarnation: string;
 }
 
 const toApns = (r: ApnsRow): ApnsDevice => ({
@@ -717,16 +720,21 @@ const toApns = (r: ApnsRow): ApnsDevice => ({
   lastPushAt: r.last_push_at,
   failCount: r.fail_count,
   goneAt: r.gone_at,
+  incarnation: r.incarnation,
 });
 
-export type ApnsRegisterResult = { ok: true; id: string } | { ok: false; reason: "quota" | "revoked" };
+export type ApnsRegisterResult = { ok: true; id: string } | { ok: false; reason: "quota" | "revoked" | "taken" };
 
 /**
  * Register (or re-register) a device token for `accountId`, bound to
- * `grantId` and the account's current auth generation. The same token
- * replaces its earlier row whoever registered it (new key, new grant; a
- * device signed in to another account moves over), keeping the row's id
- * within one account. At most `max` live registrations per account.
+ * `grantId` and the account's current auth generation, with a new
+ * incarnation. The same token of the same account replaces its row (new
+ * key, new grant, same id). A token registered to another account is
+ * `taken` while that registration is still authorized and not gone; a
+ * dead one (signed out, reset, expired temporary passkey, gone) is
+ * replaced under a new id. Decided by the upsert itself, under the row
+ * lock, so a concurrent renewal by the owner cannot race it. At most `max`
+ * live registrations per account.
  *
  * Under the account row lock, which `bootstrap --reset` and every grant
  * revocation also take first: a grant revoked (or an account reset) after
@@ -760,18 +768,23 @@ export async function registerApnsDevice(
     );
     if ((rows[0]?.n ?? 0) >= max) return { ok: false, reason: "quota" };
     const ins = await tx.query<{ id: string }>(
-      `INSERT INTO push_apns_device (id, account_id, grant_id, auth_generation, token, environment, topic, public_key, name, locale)
+      `INSERT INTO push_apns_device AS d (id, account_id, grant_id, auth_generation, token, environment, topic, public_key, name, locale)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (token) DO UPDATE SET
-         id = CASE WHEN push_apns_device.account_id = EXCLUDED.account_id THEN push_apns_device.id ELSE EXCLUDED.id END,
+         id = CASE WHEN d.account_id = EXCLUDED.account_id THEN d.id ELSE EXCLUDED.id END,
          account_id = EXCLUDED.account_id, grant_id = EXCLUDED.grant_id, auth_generation = EXCLUDED.auth_generation,
          environment = EXCLUDED.environment, topic = EXCLUDED.topic, public_key = EXCLUDED.public_key,
          name = EXCLUDED.name, locale = EXCLUDED.locale, updated_at = now(), gone_at = NULL, fail_count = 0,
-         created_at = CASE WHEN push_apns_device.account_id = EXCLUDED.account_id THEN push_apns_device.created_at ELSE now() END
+         last_push_at = CASE WHEN d.account_id = EXCLUDED.account_id THEN d.last_push_at END,
+         created_at = CASE WHEN d.account_id = EXCLUDED.account_id THEN d.created_at ELSE now() END,
+         incarnation = gen_random_uuid()::text
+       WHERE d.account_id = EXCLUDED.account_id OR d.gone_at IS NOT NULL OR NOT (${APNS_AUTHORIZED})
        RETURNING id`,
       [d.newId, d.accountId, d.grantId, acc.rows[0].auth_generation, d.token, d.environment, d.topic, d.publicKey, d.name, d.locale],
     );
-    return { ok: true, id: ins.rows[0]!.id };
+    // No row: the token belongs to another account's live registration.
+    if (!ins.rows[0]) return { ok: false, reason: "taken" };
+    return { ok: true, id: ins.rows[0].id };
   });
 }
 
@@ -800,28 +813,33 @@ export async function apnsTargetsForAccount(db: Queryable, accountId: string, al
 
 /**
  * Before every send attempt (retries included): the registration is still
- * the one the push was made for (same id, account, grant, token and key),
- * not gone, authorized, and its account allowlisted.
+ * the very incarnation the push was made for (and so the same account,
+ * grant, token, key and destination), not gone, authorized, and its
+ * account allowlisted. A renewal in between, even an identical one, makes
+ * the queued send stale.
  */
 export async function apnsTargetStillAuthorized(db: Queryable, d: ApnsDevice, allowed: readonly string[]): Promise<boolean> {
   const { rows } = await db.query(
     `SELECT 1 FROM push_apns_device d
       WHERE d.id = $1 AND d.account_id = $2 AND d.grant_id = $3 AND d.token = $4 AND d.public_key = $5
-        AND d.gone_at IS NULL AND ${APNS_AUTHORIZED} AND ${ALLOWED(6, "d")} LIMIT 1`,
-    [d.id, d.accountId, d.grantId, d.token, d.publicKey, [...allowed]],
+        AND d.environment = $6 AND d.topic = $7 AND d.incarnation = $8
+        AND d.gone_at IS NULL AND ${APNS_AUTHORIZED} AND ${ALLOWED(9, "d")} LIMIT 1`,
+    [d.id, d.accountId, d.grantId, d.token, d.publicKey, d.environment, d.topic, d.incarnation, [...allowed]],
   );
   return rows.length > 0;
 }
 
 export type ApnsSendOutcome = "ok" | "gone" | "failed" | "revoked";
 
-/** Record a send result for the registration (matched by id and token, so a replaced row is not touched). */
-export async function recordApnsResult(db: Queryable, d: Pick<ApnsDevice, "id" | "token">, outcome: ApnsSendOutcome): Promise<void> {
-  if (outcome === "ok") {
-    await db.query("UPDATE push_apns_device SET last_push_at = now(), fail_count = 0 WHERE id = $1 AND token = $2", [d.id, d.token]);
-  } else if (outcome === "gone") {
-    await db.query("UPDATE push_apns_device SET gone_at = now() WHERE id = $1 AND token = $2", [d.id, d.token]);
-  } else if (outcome === "failed") {
-    await db.query("UPDATE push_apns_device SET fail_count = fail_count + 1 WHERE id = $1 AND token = $2", [d.id, d.token]);
-  }
+/**
+ * Record a send result for the incarnation it was sent to: a late answer
+ * for an earlier incarnation (a renewal or revival happened meanwhile)
+ * changes nothing.
+ */
+export async function recordApnsResult(db: Queryable, d: Pick<ApnsDevice, "id" | "token" | "incarnation">, outcome: ApnsSendOutcome): Promise<void> {
+  const where = "WHERE id = $1 AND token = $2 AND incarnation = $3";
+  const args = [d.id, d.token, d.incarnation];
+  if (outcome === "ok") await db.query(`UPDATE push_apns_device SET last_push_at = now(), fail_count = 0 ${where}`, args);
+  else if (outcome === "gone") await db.query(`UPDATE push_apns_device SET gone_at = now() ${where}`, args);
+  else if (outcome === "failed") await db.query(`UPDATE push_apns_device SET fail_count = fail_count + 1 ${where}`, args);
 }

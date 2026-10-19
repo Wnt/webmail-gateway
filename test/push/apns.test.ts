@@ -11,7 +11,14 @@ import {
 } from "../../src/features/push/apns.js";
 import { APNS_PRODUCTION_URL, APNS_SANDBOX_URL, parsePushConfig } from "../../src/features/push/config.js";
 import { PushStats } from "../../src/features/push/stats.js";
-import { apnsTargetsForAccount, getApnsDevice, registerApnsDevice, type ApnsDevice } from "../../src/features/push/store.js";
+import {
+  apnsTargetsForAccount,
+  apnsTargetStillAuthorized,
+  getApnsDevice,
+  recordApnsResult,
+  registerApnsDevice,
+  type ApnsDevice,
+} from "../../src/features/push/store.js";
 import type { AppContext } from "../../src/types.js";
 import { makeTestConfig, makeTestContext } from "../helpers.js";
 import { apnsEnv, makeDevice, makeProviderKey, signInApp, startFakeApns, type FakeApns, type FakeDevice } from "./apns-fake.js";
@@ -315,6 +322,75 @@ describe("authorization at every attempt", () => {
     const again = { ...d, publicKey: makeDevice().publicKey };
     await register(again);
     expect((await sender.sendOne(dev, mail())).outcome).toBe("revoked");
+  });
+});
+
+describe("a registration renewed while a push is on its way (review ios-apns-r1 N4)", () => {
+  it("a late 410 for the earlier incarnation does not mark the renewed registration gone, even an identical renewal", async () => {
+    const d = makeDevice();
+    const dev = await register(d);
+    fake.script.push({ status: 410, reason: "Unregistered", delayMs: 150 });
+    const sending = sender.sendOne(dev, mail());
+    await new Promise((r) => setTimeout(r, 50));
+    const renewed = await register(d); // same token, key, grant and destination: a new incarnation all the same
+    expect(renewed.id).toBe(dev.id);
+    expect(renewed.incarnation).not.toBe(dev.incarnation);
+    expect((await sending).outcome).toBe("gone");
+    const row = (await getApnsDevice(ctx.db, dev.id, accountId))!;
+    expect(row.goneAt).toBeNull();
+    expect((await sender.sendOne(row, mail())).outcome).toBe("ok");
+  });
+
+  it("a late ok or failure for the earlier incarnation is not recorded on the renewed one either", async () => {
+    const d = makeDevice();
+    const dev = await register(d);
+    await register(d);
+    await recordApnsResult(ctx.db, dev, "failed");
+    await recordApnsResult(ctx.db, dev, "ok");
+    const row = (await getApnsDevice(ctx.db, dev.id, accountId))!;
+    expect(row).toMatchObject({ failCount: 0, lastPushAt: null, goneAt: null });
+  });
+
+  it("a retry queued before a renewal does not go out under the old snapshot", async () => {
+    const d = makeDevice();
+    const dev = await register(d);
+    let renew: Promise<unknown> | null = null;
+    const s2 = new ApnsSender(ctx, stats, {
+      ca: fake.ca,
+      retryDelaysMs: [5],
+      sleep: async () => {
+        renew = register(d);
+        await renew;
+      },
+    });
+    try {
+      fake.script.push({ status: 503, reason: "ServiceUnavailable" });
+      expect((await s2.sendOne(dev, mail())).outcome).toBe("revoked");
+      expect(renew).not.toBeNull();
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      s2.close();
+    }
+  });
+
+  it("a changed environment or topic makes the old snapshot unauthorized", async () => {
+    const d = makeDevice();
+    const dev = await register(d);
+    await registerApnsDevice(ctx.db, {
+      newId: "unused-id-0000000000",
+      accountId,
+      grantId,
+      token: d.token,
+      environment: "sandbox",
+      topic: "fi.madekivi.mail",
+      publicKey: d.publicKey,
+      name: null,
+      locale: null,
+    });
+    expect(await apnsTargetStillAuthorized(ctx.db, dev, ctx.config.allowedEmails)).toBe(false);
+    const now2 = (await getApnsDevice(ctx.db, dev.id, accountId))!;
+    expect(now2.environment).toBe("sandbox");
+    expect(await apnsTargetStillAuthorized(ctx.db, now2, ctx.config.allowedEmails)).toBe(true);
   });
 });
 

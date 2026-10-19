@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { registerAuthenticator, resetAuthenticators, type Principal } from "../../src/core/auth-context.js";
-import { TEST_PUSHES_PER_HOUR } from "../../src/features/push/apns-routes.js";
+import { TEST_PUSHES_PER_ACCOUNT_HOUR, TEST_PUSHES_PER_HOUR } from "../../src/features/push/apns-routes.js";
 import { getApnsDevice, getUpstream, hasActiveSubs, MAX_APNS_DEVICES_PER_ACCOUNT } from "../../src/features/push/store.js";
 import { TokenStore } from "../../src/features/auth/tokens.js";
 import { apnsEnv, makeDevice, makeProviderKey, signInApp, startFakeApns, type FakeApns, type FakeDevice } from "./apns-fake.js";
@@ -176,15 +176,44 @@ describe("POST devices", () => {
     expect((await a.call("POST", "/relay/api/push/apns/devices", body(makeDevice()))).statusCode).toBe(200);
   });
 
-  it("a device signed in to another account moves over", async () => {
+  it("another account cannot take over a live registration (409), whatever it sends", async () => {
     const a = await app();
     const b = await app();
     const d = makeDevice();
     const first = (await a.call("POST", "/relay/api/push/apns/devices", body(d))).json() as { id: string };
-    const second = (await b.call("POST", "/relay/api/push/apns/devices", body(d))).json() as { id: string };
+    for (const over of [{}, { publicKey: makeDevice().publicKey }, { environment: "sandbox" }]) {
+      const res = await b.call("POST", "/relay/api/push/apns/devices", body(d, over));
+      expect(res.statusCode).toBe(409);
+      expect(res.json()).toEqual({ error: "Device registered to another account" });
+    }
+    expect(await getApnsDevice(h.ctx.db, first.id, a.account.id)).toMatchObject({ token: d.token, publicKey: d.publicKey, environment: "production" });
+    // The owner still renews it, under the same id.
+    expect((await a.call("POST", "/relay/api/push/apns/devices", body(d))).json()).toEqual(first);
+  });
+
+  it.each([
+    ["signed out (grant revoked)", async (a: Awaited<ReturnType<typeof app>>) => new TokenStore(h.ctx).revokeToken(a.refreshToken, "madekivi-ios")],
+    ["reset (auth generation moved)", async (a: Awaited<ReturnType<typeof app>>) => {
+      await h.ctx.db.query("UPDATE account SET auth_generation = auth_generation + 1 WHERE id = $1", [a.account.id]);
+    }],
+    ["temporary passkey expired", async (a: Awaited<ReturnType<typeof app>>) => {
+      await h.ctx.db.query("UPDATE passkey SET expires_at = now() - interval '1 second' WHERE id = $1", [a.passkeyId]);
+    }],
+    ["gone at APNs", async (a: Awaited<ReturnType<typeof app>>) => {
+      await h.ctx.db.query("UPDATE push_apns_device SET gone_at = now() WHERE account_id = $1", [a.account.id]);
+    }],
+  ])("a registration no longer authorized (%s) is taken over by the next account", async (_, kill) => {
+    const a = await app();
+    const b = await app();
+    const d = makeDevice();
+    const first = (await a.call("POST", "/relay/api/push/apns/devices", body(d))).json() as { id: string };
+    await kill(a);
+    const res = await b.call("POST", "/relay/api/push/apns/devices", body(d));
+    expect(res.statusCode, res.body).toBe(200);
+    const second = res.json() as { id: string };
     expect(second.id).not.toBe(first.id);
     expect(await getApnsDevice(h.ctx.db, first.id, a.account.id)).toBeNull();
-    expect(await getApnsDevice(h.ctx.db, second.id, b.account.id)).toMatchObject({ token: d.token });
+    expect(await getApnsDevice(h.ctx.db, second.id, b.account.id)).toMatchObject({ token: d.token, grantId: b.grantId, goneAt: null });
   });
 });
 
@@ -211,7 +240,7 @@ describe("DELETE devices/:id", () => {
 });
 
 describe("POST devices/:id/test", () => {
-  it(`sends the synthetic test push, ${TEST_PUSHES_PER_HOUR} per hour`, async () => {
+  it(`sends the synthetic test push, ${TEST_PUSHES_PER_HOUR} per hour per device token`, async () => {
     const a = await app();
     const d = makeDevice();
     const { id } = (await a.call("POST", "/relay/api/push/apns/devices", body(d))).json() as { id: string };
@@ -226,7 +255,26 @@ describe("POST devices/:id/test", () => {
     for (let i = 1; i < TEST_PUSHES_PER_HOUR; i++) expect((await a.call("POST", `/relay/api/push/apns/devices/${id}/test`)).statusCode).toBe(200);
     const limited = await a.call("POST", `/relay/api/push/apns/devices/${id}/test`, {});
     expect(limited.statusCode).toBe(429);
+    // Deleting and registering the same token again does not reset it.
+    expect((await a.call("DELETE", `/relay/api/push/apns/devices/${id}`)).statusCode).toBe(200);
+    const again = (await a.call("POST", "/relay/api/push/apns/devices", body(d))).json() as { id: string };
+    expect((await a.call("POST", `/relay/api/push/apns/devices/${again.id}/test`, {})).statusCode).toBe(429);
+    // Nor does the token moving to another account after a sign-out.
+    await new TokenStore(h.ctx).revokeToken(a.refreshToken, "madekivi-ios");
+    const b = await app();
+    const moved = (await b.call("POST", "/relay/api/push/apns/devices", body(d))).json() as { id: string };
+    expect((await b.call("POST", `/relay/api/push/apns/devices/${moved.id}/test`, {})).statusCode).toBe(429);
     expect(fake.requests).toHaveLength(TEST_PUSHES_PER_HOUR);
+  });
+
+  it(`at most ${TEST_PUSHES_PER_ACCOUNT_HOUR} test pushes per account per hour`, async () => {
+    const a = await app();
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) ids.push(((await a.call("POST", "/relay/api/push/apns/devices", body(makeDevice()))).json() as { id: string }).id);
+    const statuses: number[] = [];
+    for (const id of ids) for (let i = 0; i < 4; i++) statuses.push((await a.call("POST", `/relay/api/push/apns/devices/${id}/test`, {})).statusCode);
+    expect(statuses.filter((s) => s === 200)).toHaveLength(TEST_PUSHES_PER_ACCOUNT_HOUR);
+    expect(statuses.slice(TEST_PUSHES_PER_ACCOUNT_HOUR)).toEqual([429, 429]);
   });
 
   it("answers 410 when APNs says the token is gone, 502 on another refusal, 404 for others' devices", async () => {

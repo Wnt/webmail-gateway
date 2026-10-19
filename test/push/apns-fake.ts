@@ -99,8 +99,8 @@ export interface FakeApns {
   /** The certificate to trust. */
   ca: string;
   requests: ApnsRequest[];
-  /** Scripted answers, consumed in order, for requests that pass the checks (default 200). */
-  script: { status: number; reason?: string }[];
+  /** Scripted answers, consumed in order, for requests that pass the checks (default 200), optionally late. */
+  script: { status: number; reason?: string; delayMs?: number }[];
   /** Connections accepted so far. */
   sessions: number;
   /** Send GOAWAY on the connection after answering the next request. */
@@ -206,7 +206,7 @@ export async function startFakeApns(key: ProviderKey, topics: string[] = ["fi.ma
       }
       const auth = String(headers.authorization ?? "");
       const jwt = /^bearer /i.test(auth) ? decodeJwt(auth.slice(7).trim()) : null;
-      let answer = check(headers, jwt, body.length);
+      let answer: { status: number; reason?: string; delayMs?: number } = check(headers, jwt, body.length);
       if (answer.status === 200 && fake.script.length) answer = fake.script.shift()!;
       let json: ApnsRequest["json"] = null;
       try {
@@ -226,13 +226,10 @@ export async function startFakeApns(key: ProviderKey, topics: string[] = ["fi.ma
         session: sessionNo.get(stream.session as http2.ServerHttp2Session) ?? 0,
       });
       const apnsId = "00000000-0000-4000-8000-" + randomBytes(6).toString("hex").toUpperCase();
-      if (answer.status === 200) {
-        stream.respond({ ":status": 200, "apns-id": apnsId });
-        stream.end();
-      } else {
-        stream.respond({ ":status": answer.status, "apns-id": apnsId, "content-type": "application/json" });
-        stream.end(JSON.stringify(answer.status === 410 ? { reason: answer.reason ?? "Unregistered", timestamp: Date.now() } : { reason: answer.reason ?? "InternalServerError" }));
-      }
+      if (answer.delayMs) {
+        const { delayMs, ...later } = answer;
+        setTimeout(() => respond(stream, later, apnsId), delayMs);
+      } else respond(stream, answer, apnsId);
       if (fake.goawayAfterNext) {
         fake.goawayAfterNext = false;
         const s = stream.session;
@@ -240,6 +237,17 @@ export async function startFakeApns(key: ProviderKey, topics: string[] = ["fi.ma
       }
     });
   });
+
+  function respond(stream: http2.ServerHttp2Stream, answer: { status: number; reason?: string }, apnsId: string): void {
+    if (stream.destroyed || stream.closed) return;
+    if (answer.status === 200) {
+      stream.respond({ ":status": 200, "apns-id": apnsId });
+      stream.end();
+    } else {
+      stream.respond({ ":status": answer.status, "apns-id": apnsId, "content-type": "application/json" });
+      stream.end(JSON.stringify(answer.status === 410 ? { reason: answer.reason ?? "Unregistered", timestamp: Date.now() } : { reason: answer.reason ?? "InternalServerError" }));
+    }
+  }
 
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const addr = server.address();

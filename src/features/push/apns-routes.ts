@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { authenticate, type Principal } from "../../core/auth-context.js";
 import type { AppContext } from "../../types.js";
@@ -21,7 +21,8 @@ import {
  *
  * - `POST devices` {token, environment, topic?, publicKey, name?, locale?} -> {id}
  * - `DELETE devices/:id`
- * - `POST devices/:id/test`: one encrypted test push (`kind: "test"`, code 123456), 5 per hour.
+ * - `POST devices/:id/test`: one encrypted test push (`kind: "test"`, code 123456): 5 an hour per
+ *   device token (deleting and registering it again does not reset that) and 10 an hour per account.
  *
  * Every route needs an OAuth access token of the account with scope `mail`
  * (`Authorization: Bearer`); the registration is bound to that token's grant.
@@ -32,8 +33,9 @@ const ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const TOKEN_RE = /^[0-9a-f]{64,200}$/;
 const FIELDS = new Set(["token", "environment", "topic", "publicKey", "name", "locale"]);
 export const NAME_MAX = 64;
-/** Test pushes per registration per hour. */
+/** Test pushes per device token per hour (whatever registration it is under), and per account. */
 export const TEST_PUSHES_PER_HOUR = 5;
+export const TEST_PUSHES_PER_ACCOUNT_HOUR = 10;
 
 export interface ApnsRegistration {
   token: string;
@@ -78,7 +80,10 @@ export async function registerApnsRoutes(app: FastifyInstance, ctx: AppContext, 
   const { stats, apns } = deps;
   const ipLimit = new RateLimiter(30);
   const accountLimit = new RateLimiter(30);
+  // Keyed on the destination, not the registration: a delete and a new
+  // registration of the same token do not reset it (in memory, one replica: D12).
   const testLimit = new RateLimiter(TEST_PUSHES_PER_HOUR, 3600_000);
+  const testAccountLimit = new RateLimiter(TEST_PUSHES_PER_ACCOUNT_HOUR, 3600_000);
 
   await app.register(
     async (r) => {
@@ -137,6 +142,7 @@ export async function registerApnsRoutes(app: FastifyInstance, ctx: AppContext, 
         if (!res.ok) {
           stats.inc(`apns_register_${res.reason}`);
           if (res.reason === "quota") return err(reply, 409, "Too many devices", { max: MAX_APNS_DEVICES_PER_ACCOUNT });
+          if (res.reason === "taken") return err(reply, 409, "Device registered to another account");
           return err(reply.header("www-authenticate", 'Bearer realm="push"'), 401, "Unauthorized");
         }
         stats.inc("apns_registered");
@@ -163,7 +169,7 @@ export async function registerApnsRoutes(app: FastifyInstance, ctx: AppContext, 
         const device = await getApnsDevice(ctx.db, req.params.id, p.accountId);
         if (!device || !(await apnsTargetStillAuthorized(ctx.db, device, ctx.config.allowedEmails))) return err(reply, 404, "Unknown device");
         if (!apns.enabled) return err(reply, 503, "APNs not configured");
-        if (!testLimit.allow(device.id)) {
+        if (!testLimit.allow(createHash("sha256").update(device.token).digest("hex")) || !testAccountLimit.allow(p.accountId)) {
           stats.inc("apns_test_rate_limited");
           return err(reply, 429, "Too many test pushes");
         }
