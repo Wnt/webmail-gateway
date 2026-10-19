@@ -723,18 +723,21 @@ const toApns = (r: ApnsRow): ApnsDevice => ({
   incarnation: r.incarnation,
 });
 
-export type ApnsRegisterResult = { ok: true; id: string } | { ok: false; reason: "quota" | "revoked" | "taken" };
+export type ApnsRegisterResult = { ok: true; id: string } | { ok: false; reason: "quota" | "revoked" | "taken" | "superseded" };
 
 /**
  * Register (or re-register) a device token for `accountId`, bound to
  * `grantId` and the account's current auth generation, with a new
  * incarnation. The same token of the same account replaces its row (new
- * key, new grant, same id). A token registered to another account is
+ * key, new grant, same id) unless the row is bound to a newer grant (by the
+ * server's grant creation order, the grant id breaking ties): a delayed
+ * registration of a previous sign-in never replaces its successor's
+ * binding (`superseded`). A token registered to another account is
  * `taken` while that registration is still authorized and not gone; a
  * dead one (signed out, reset, expired temporary passkey, gone) is
- * replaced under a new id. Decided by the upsert itself, under the row
- * lock, so a concurrent renewal by the owner cannot race it. At most `max`
- * live registrations per account.
+ * replaced, under a new id for another account. Decided by the upsert
+ * itself, under the row lock, so concurrent registrations cannot race it.
+ * At most `max` live registrations per account.
  *
  * Under the account row lock, which `bootstrap --reset` and every grant
  * revocation also take first: a grant revoked (or an account reset) after
@@ -778,13 +781,19 @@ export async function registerApnsDevice(
          last_push_at = CASE WHEN d.account_id = EXCLUDED.account_id THEN d.last_push_at END,
          created_at = CASE WHEN d.account_id = EXCLUDED.account_id THEN d.created_at ELSE now() END,
          incarnation = gen_random_uuid()::text
-       WHERE d.account_id = EXCLUDED.account_id OR d.gone_at IS NOT NULL OR NOT (${APNS_AUTHORIZED})
+       WHERE d.gone_at IS NOT NULL OR NOT (${APNS_AUTHORIZED})
+          OR (d.account_id = EXCLUDED.account_id
+              AND NOT EXISTS (SELECT 1 FROM oauth_grant bound, oauth_grant asking
+                               WHERE bound.id = d.grant_id AND asking.id = EXCLUDED.grant_id
+                                 AND (bound.created_at, bound.id) > (asking.created_at, asking.id)))
        RETURNING id`,
       [d.newId, d.accountId, d.grantId, acc.rows[0].auth_generation, d.token, d.environment, d.topic, d.publicKey, d.name, d.locale],
     );
-    // No row: the token belongs to another account's live registration.
-    if (!ins.rows[0]) return { ok: false, reason: "taken" };
-    return { ok: true, id: ins.rows[0].id };
+    if (ins.rows[0]) return { ok: true, id: ins.rows[0].id };
+    // No row: the token's live registration belongs to another account, or
+    // to a newer sign-in of this one (a delayed POST of the previous sign-in).
+    const owner = await tx.query<{ account_id: string }>("SELECT account_id FROM push_apns_device WHERE token = $1", [d.token]);
+    return { ok: false, reason: owner.rows[0]?.account_id === d.accountId ? "superseded" : "taken" };
   });
 }
 

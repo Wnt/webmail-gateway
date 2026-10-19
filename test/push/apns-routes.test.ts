@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { registerAuthenticator, resetAuthenticators, type Principal } from "../../src/core/auth-context.js";
 import { TEST_PUSHES_PER_ACCOUNT_HOUR, TEST_PUSHES_PER_HOUR } from "../../src/features/push/apns-routes.js";
-import { getApnsDevice, getUpstream, hasActiveSubs, MAX_APNS_DEVICES_PER_ACCOUNT } from "../../src/features/push/store.js";
+import { apnsTargetsForAccount, getApnsDevice, getUpstream, hasActiveSubs, MAX_APNS_DEVICES_PER_ACCOUNT } from "../../src/features/push/store.js";
 import { TokenStore } from "../../src/features/auth/tokens.js";
 import { apnsEnv, makeDevice, makeProviderKey, signInApp, startFakeApns, type FakeApns, type FakeDevice } from "./apns-fake.js";
 import { makeHarness, type Harness } from "./harness.js";
@@ -214,6 +214,56 @@ describe("POST devices", () => {
     expect(second.id).not.toBe(first.id);
     expect(await getApnsDevice(h.ctx.db, first.id, a.account.id)).toBeNull();
     expect(await getApnsDevice(h.ctx.db, second.id, b.account.id)).toMatchObject({ token: d.token, grantId: b.grantId, goneAt: null });
+  });
+});
+
+describe("re-registration across sign-ins of one account (review ios-app-r4 R4-4)", () => {
+  /** One account, two sign-ins of the app on one device: A, then B. */
+  async function twoSignIns() {
+    const a = await app();
+    const b = await signInApp(h.ctx, a.account.id);
+    const d = makeDevice();
+    const keyB = makeDevice().publicKey;
+    const register = (accessToken: string, publicKey: string) => a.call("POST", "/relay/api/push/apns/devices", body(d, { publicKey }), accessToken);
+    return { a, b, d, keyB, register };
+  }
+
+  it("a newer sign-in replaces the older one's binding, and survives the older one's revocation", async () => {
+    const { a, b, d, keyB, register } = await twoSignIns();
+    expect((await register(a.accessToken, d.publicKey)).statusCode).toBe(200);
+    const res = await register(b.accessToken, keyB);
+    expect(res.statusCode).toBe(200);
+    const { id } = res.json() as { id: string };
+    await new TokenStore(h.ctx).revokeToken(a.refreshToken, "madekivi-ios");
+    expect(await getApnsDevice(h.ctx.db, id, a.account.id)).toMatchObject({ grantId: b.grantId, publicKey: keyB });
+    expect(await apnsTargetsForAccount(h.ctx.db, a.account.id, h.ctx.config.allowedEmails)).toHaveLength(1);
+  });
+
+  it("a delayed registration of the older sign-in does not replace the newer one's (409), before or after its revocation", async () => {
+    const { a, b, d, keyB, register } = await twoSignIns();
+    const res = await register(b.accessToken, keyB);
+    expect(res.statusCode).toBe(200);
+    const { id } = res.json() as { id: string };
+    const before = (await getApnsDevice(h.ctx.db, id, a.account.id))!;
+    const late = await register(a.accessToken, d.publicKey); // A's POST, sent before A signed out, arrives now
+    expect(late.statusCode).toBe(409);
+    expect(late.json()).toEqual({ error: "Device registered by a newer sign-in" });
+    const after = (await getApnsDevice(h.ctx.db, id, a.account.id))!;
+    expect(after).toMatchObject({ grantId: b.grantId, publicKey: keyB, incarnation: before.incarnation });
+    await new TokenStore(h.ctx).revokeToken(a.refreshToken, "madekivi-ios");
+    const targets = await apnsTargetsForAccount(h.ctx.db, a.account.id, h.ctx.config.allowedEmails);
+    expect(targets.map((t) => [t.grantId, t.publicKey])).toEqual([[b.grantId, keyB]]);
+  });
+
+  it("the same sign-in renews its own binding; an older live sign-in may take a row whose newer sign-in is gone", async () => {
+    const { a, b, d, keyB, register } = await twoSignIns();
+    expect((await register(b.accessToken, keyB)).statusCode).toBe(200);
+    const renewedKey = makeDevice().publicKey;
+    expect((await register(b.accessToken, renewedKey)).statusCode).toBe(200);
+    await new TokenStore(h.ctx).revokeToken(b.refreshToken, "madekivi-ios");
+    const res = await register(a.accessToken, d.publicKey);
+    expect(res.statusCode).toBe(200);
+    expect(await getApnsDevice(h.ctx.db, (res.json() as { id: string }).id, a.account.id)).toMatchObject({ grantId: a.grantId, publicKey: d.publicKey });
   });
 });
 

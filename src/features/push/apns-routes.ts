@@ -143,6 +143,7 @@ export async function registerApnsRoutes(app: FastifyInstance, ctx: AppContext, 
           stats.inc(`apns_register_${res.reason}`);
           if (res.reason === "quota") return err(reply, 409, "Too many devices", { max: MAX_APNS_DEVICES_PER_ACCOUNT });
           if (res.reason === "taken") return err(reply, 409, "Device registered to another account");
+          if (res.reason === "superseded") return err(reply, 409, "Device registered by a newer sign-in");
           return err(reply.header("www-authenticate", 'Bearer realm="push"'), 401, "Unauthorized");
         }
         stats.inc("apns_registered");

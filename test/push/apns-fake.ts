@@ -257,6 +257,14 @@ export async function startFakeApns(key: ProviderKey, topics: string[] = ["fi.ma
 
 // ------------------------------------------------------------ signed-in app
 
+/**
+ * Grants made here get strictly increasing creation times (one millisecond
+ * apart at least), as sign-ins with passkey taps always have: a registration
+ * is fenced by its grant's creation order.
+ */
+let lastGrantAt = 0;
+const grantClock = () => (lastGrantAt = Math.max(Date.now(), lastGrantAt + 1));
+
 /** The native app signed in: a passkey, a grant of the madekivi-ios client from a real code exchange, and its principal. */
 export async function signInApp(
   ctx: Pick<import("../../src/types.js").AppContext, "config" | "db" | "log">,
@@ -267,7 +275,7 @@ export async function signInApp(
   const { addTestPasskey } = await import("../helpers.js");
   const { createHash } = await import("node:crypto");
   const pk = passkeyId ?? (await addTestPasskey(ctx, accountId));
-  const store = new TokenStore(ctx);
+  const store = new TokenStore(ctx, grantClock);
   const verifier = randomBytes(32).toString("base64url");
   const redirectUri = "fi.madekivi.mail:/oauth/callback";
   const code = await store.issueCode({
