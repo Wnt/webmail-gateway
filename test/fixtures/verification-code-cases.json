@@ -33,7 +33,6 @@
   { "name": "a delivery report from Outlook", "subject": "Successfully delivered message", "text": "<x@example.com> (delivered to 'example-com.mail.protection.outlook.com' with code 250 (2.6.0) '2.6.0 <a1b2@mail.example.org> [InternalId=21045339521540, Hostname=PAXPR03MB8065.eurprd03.prod.outlook.com] 12825 bytes in 0.108, 115.431 KB/sec Queued mail for delivery')", "code": null },
   { "name": "an HTML table cell, as the reader renders it", "subject": "Verification Code", "text": "Verification code:\n261765", "code": "261765" },
   { "name": "plain-text mail", "subject": "", "text": "Your HA Remote verification code is 811083.", "code": "811083" },
-
   { "name": "otp fixture 01: 6 digits in subject and body", "subject": "Your Examplepaja verification code is 482913", "text": "Hi Alice,\n\nUse this code to finish signing in: 482913\n\nIt expires in 10 minutes. If you did not try to sign in, ignore this message.\n\nExamplepaja", "code": "482913" },
   { "name": "otp fixture 02: 6 digits with a space, Finnish", "subject": "Kirjautumisen vahvistus", "text": "Hei,\n\nVahvistuskoodisi on 739 104\n\nKoodi on voimassa 5 minuuttia. Älä kerro koodia kenellekään.\n\nTerveisin\nKuntoportaali", "code": "739104" },
   { "name": "otp fixture 03: 4 digits, SMS style", "subject": "Ruokakassi: code 5821", "text": "Your Ruokakassi code: 5821", "code": "5821" },
@@ -46,7 +45,6 @@
   { "name": "otp fixture 10: a time, a date and a reference nearby", "subject": "Postipalvelu sign-in", "text": "Your code 117 734 expires at 14:05 on 19.10.2026. Do not share it. Reference 2026-10-19-88.", "code": "117734" },
   { "name": "otp fixture 11: an order number, a date and a phone number", "subject": "Order 48213977 confirmed", "text": "Thanks for your order 48213977. Delivery on 21.10.2026 between 16 and 18. Questions: +358 40 000 0000.", "code": null },
   { "name": "otp fixture 12: amounts, reference and account numbers", "subject": "Lasku 2026-1043", "text": "Laskun summa 128,40 EUR, eräpäivä 02.11.2026, viitenumero RF18 5390 0754 7034, tilinumero FI00 1234 5600 0007 85.", "code": null },
-
   { "name": "4 digits", "subject": "Examplepaja", "text": "Your sign-in code is 4821. It expires in 5 minutes.", "code": "4821" },
   { "name": "6 digits after a colon", "subject": "Sign in to Examplecloud", "text": "Verification code: 123456\nIf this wasn't you, change your password.", "code": "123456" },
   { "name": "8 digits", "subject": "Kertakäyttöinen koodi", "text": "Syötä koodi 90817265 sovellukseen.", "code": "90817265" },
@@ -68,5 +66,9 @@
   { "name": "no code: a phone number", "subject": "Call us", "text": "Questions? Call +358 40 123 4567 or 0800 123 456.", "code": null },
   { "name": "no code: a promo code", "subject": "Autumn sale", "text": "Use promo code AUTUMN25 for 25% off. Discount code SAVE1234 ends on Sunday.", "code": null },
   { "name": "no code: a postcode", "subject": "Your address", "text": "We will ship to Examplekatu 1, 00100 Helsinki. Postcode 00100.", "code": null },
-  { "name": "no code: a mention without a code", "subject": "Your sign-in code", "text": "Open the app to see your code.", "code": null }
+  { "name": "no code: a mention without a code", "subject": "Your sign-in code", "text": "Open the app to see your code.", "code": null },
+  { "name": "Finnish possessive: vahvistuskoodisi", "subject": "Kirjautuminen", "text": "Vahvistuskoodisi on 482913. Älä kerro sitä kenellekään.", "code": "482913" },
+  { "name": "Finnish possessive: syötä koodisi", "subject": "", "text": "Syötä kertakäyttöinen koodisi: 590 112", "code": "590112" },
+  { "name": "Finnish possessive: vahvistuskoodinne", "subject": "Tilin vahvistus", "text": "Vahvistuskoodinne on 7731 ja se on voimassa 10 minuuttia.", "code": "7731" },
+  { "name": "Finnish possessive without a code", "subject": "Koodisi on vaihdettu", "text": "Turvakoodisi vaihdettiin 19.10.2026 klo 12.30. Jos et tehnyt muutosta, soita 0800 123 456.", "code": null }
 ]

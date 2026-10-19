@@ -38,11 +38,11 @@ const NOT_A_CODE_PREFIXES = new Set([
 ]);
 
 // Word endings that name a code, across the languages the app ships.
-// "bestätigungscode", "verificatiecode", "engangskode", "vahvistuskoodi",
+// "bestätigungscode", "verificatiecode", "engangskode", "vahvistuskoodi(si)",
 // "verifieringskod", "ellenőrzőkód", "код", ...
 const CODE_WORD_ENDINGS = [
   'code', 'codes', 'codice', 'codici', 'código', 'códigos', 'codigo', 'codigos', 'cod', 'kod',
-  'kodu', 'kodem', 'kodunuz', 'kód', 'kódot', 'kódu', 'kode', 'koden', 'koodi', 'koodia', 'kood',
+  'kodu', 'kodem', 'kodunuz', 'kód', 'kódot', 'kódu', 'kode', 'koden', 'koodi', 'koodia', 'koodisi', 'koodiasi', 'koodinne', 'koodianne', 'kood',
   'kods', 'kodas', 'код', 'кода', 'коду', 'кодом', 'κωδικός', 'κωδικό', 'קוד', 'رمز', 'کد',
 ];
 
