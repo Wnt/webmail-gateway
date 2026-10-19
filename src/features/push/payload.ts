@@ -64,18 +64,22 @@ export function payloadNotificationText(email: PayloadEmail | undefined): { titl
 
 /**
  * `p` as a Declarative Web Push message that opens its newest message
- * (the same URL the service worker gives the notification it shows).
+ * (the same URL the service worker gives the notification it shows). iOS
+ * keeps no `data` for such a notification, so the link's fragment carries
+ * when the push went out (`#sent=<ms>`): the worker orders it against a
+ * quiet push by that (sw.js), and the app ignores the fragment.
  */
 export function declarativePayload(p: PushPayload, publicBaseUrl: string): DeclarativePushPayload {
   const emailId = p.emailIds[p.emailIds.length - 1] ?? "";
   const base = publicBaseUrl.replace(/\/+$/, "");
   const { title, body } = payloadNotificationText(p.email);
+  const sent = typeof p.sentAt === "number" && Number.isFinite(p.sentAt) ? `#sent=${Math.round(p.sentAt)}` : "";
   return {
     web_push: 8030,
     notification: {
       title,
       body,
-      navigate: emailId ? `${base}/mail/message/${encodeURIComponent(emailId)}` : `${base}/`,
+      navigate: emailId ? `${base}/mail/message/${encodeURIComponent(emailId)}${sent}` : `${base}/`,
       tag: `bulwark-mail:${p.accountId || "default"}`,
       silent: false,
       data: { kind: "email", emailId, accountId: p.accountId, headlineEmailId: emailId },

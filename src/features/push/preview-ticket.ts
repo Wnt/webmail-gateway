@@ -1,4 +1,4 @@
-import { hkdfSync } from "node:crypto";
+import { createHash, hkdfSync, timingSafeEqual } from "node:crypto";
 import { CryptoError, open, seal } from "../../core/crypto.js";
 
 /**
@@ -7,28 +7,36 @@ import { CryptoError, open, seal } from "../../core/crypto.js";
  * webmail session has expired (an idle phone: the access token behind
  * Bulwark's /api/push/preview lives an hour).
  *
- * A ticket names exactly one message of one account for one push target (the
- * browser's relay record), and lives `PREVIEW_TICKET_TTL_MS`. It is sealed
+ * A ticket names exactly one message of one account for one push target: the
+ * browser's relay record as it was (its endpoint and keys) and the very
+ * emulated subscription that authorized the push. It lives
+ * `PREVIEW_TICKET_TTL_MS`. It is sealed
  * with a purpose key derived from GATEWAY_ENC_KEY (A6), travels only inside
  * the push payload (RFC 8291: encrypted to the subscribed browser) and in the
  * body of a same-origin POST, never in a URL or a log. It grants a read of
- * that message and nothing else, and only while the push target is still
- * deliverable: a revoked grant, an expired temporary passkey, a destroyed
- * subscription (sign-out) or a gone relay record ends it at once
- * (`previewTargetAuthorized`, read from the database on every use).
+ * that message and nothing else, and only while that subscription is still
+ * deliverable and that relay record unchanged: a revoked grant, an expired
+ * temporary passkey, an account reset, a destroyed subscription (sign-out),
+ * a deleted or re-registered relay record ends it for good, and a new
+ * subscription or grant on the same relay id does not bring it back
+ * (store.ts `previewTicketTarget`, read from the database on every use).
  */
 
 export const PREVIEW_TICKET_TTL_MS = 10 * 60_000;
 /** Longest ticket string accepted (a real one is ~250 characters). */
 export const PREVIEW_TICKET_MAX_CHARS = 1024;
 
-const AAD = "webmail-gateway/push-preview-ticket/v1";
+const AAD = "webmail-gateway/push-preview-ticket/v2";
 
 export interface PreviewTicket {
   /** Gateway account id. */
   accountId: string;
   /** The push target (relay record) it was minted for. */
   relayId: string;
+  /** The emulated subscription that authorized the push. */
+  subId: string;
+  /** `relayKeyHash` of the relay record's endpoint and keys at minting. */
+  keyHash: string;
   /** The upstream's JMAP account id (the payload's `accountId`). */
   legacyAccountId: string;
   /** The one message it names. */
@@ -49,12 +57,25 @@ function ticketKey(encKey: Buffer): Buffer {
   return k;
 }
 
+/** Identifies a relay record's endpoint and keys (a re-registration changes it). */
+export function relayKeyHash(r: { endpoint: string; p256dh: string; auth: string }): string {
+  return createHash("sha256").update(`${r.endpoint}\0${r.p256dh}\0${r.auth}`).digest("base64url").slice(0, 22);
+}
+
+export function sameKeyHash(a: string, b: string): boolean {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+
 export function mintPreviewTicket(
   encKey: Buffer,
   t: Omit<PreviewTicket, "expiresAt">,
   now = Date.now(),
 ): string {
-  const body = JSON.stringify({ v: 1, a: t.accountId, r: t.relayId, l: t.legacyAccountId, m: t.emailId, x: now + PREVIEW_TICKET_TTL_MS });
+  const body = JSON.stringify({
+    v: 2, a: t.accountId, r: t.relayId, s: t.subId, k: t.keyHash, l: t.legacyAccountId, m: t.emailId, x: now + PREVIEW_TICKET_TTL_MS,
+  });
   return seal(body, ticketKey(encKey), AAD).toString("base64url");
 }
 
@@ -71,9 +92,9 @@ export function openPreviewTicket(encKey: Buffer, ticket: unknown, now = Date.no
     throw err;
   }
   const p = parsed as Record<string, unknown> | null;
-  if (!p || typeof p !== "object" || p.v !== 1) return null;
-  if (!str(p.a, 64) || !str(p.r, 128) || !str(p.l, 255) || !str(p.m, 255)) return null;
+  if (!p || typeof p !== "object" || p.v !== 2) return null;
+  if (!str(p.a, 64) || !str(p.r, 128) || !str(p.s, 64) || !str(p.k, 64) || !str(p.l, 255) || !str(p.m, 255)) return null;
   const x = p.x;
   if (typeof x !== "number" || !Number.isFinite(x) || x <= now || x > now + PREVIEW_TICKET_TTL_MS) return null;
-  return { accountId: p.a, relayId: p.r, legacyAccountId: p.l, emailId: p.m, expiresAt: x };
+  return { accountId: p.a, relayId: p.r, subId: p.s, keyHash: p.k, legacyAccountId: p.l, emailId: p.m, expiresAt: x };
 }

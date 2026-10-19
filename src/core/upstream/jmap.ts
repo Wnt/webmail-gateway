@@ -13,6 +13,8 @@ import {
   JMAP_CORE,
   JMAP_MAIL,
   UpstreamCallError,
+  UpstreamTooLargeError,
+  type JmapCallOptions,
   type JmapMethodCall,
   type JmapResponse,
   type JmapSession,
@@ -224,7 +226,7 @@ export class JmapUpstream implements Upstream {
     return { kind: "response", res };
   }
 
-  async jmap(account: UpstreamAccount, methodCalls: JmapMethodCall[], using: string[] = [JMAP_CORE, JMAP_MAIL]): Promise<JmapResponse> {
+  async jmap(account: UpstreamAccount, methodCalls: JmapMethodCall[], using: string[] = [JMAP_CORE, JMAP_MAIL], opts: JmapCallOptions = {}): Promise<JmapResponse> {
     const r = await this.request(account, {
       target: { kind: "api" },
       method: "POST",
@@ -233,6 +235,7 @@ export class JmapUpstream implements Upstream {
       replayable: true,
       headersTimeout: JMAP_TIMEOUT_MS,
       bodyTimeout: JMAP_TIMEOUT_MS,
+      ...(opts.signal ? { signal: opts.signal } : {}),
     }).catch((err: Error) => {
       throw new UpstreamCallError(`upstream request failed: ${err.message}`);
     });
@@ -240,6 +243,33 @@ export class JmapUpstream implements Upstream {
     if (r.res.statusCode < 200 || r.res.statusCode >= 300) {
       await r.res.body.dump();
       throw new UpstreamCallError(`upstream answered ${r.res.statusCode}`, r.res.statusCode);
+    }
+    if (opts.maxResponseBytes !== undefined) {
+      const max = opts.maxResponseBytes;
+      const declared = Number(r.res.headers["content-length"]);
+      if (Number.isFinite(declared) && declared > max) {
+        r.res.body.destroy();
+        throw new UpstreamTooLargeError(max);
+      }
+      const chunks: Buffer[] = [];
+      let total = 0;
+      for await (const chunk of r.res.body) {
+        const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
+        total += b.byteLength;
+        if (total > max) {
+          r.res.body.destroy();
+          throw new UpstreamTooLargeError(max);
+        }
+        chunks.push(b);
+      }
+      let parsed: JmapResponse | null = null;
+      try {
+        parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as JmapResponse;
+      } catch {
+        parsed = null;
+      }
+      if (!parsed || !Array.isArray(parsed.methodResponses)) throw new UpstreamCallError("upstream returned a non-JMAP body", r.res.statusCode);
+      return parsed;
     }
     const body = (await r.res.body.json().catch(() => null)) as JmapResponse | null;
     if (!body || !Array.isArray(body.methodResponses)) throw new UpstreamCallError("upstream returned a non-JMAP body", r.res.statusCode);

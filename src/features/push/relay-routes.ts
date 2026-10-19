@@ -1,15 +1,15 @@
 import { isIPv6 } from "node:net";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { getAccountById } from "../../core/accounts.js";
-import { getUpstream, JMAP_CORE, JMAP_MAIL } from "../../core/upstream/index.js";
+import { getUpstream, JMAP_CORE, JMAP_MAIL, UpstreamTooLargeError, type JmapResponse } from "../../core/upstream/index.js";
 import type { AppContext } from "../../types.js";
-import { openPreviewTicket } from "./preview-ticket.js";
+import { openPreviewTicket, relayKeyHash, sameKeyHash } from "./preview-ticket.js";
 import type { PushStats } from "./stats.js";
 import {
   deleteRelaySub,
   getRelaySub,
   PENDING_WINDOW_MS,
-  previewTargetAuthorized,
+  previewTicketTarget,
   registerRelaySub,
   relayActive,
 } from "./store.js";
@@ -76,6 +76,20 @@ export const PREVIEW_DEFAULT_PROPERTIES = [
 /** Largest body value a preview read asks for, and the largest answer it returns (JSON characters). */
 export const PREVIEW_MAX_BODY_VALUE_BYTES = 256_000;
 export const PREVIEW_MAX_RESPONSE_CHARS = 600_000;
+/** The most of the upstream's answer a preview read takes in (bytes on the wire); past it the read stops. */
+export const PREVIEW_MAX_UPSTREAM_BYTES = 1_000_000;
+/** Preview reads running at once per account; more get 429. */
+export const PREVIEW_MAX_INFLIGHT_PER_ACCOUNT = 2;
+
+/** The one Email/get answer of a preview read, or null when the upstream's answer is not shaped like one. */
+export function previewEmailList(res: unknown): unknown[] | null {
+  const responses = res && typeof res === "object" ? (res as Partial<JmapResponse>).methodResponses : undefined;
+  if (!Array.isArray(responses)) return null;
+  const g = responses.find((t: unknown) => Array.isArray(t) && t.length >= 3 && t[2] === "g") as unknown[] | undefined;
+  if (!g || g[0] !== "Email/get" || !g[1] || typeof g[1] !== "object") return null;
+  const list = (g[1] as { list?: unknown }).list;
+  return Array.isArray(list) ? list : null;
+}
 
 interface PreviewRequest {
   ticket: string;
@@ -191,6 +205,7 @@ export async function registerRelayRoutes(app: FastifyInstance, ctx: AppContext,
       // /api/push/preview has expired. The ticket in the body is the
       // capability; it never appears in a URL or a log line.
       const previewLimit = new RateLimiter(60);
+      const previewInflight = new Map<string, number>();
       r.post("/preview", { bodyLimit: BODY_LIMIT, onRequest: limited(previewLimit) }, async (req, reply) => {
         const started = Date.now();
         const done = (status: number, outcome: string, body: unknown) => {
@@ -198,18 +213,32 @@ export async function registerRelayRoutes(app: FastifyInstance, ctx: AppContext,
           ctx.log.info({ outcome, status, ms: Date.now() - started }, "push: preview ticket");
           return reply.code(status).header("cache-control", "no-store").send(body);
         };
+        const refused = () => done(403, "refused", { error: "Invalid or expired ticket" });
         const parsed = parsePreviewRequest(req.body);
         if (!parsed) return done(400, "bad_request", { error: "Invalid request" });
         const ticket = openPreviewTicket(ctx.config.encKey, parsed.ticket);
-        if (!ticket || !UUID_RE.test(ticket.accountId)) return done(403, "refused", { error: "Invalid or expired ticket" });
-        if (!(await previewTargetAuthorized(ctx.db, ticket.accountId, ticket.relayId, ctx.config.allowedEmails))) {
-          return done(403, "revoked", { error: "Invalid or expired ticket" });
+        if (!ticket || !UUID_RE.test(ticket.accountId)) return refused();
+        // The very subscription the push went out under, still deliverable, and
+        // the relay record still the one it was minted for.
+        const target = await previewTicketTarget(ctx.db, ticket, ctx.config.allowedEmails);
+        if (!target || !sameKeyHash(relayKeyHash(target), ticket.keyHash)) {
+          stats.inc("preview_ticket_revoked");
+          return refused();
         }
         const account = await getAccountById(ctx, ticket.accountId);
-        if (!account) return done(403, "revoked", { error: "Invalid or expired ticket" });
-        let res;
+        if (!account) return refused();
+        const running = previewInflight.get(account.id) ?? 0;
+        if (running >= PREVIEW_MAX_INFLIGHT_PER_ACCOUNT) return done(429, "busy", { error: "Too many requests" });
+        previewInflight.set(account.id, running + 1);
+        // A client that leaves stops the read.
+        const gone = new AbortController();
+        const onClose = () => {
+          if (!reply.raw.writableFinished) gone.abort();
+        };
+        reply.raw.once("close", onClose);
+        let list: unknown[] | null;
         try {
-          res = await getUpstream(ctx).jmap(
+          const res = await getUpstream(ctx).jmap(
             account,
             [[
               "Email/get",
@@ -225,13 +254,19 @@ export async function registerRelayRoutes(app: FastifyInstance, ctx: AppContext,
               "g",
             ]],
             [JMAP_CORE, JMAP_MAIL],
+            { maxResponseBytes: PREVIEW_MAX_UPSTREAM_BYTES, signal: gone.signal },
           );
+          list = previewEmailList(res);
         } catch (e) {
+          if (e instanceof UpstreamTooLargeError) return done(413, "too_large", { error: "Message too large" });
           ctx.log.warn({ err: (e as Error).message }, "push: preview ticket read failed");
           return done(502, "upstream_error", { error: "Mail server unavailable" });
+        } finally {
+          reply.raw.off("close", onClose);
+          const left = (previewInflight.get(account.id) ?? 1) - 1;
+          if (left > 0) previewInflight.set(account.id, left);
+          else previewInflight.delete(account.id);
         }
-        const g = res.methodResponses.find(([, , id]) => id === "g");
-        const list = g && g[0] === "Email/get" && Array.isArray((g[1] as { list?: unknown }).list) ? (g[1] as { list: unknown[] }).list : null;
         if (!list) return done(502, "upstream_error", { error: "Mail server unavailable" });
         const email = list.find((e) => !!e && typeof e === "object" && (e as { id?: unknown }).id === ticket.emailId);
         if (!email) return done(404, "not_found", { error: "Message not found" });

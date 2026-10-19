@@ -81,8 +81,8 @@ export interface Upstream {
   request(account: UpstreamAccount, req: UpstreamRequest): Promise<UpstreamResult>;
   /** The upstream's (unrewritten) session for `account`; cached briefly unless `fresh`. Throws `UpstreamCallError`. */
   session(account: UpstreamAccount, opts?: { fresh?: boolean }): Promise<JmapSession>;
-  /** POST JMAP method calls as `account` and parse the answer. Throws `UpstreamCallError`. */
-  jmap(account: UpstreamAccount, methodCalls: JmapMethodCall[], using?: string[]): Promise<JmapResponse>;
+  /** POST JMAP method calls as `account` and parse the answer. Throws `UpstreamCallError` (`UpstreamTooLargeError` past `opts.maxResponseBytes`). */
+  jmap(account: UpstreamAccount, methodCalls: JmapMethodCall[], using?: string[], opts?: JmapCallOptions): Promise<JmapResponse>;
   /** Capability URIs the upstream accepts in `using`. */
   knownCapabilities(account: UpstreamAccount): Promise<ReadonlySet<string>>;
   /** Before a non-replayable request: make sure the upstream still accepts the account. */
@@ -117,4 +117,20 @@ export class UpstreamCallError extends Error {
     super(message);
     this.name = "UpstreamCallError";
   }
+}
+
+/** The response body was larger than the caller's `maxResponseBytes`; no more of it was read. */
+export class UpstreamTooLargeError extends UpstreamCallError {
+  constructor(limit: number) {
+    super(`upstream response over ${limit} bytes`);
+    this.name = "UpstreamTooLargeError";
+  }
+}
+
+/** Options for one `Upstream.jmap` call. */
+export interface JmapCallOptions {
+  /** Read at most this many bytes of the response body; past it the call fails with `UpstreamTooLargeError`. */
+  maxResponseBytes?: number;
+  /** Abort the call (e.g. the client that asked for it went away). */
+  signal?: AbortSignal;
 }

@@ -83,7 +83,7 @@ describe("new-mail push to Apple's push service", () => {
     expect(apple!.notification).toEqual({
       title: "Examplepaja <info@examplepaja.test>",
       body: "Order confirmed\nThanks for your order, it ships tomorrow.",
-      navigate: `${PUBLIC}/mail/message/mail%2F1`,
+      navigate: expect.stringMatching(new RegExp(`^${PUBLIC}/mail/message/mail%2F1#sent=\\d{13}$`)),
       tag: `bulwark-mail:${d.legacyAccountId}`,
       silent: false,
       data: { kind: "email", emailId: "mail/1", accountId: d.legacyAccountId, headlineEmailId: "mail/1" },
@@ -116,7 +116,7 @@ describe("new-mail push to Apple's push service", () => {
     const [apple] = decrypt(d.iphone, "decl-0002-ios");
     expect(apple!.emailIds).toEqual(["b1", "b2"]);
     const note = apple!.notification as Record<string, string>;
-    expect(note.navigate).toBe(`${PUBLIC}/mail/message/b2`);
+    expect(note.navigate).toBe(`${PUBLIC}/mail/message/b2#sent=${apple!.sentAt}`);
     expect({ title: note.title, body: note.body }).toEqual(payloadNotificationText(apple!.email as PushPayload["email"]));
     expect(note.title).toBe("New mail");
     expect(note.body).toBe("Second");
@@ -131,6 +131,7 @@ describe("new-mail push to Apple's push service", () => {
     const apple = JSON.parse(d.iphone.decrypt(r.body)) as Record<string, unknown>;
     expect(Buffer.byteLength(JSON.stringify(apple))).toBeLessThanOrEqual(PAYLOAD_BUDGET_BYTES);
     expect(webkitDeclarativeError(apple)).toBeNull();
+    expect(apple.previewTicket, "the text shrinks, the ticket stays").toBeTruthy();
     expect((apple.notification as { title: string }).title.length).toBeGreaterThan(0);
   });
 
@@ -143,7 +144,8 @@ describe("new-mail push to Apple's push service", () => {
     expect(sent).toHaveLength(2);
     expect(sent[1]!.email).toBeUndefined();
     expect(webkitDeclarativeError(sent[1])).toBeNull();
-    expect(sent[1]!.notification).toMatchObject({ title: "New mail", body: "", navigate: `${PUBLIC}/mail/message/m413` });
+    expect(sent[1]!.notification).toMatchObject({ title: "New mail", body: "", navigate: `${PUBLIC}/mail/message/m413#sent=${sent[1]!.sentAt}` });
+    expect(sent[1]!.previewTicket, "the 413 fallback keeps its ticket").toBeTruthy();
   });
 
   it("is classic when PUSH_APPLE_DECLARATIVE=false", async () => {
@@ -172,6 +174,7 @@ describe("new-mail push to Apple's push service", () => {
     const m = declarativePayload(p, `${PUBLIC}/`);
     expect(webkitDeclarativeError(m)).toBeNull();
     expect(m.notification).toMatchObject({ title: "New mail", body: "", navigate: `${PUBLIC}/mail/message/x`, tag: "bulwark-mail:acc 1" });
+    expect(declarativePayload({ ...p, sentAt: 1_800_000_000_123 }, PUBLIC).notification.navigate).toBe(`${PUBLIC}/mail/message/x#sent=1800000000123`);
     expect(webkitDeclarativeError(declarativePayload({ ...p, emailIds: [] }, PUBLIC))).toBeNull();
   });
 });

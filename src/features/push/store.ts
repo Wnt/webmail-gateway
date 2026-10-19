@@ -349,6 +349,8 @@ export interface PushTarget {
   endpoint: string;
   p256dh: string;
   auth: string;
+  /** A deliverable emulated subscription of the account that points at the relay record (what authorizes this target). */
+  subId?: string;
 }
 
 /** The account is (still) in `ALLOWED_EMAILS` (`$n` is that list): removing it ends its pushes at once. */
@@ -356,43 +358,59 @@ const ALLOWED = (n: number) => `EXISTS (SELECT 1 FROM account ae WHERE ae.id = s
 
 /** Distinct endpoints that should get the account's EmailDelivery pushes. `allowed`: the configured allowlist. */
 export async function targetsForAccount(db: Queryable, accountId: string, allowed: readonly string[]): Promise<PushTarget[]> {
-  const { rows } = await db.query<{ relay_id: string; endpoint: string; p256dh: string; auth: string }>(
-    `SELECT DISTINCT ON (r.endpoint) r.relay_id, r.endpoint, r.p256dh, r.auth
+  const { rows } = await db.query<{ relay_id: string; endpoint: string; p256dh: string; auth: string; sub_id: string }>(
+    `SELECT DISTINCT ON (r.endpoint) r.relay_id, r.endpoint, r.p256dh, r.auth, s.id AS sub_id
        FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
       WHERE s.account_id = $1 AND ${DELIVERABLE} AND ${ALLOWED(2)} AND r.gone_at IS NULL
         AND (s.types IS NULL OR 'EmailDelivery' = ANY (s.types))
-      ORDER BY r.endpoint, r.updated_at DESC`,
+      ORDER BY r.endpoint, r.updated_at DESC, s.created_at DESC`,
     [accountId, [...allowed]],
   );
-  return rows.map((r) => ({ accountId, relayId: r.relay_id, endpoint: r.endpoint, p256dh: r.p256dh, auth: r.auth }));
+  return rows.map((r) => ({ accountId, relayId: r.relay_id, endpoint: r.endpoint, p256dh: r.p256dh, auth: r.auth, subId: r.sub_id }));
 }
 
 /** Is `target` still a recipient (and its account still allowlisted)? Checked before every send attempt, retries included. */
+/**
+ * Before every send attempt: the target is still what it was when the push
+ * was queued. A deliverable, authorized EmailDelivery subscription of the
+ * account still points at the relay record, and that record still exists,
+ * is not gone and has the same endpoint and keys (a deleted or re-registered
+ * record is a revocation of what was queued for it).
+ */
 export async function targetStillAuthorized(db: Queryable, target: PushTarget, allowed: readonly string[]): Promise<boolean> {
   const { rows } = await db.query(
-    `SELECT 1 FROM push_jmap_sub s WHERE s.account_id = $1 AND s.relay_id = $2 AND ${DELIVERABLE} AND ${ALLOWED(3)} LIMIT 1`,
-    [target.accountId, target.relayId, [...allowed]],
+    `SELECT 1 FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
+      WHERE s.account_id = $1 AND s.relay_id = $2 AND r.gone_at IS NULL
+        AND r.endpoint = $4 AND r.p256dh = $5 AND r.auth = $6
+        AND (s.types IS NULL OR 'EmailDelivery' = ANY (s.types))
+        AND ${DELIVERABLE} AND ${ALLOWED(3)} LIMIT 1`,
+    [target.accountId, target.relayId, [...allowed], target.endpoint, target.p256dh, target.auth],
   );
   return rows.length > 0;
 }
 
 /**
- * A preview ticket's push target (preview-ticket.ts) can still use it: the
- * relay record exists and is not gone, and a deliverable subscription of
- * the account (verified, unexpired, authorized: see AUTHORIZED) points at it.
+ * A preview ticket (preview-ticket.ts) can still be used: the very
+ * subscription it was minted under is still deliverable, authorized and an
+ * EmailDelivery subscription of the account, it still points at the relay
+ * record, and that record is not gone. Returns the record's endpoint and
+ * keys (the caller checks they are the ones the ticket was minted for), or
+ * null. A new subscription or grant on the same relay id never revives an
+ * older ticket.
  */
-export async function previewTargetAuthorized(
+export async function previewTicketTarget(
   db: Queryable,
-  accountId: string,
-  relayId: string,
+  t: { accountId: string; relayId: string; subId: string },
   allowed: readonly string[],
-): Promise<boolean> {
-  const { rows } = await db.query(
-    `SELECT 1 FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
-      WHERE s.account_id = $1 AND s.relay_id = $2 AND r.gone_at IS NULL AND ${DELIVERABLE} AND ${ALLOWED(3)} LIMIT 1`,
-    [accountId, relayId, [...allowed]],
+): Promise<{ endpoint: string; p256dh: string; auth: string } | null> {
+  const { rows } = await db.query<{ endpoint: string; p256dh: string; auth: string }>(
+    `SELECT r.endpoint, r.p256dh, r.auth FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
+      WHERE s.id = $1 AND s.account_id = $2 AND s.relay_id = $3 AND r.gone_at IS NULL
+        AND (s.types IS NULL OR 'EmailDelivery' = ANY (s.types))
+        AND ${DELIVERABLE} AND ${ALLOWED(4)} LIMIT 1`,
+    [t.subId, t.accountId, t.relayId, [...allowed]],
   );
-  return rows.length > 0;
+  return rows[0] ?? null;
 }
 
 // -------------------------------------------------------------- upstream subscription

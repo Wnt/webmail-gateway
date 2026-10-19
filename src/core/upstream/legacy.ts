@@ -7,6 +7,7 @@ import { getGandiPassword, setGandiPassword } from "../accounts.js";
 import {
   LEGACY_TOKEN_TTL_SEC,
   LegacyError,
+  LegacyTooLargeError,
   legacyFetch,
   legacyJmap,
   mintLegacyToken,
@@ -19,6 +20,8 @@ import {
   JMAP_CORE,
   JMAP_MAIL,
   UpstreamCallError,
+  UpstreamTooLargeError,
+  type JmapCallOptions,
   type JmapMethodCall,
   type JmapResponse,
   type JmapSession,
@@ -159,10 +162,11 @@ export class LegacyUpstream implements Upstream {
     return s;
   }
 
-  async jmap(account: UpstreamAccount, methodCalls: JmapMethodCall[], using: string[] = [JMAP_CORE, JMAP_MAIL]): Promise<JmapResponse> {
+  async jmap(account: UpstreamAccount, methodCalls: JmapMethodCall[], using: string[] = [JMAP_CORE, JMAP_MAIL], opts: JmapCallOptions = {}): Promise<JmapResponse> {
     try {
-      return await legacyJmap(this.ctx, account, methodCalls, using);
+      return await legacyJmap(this.ctx, account, methodCalls, using, opts);
     } catch (err) {
+      if (err instanceof LegacyTooLargeError) throw new UpstreamTooLargeError(err.limit);
       if (err instanceof LegacyError) throw new UpstreamCallError(err.message, err.status);
       throw err;
     }

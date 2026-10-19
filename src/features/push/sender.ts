@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import webpush from "web-push";
 import type { AppContext } from "../../types.js";
 import { declarativePayload, fitPayload, minimalPayload, PAYLOAD_BUDGET_BYTES, type PushPayload } from "./payload.js";
-import { mintPreviewTicket } from "./preview-ticket.js";
+import { mintPreviewTicket, relayKeyHash } from "./preview-ticket.js";
 import { safeHost } from "./relay-routes.js";
 import type { PushStats } from "./stats.js";
 import { recordRelayResult, targetStillAuthorized, type PushTarget, type SendOutcome } from "./store.js";
@@ -112,10 +112,11 @@ export class Sender {
 
   /**
    * What one device gets: the payload with its send time and, when enabled,
-   * a preview ticket minted for this device (preview-ticket.ts); for an
-   * Apple endpoint a new-mail push becomes a Declarative Web Push message
-   * (payload.ts). The text is shrunk to fit what is really sent; the ticket
-   * goes in only when it still fits, so it never costs the notification text.
+   * a preview ticket minted for this device and the subscription that
+   * authorized it (preview-ticket.ts); for an Apple endpoint a new-mail push
+   * becomes a Declarative Web Push message (payload.ts). The ticket is
+   * reserved first and the text shrunk around it, so every push carries one
+   * (the 413 fallback too: it is rebuilt from the minimal payload).
    */
   bodyFor(target: PushTarget, payload: PushPayload, now = Date.now()): PushPayload {
     const cfg = this.ctx.config.push;
@@ -123,21 +124,23 @@ export class Sender {
     const wrap = declarative
       ? (q: PushPayload): PushPayload => declarativePayload(q, this.ctx.config.publicBaseUrl)
       : (q: PushPayload): PushPayload => q;
-    let p = fitPayload({ ...payload, sentAt: now }, PAYLOAD_BUDGET_BYTES, wrap);
-    const emailId = p.emailIds[p.emailIds.length - 1];
-    if (cfg.previewTickets && emailId) {
-      const withTicket: PushPayload = {
-        ...p,
-        previewTicket: mintPreviewTicket(
+    const emailId = payload.emailIds[payload.emailIds.length - 1];
+    const previewTicket = cfg.previewTickets && emailId && target.subId
+      ? mintPreviewTicket(
           this.ctx.config.encKey,
-          { accountId: target.accountId, relayId: target.relayId, legacyAccountId: p.accountId, emailId },
+          {
+            accountId: target.accountId,
+            relayId: target.relayId,
+            subId: target.subId,
+            keyHash: relayKeyHash(target),
+            legacyAccountId: payload.accountId,
+            emailId,
+          },
           now,
-        ),
-      };
-      if (Buffer.byteLength(JSON.stringify(wrap(withTicket)), "utf8") <= PAYLOAD_BUDGET_BYTES) p = withTicket;
-      else this.stats.inc("push_ticket_dropped");
-    }
-    return wrap(p);
+        )
+      : undefined;
+    const { previewTicket: _stale, ...rest } = payload;
+    return wrap(fitPayload({ ...rest, sentAt: now, ...(previewTicket ? { previewTicket } : {}) }, PAYLOAD_BUDGET_BYTES, wrap));
   }
 
   private async done(target: PushTarget, outcome: SendOutcome, counter: string): Promise<SendOutcome> {

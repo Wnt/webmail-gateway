@@ -23,6 +23,13 @@ export interface JmapResponse {
   [k: string]: unknown;
 }
 
+export class LegacyTooLargeError extends Error {
+  constructor(readonly limit: number) {
+    super(`legacy-proxy response over ${limit} bytes`);
+    this.name = "LegacyTooLargeError";
+  }
+}
+
 export class LegacyError extends Error {
   constructor(
     message: string,
@@ -145,14 +152,16 @@ export async function legacyJmap(
   account: LegacyAccount,
   methodCalls: JmapMethodCall[],
   using: string[] = [JMAP_CORE, JMAP_MAIL],
+  opts: { maxResponseBytes?: number; signal?: AbortSignal } = {},
 ): Promise<JmapResponse> {
   let res: Response;
+  const timeout = AbortSignal.timeout(JMAP_TIMEOUT_MS);
   try {
     res = await legacyFetch(ctx, account, "/jmap", {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify({ using, methodCalls }),
-      signal: AbortSignal.timeout(JMAP_TIMEOUT_MS),
+      signal: opts.signal ? AbortSignal.any([timeout, opts.signal]) : timeout,
     });
   } catch (err) {
     throw new LegacyError(`legacy-proxy request failed: ${(err as Error).message}`);
@@ -161,9 +170,41 @@ export async function legacyJmap(
     await discard(res);
     throw new LegacyError(`legacy-proxy answered ${res.status}`, res.status);
   }
+  if (opts.maxResponseBytes !== undefined) {
+    const text = await readCapped(res, opts.maxResponseBytes);
+    try {
+      return JSON.parse(text) as JmapResponse;
+    } catch {
+      throw new LegacyError("legacy-proxy returned a non-JSON body", res.status);
+    }
+  }
   try {
     return (await res.json()) as JmapResponse;
   } catch {
     throw new LegacyError("legacy-proxy returned a non-JSON body", res.status);
   }
+}
+
+/** The body as text, reading no more than `max` bytes; past that, `LegacyTooLargeError`. */
+async function readCapped(res: Response, max: number): Promise<string> {
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > max) {
+    await discard(res);
+    throw new LegacyTooLargeError(max);
+  }
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => undefined);
+      throw new LegacyTooLargeError(max);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
