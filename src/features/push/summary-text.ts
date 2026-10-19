@@ -162,12 +162,72 @@ const TAG_NAME = /^(\/?)(\w+)/;
  * tag is read up to its `>`, and each search for a closing tag either moves
  * the scan past it or is remembered as having found none.
  */
-export function htmlToText(html: string, opts: { keepQuotes?: boolean } = {}): string {
+export function htmlToText(html: string, opts: HtmlToTextOptions = {}): string {
+  return htmlToTextRead(html, opts).text;
+}
+
+/** What `exclude` says about an element: leave it out with its content, leave out everything from it on, or read it. */
+export type HtmlExclusion = "element" | "rest" | null;
+
+export interface HtmlToTextOptions {
+  keepQuotes?: boolean;
+  /**
+   * Leave elements out by their name and attributes (the one-time-code
+   * reader: hidden and quoted parts). An element left out is skipped with all
+   * of its content, nested elements of the same name counted; one never
+   * closed takes the rest with it.
+   */
+  exclude?: (tag: string, attr: (name: string) => string | null) => HtmlExclusion;
+}
+
+/** Elements without content (no closing tag). */
+const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+
+/** The attributes of a tag (the text between its name and its `>`), read once from left to right. */
+function tagAttributes(t: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const n = t.length;
+  let i = 0;
+  while (i < n) {
+    while (i < n && (/\s/.test(t.charAt(i)) || t.charAt(i) === "/")) i++;
+    let j = i;
+    while (j < n && !/[\s=/]/.test(t.charAt(j))) j++;
+    if (j === i) {
+      i++;
+      continue;
+    }
+    const name = t.slice(i, j).toLowerCase();
+    i = j;
+    while (i < n && /\s/.test(t.charAt(i))) i++;
+    let value = "";
+    if (t.charAt(i) === "=") {
+      i++;
+      while (i < n && /\s/.test(t.charAt(i))) i++;
+      const quote = t.charAt(i);
+      if (quote === '"' || quote === "'") {
+        const close = t.indexOf(quote, i + 1);
+        value = t.slice(i + 1, close < 0 ? n : close);
+        i = close < 0 ? n : close + 1;
+      } else {
+        let k = i;
+        while (k < n && !/\s/.test(t.charAt(k))) k++;
+        value = t.slice(i, k);
+        i = k;
+      }
+    }
+    if (!out.has(name)) out.set(name, value);
+  }
+  return out;
+}
+
+/** `htmlToText`, and whether an `exclude` verdict of "rest" ended it (the text left is then complete). */
+export function htmlToTextRead(html: string, opts: HtmlToTextOptions = {}): { text: string; stopped: boolean } {
   let s = html.length > MAX_HTML_CHARS ? html.slice(0, MAX_HTML_CHARS) : html;
   const q = opts.keepQuotes ? null : HTML_QUOTE_START.exec(s);
   if (q) s = s.slice(0, q.index);
   const out: string[] = [];
   const unclosed = new Set<string>();
+  let stopped = false;
   /** End of the first `</name\s*>` at or after `from`, or -1 (then never searched for again). */
   const closing = (name: string, from: number): number => {
     if (unclosed.has(name)) return -1;
@@ -179,6 +239,18 @@ export function htmlToText(html: string, opts: { keepQuotes?: boolean } = {}): s
       return -1;
     }
     return m.index + m[0].length;
+  };
+  /** End of the element opened just before `from`, nested ones of the same name counted, or -1. */
+  const elementEnd = (name: string, from: number): number => {
+    const re = new RegExp(`<(\\/?)${name}\\b[^<>]*>`, "gi");
+    re.lastIndex = from;
+    let depth = 1;
+    for (let m = re.exec(s); m; m = re.exec(s)) {
+      if (m[1]) {
+        if (--depth === 0) return m.index + m[0].length;
+      } else if (!m[0].endsWith("/>")) depth++;
+    }
+    return -1;
   };
   let i = 0;
   while (i < s.length) {
@@ -211,6 +283,26 @@ export function htmlToText(html: string, opts: { keepQuotes?: boolean } = {}): s
     const gt = s.indexOf(">", lt + 1);
     // A tag cut off at the end (a value cut at maxBodyValueBytes) is not text.
     if (gt < 0) break;
+    if (name && opts.exclude) {
+      const attrs = tagAttributes(s.slice(lt + 1 + name.length, gt));
+      const verdict = opts.exclude(name, (a) => attrs.get(a) ?? null);
+      if (verdict === "rest") {
+        stopped = true;
+        break;
+      }
+      if (verdict === "element") {
+        if (VOID.has(name) || s.charAt(gt - 1) === "/") {
+          i = gt + 1;
+          continue;
+        }
+        const end = elementEnd(name, gt + 1);
+        // Never closed: the rest is inside it.
+        if (end < 0) break;
+        out.push(" ");
+        i = end;
+        continue;
+      }
+    }
     if (name === "blockquote" && !opts.keepQuotes) {
       const end = closing(name, lt + 1 + name.length);
       if (end >= 0) {
@@ -225,7 +317,7 @@ export function htmlToText(html: string, opts: { keepQuotes?: boolean } = {}): s
     else if (CELL.has(tag)) out.push(" ");
     i = gt + 1;
   }
-  return decodeEntities(out.join(""));
+  return { text: decodeEntities(out.join("")), stopped };
 }
 
 /** "On <date>, <name> wrote:" and its translations (Finnish clients: "<date> <name> kirjoitti:"). */

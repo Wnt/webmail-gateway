@@ -1,4 +1,4 @@
-import { htmlToText, type EmailBody } from "./summary-text.js";
+import { htmlToTextRead, type EmailBody } from "./summary-text.js";
 
 /**
  * Finds the one-time code in a sign-in or confirmation mail ("Your
@@ -179,6 +179,8 @@ const LOWERCASE_HEX = /^[0-9a-f-]+$/;
 const LINKED_BY = /(?::|=|(?<!\p{L})(?:is|lautet|ist|est|es|è|é|är|er|jest|je))\s*$/iu;
 
 const LETTER = /\p{L}/u;
+// How far after a candidate promotion words disqualify it.
+const PROMO_AFTER = 40;
 
 /** Text around a candidate, not starting or ending inside a word, so that
  *  "off" cut from "offiziellen" does not read as a word of its own. */
@@ -218,7 +220,7 @@ function scoreCandidate(text: string, raw: string, start: number, keywords: Span
     return null;
   }
   if (LABELLED_AS_OTHER.test(before)) return null;
-  if (PROMO_WORDS.test(contextWindow(text, start - 60, end + 40))) return null;
+  if (PROMO_WORDS.test(contextWindow(text, start - 60, end + PROMO_AFTER))) return null;
 
   let best = Infinity;
   let bestAfter = Infinity;
@@ -295,52 +297,74 @@ function flatten(text: string): string {
     .replace(/ ?\n[\s]*/g, '\n');
 }
 
-// A text that was cut (at a cap here, or by whoever produced it) may have
-// been cut through a code, or through the text after it that decides whether
-// it is one. So no candidate ending within CUT_GUARD characters of the cut is
-// offered: 80 is above the longest candidate span (35, four hyphenated groups
-// of 8, "AAAAAAAA-BBBBBBBB-CCCCCCCC-DDDDDDDD"; spaced digits span at most 19,
-// "1 2 3 4 5 6 7 8 9 0") plus the most text a candidate is judged by after
-// it (64 for the glued-digit walk; 40 for promotion words, 8 for a next
-// group of digits). A code never comes back as a fragment of itself.
-const CUT_GUARD = 80;
+// A text that was cut (at a cap here, or by whoever produced it) may have been
+// cut through a code, or through the text after it that decides whether it is
+// one. A candidate is offered only when the whole text could not have read it
+// otherwise, i.e. it ends at least PROMO_AFTER (40) visible characters before
+// the cut:
+// - any character after the cut could be a "%" or a promotion word inside the
+//   40-character window scoreCandidate reads after a candidate, so that window
+//   is the bound (it cannot be narrower and stay exact);
+// - it covers everything shorter: a code's possible continuation (at most 33
+//   characters more: hyphen groups up to "AAAAAAAA-BBBBBBBB-CCCCCCCC-DDDDDDDD",
+//   35 in all, spaced digits up to 19) and the next-group, date and amount
+//   checks (8 characters after it);
+// - digits glued into a word that reaches the cut never get here: the word the
+//   cut went through is dropped, and with it the digits in it.
+// So a code never comes back as a fragment of itself, nor as one the whole text
+// would refuse.
 
 /**
- * The text a cut input is read as, and the last end a candidate may have:
- * CUT_GUARD before the cut point (measured where the cut was, not where the
- * dropped half word began, so a code far from a long cut word still counts).
- * The text then ends with " …", so nothing reads the cut as the end of a
- * line.
+ * The text a cut input is read as, where each of its positions is in the
+ * flattened input (`lead`), and where the visible text ends there (before
+ * the closing ellipsis: ours, or the sender's). The text then ends with
+ * " …", so nothing reads the cut as the end of a line.
  */
-function readCut(rawText: string): { text: string; lastEnd: number } {
+function readCut(rawText: string): { text: string; lead: number; visibleEnd: number } {
   const flat = flatten(rawText);
   const kept = withoutCutWord(flat);
   const lead = kept.length - kept.trimStart().length;
   const text = kept.trim();
-  return { text: text ? `${text} …` : '', lastEnd: flat.length - lead - CUT_GUARD };
+  let visibleEnd = flat.length;
+  while (visibleEnd > 0 && SPACE.test(flat.charAt(visibleEnd - 1))) visibleEnd--;
+  if (flat.endsWith('...', visibleEnd)) visibleEnd -= 3;
+  else if (flat.endsWith('…', visibleEnd)) visibleEnd -= 1;
+  return { text: text ? `${text} …` : '', lead, visibleEnd };
 }
 
-function bestCandidate(rawText: string, cut = false): Candidate | null {
-  const { text, lastEnd } = cut ? readCut(rawText) : { text: normalize(rawText), lastEnd: Infinity };
+// In a body, two different codes about as plausible as each other (scores
+// within this; a score is roughly the distance to the code word, minus 15 for
+// "is:" and 15 for a line of its own) give no code: a wrong one is worse.
+const DISAGREE_MARGIN = 10;
+
+function bestCandidate(rawText: string, cut = false, unique = false): Candidate | null {
+  const read = cut ? readCut(rawText) : { text: normalize(rawText), lead: 0, visibleEnd: Infinity };
+  const text = read.text;
   if (!text) return null;
   const keywords = findCodeWords(text);
   if (!keywords.some((list) => list.length)) return null;
 
   let best: Candidate | null = null;
+  const byCode = new Map<string, number>();
   for (const re of [CANDIDATE, GLUED_DIGITS]) {
     for (const match of text.matchAll(re)) {
-      if (match.index! + match[0].length > lastEnd) continue;
+      if (read.visibleEnd - (match.index! + match[0].length + read.lead) < PROMO_AFTER) continue;
       if (re === GLUED_DIGITS && !gluedToWords(text, match.index!, match.index! + match[0].length)) continue;
       const candidate = scoreCandidate(text, match[0], match.index!, keywords);
-      if (candidate && (!best || candidate.score < best.score)) best = candidate;
+      if (!candidate) continue;
+      byCode.set(candidate.code, Math.min(byCode.get(candidate.code) ?? Infinity, candidate.score));
+      if (!best || candidate.score < best.score) best = candidate;
     }
+  }
+  if (best && unique) {
+    for (const [code, score] of byCode) if (code !== best.code && score <= best.score + DISAGREE_MARGIN) return null;
   }
   return best;
 }
 
 // A code sits near the top: longer input is cut, which also bounds the work
 // on hostile mail. A cut text loses the word the cut went through (as a
-// preview cut off with "..." does) and the CUT_GUARD tail.
+// preview cut off with "..." does) and offers no code near the cut.
 export const MAX_SUBJECT_CHARS = 1_000;
 export const MAX_PREVIEW_CHARS = 1_000;
 export const MAX_BODY_CHARS = 20_000;
@@ -385,9 +409,86 @@ function capped(text: string | null | undefined, max: number, mayBeCut = false):
   return { text: cut ? `${t}…` : t, cut };
 }
 
-function cappedCandidate(text: string | null | undefined, max: number, mayBeCut = false): Candidate | null {
+function cappedCandidate(text: string | null | undefined, max: number, mayBeCut = false, unique = false): Candidate | null {
   const c = capped(text, max, mayBeCut);
-  return bestCandidate(c.text, c.cut);
+  return bestCandidate(c.text, c.cut, unique);
+}
+
+// ---- What a reader of the body sees: both body readers (Bulwark's and
+// ---- webmail-gateway's) leave out the same hidden and quoted parts.
+
+const ZERO_LENGTH = /^[+-]?(?:0+(?:\.0*)?|\.0+)(?:[a-z]{1,4}|%)?$/;
+const ZERO_SIZE_PROPS = new Set(['font-size', 'width', 'height', 'max-width', 'max-height']);
+
+/** An inline style that hides its element: display:none, visibility:hidden, mso-hide:all, no size, no opacity. */
+export function hiddenByStyle(style: string): boolean {
+  for (const declaration of style.toLowerCase().split(';')) {
+    const colon = declaration.indexOf(':');
+    if (colon < 0) continue;
+    const prop = declaration.slice(0, colon).trim();
+    const value = declaration.slice(colon + 1).replace('!important', '').trim();
+    if (prop === 'display' && value === 'none') return true;
+    if (prop === 'visibility' && (value === 'hidden' || value === 'collapse')) return true;
+    if (prop === 'mso-hide' && value === 'all') return true;
+    if (prop === 'opacity' && /^0*(?:\.0*)?$/.test(value) && value !== '') return true;
+    if (ZERO_SIZE_PROPS.has(prop) && ZERO_LENGTH.test(value)) return true;
+  }
+  return false;
+}
+
+/** Where an earlier message starts in common clients' HTML: everything from it on is prior correspondence. */
+const QUOTE_START_IDS = new Set(['divrplyfwdmsg', 'appendonsend', 'mail-editor-reference-message-container', 'stopspelling']);
+const QUOTE_START_CLASSES = ['gmail_quote', 'yahoo_quoted', 'moz-cite-prefix'];
+
+/**
+ * What the code reader does with an element: leave it and its content out
+ * ('element': hidden, or a quote), leave out everything from it on ('rest':
+ * the start of prior correspondence), or read it (null). `attr` gives an
+ * attribute's value, or null when it is absent.
+ */
+export function excludedElement(tagName: string, attr: (name: string) => string | null): 'element' | 'rest' | null {
+  const id = (attr('id') ?? '').trim().toLowerCase();
+  if (QUOTE_START_IDS.has(id)) return 'rest';
+  const classes = ` ${(attr('class') ?? '').toLowerCase().replace(/\s+/g, ' ')} `;
+  if (QUOTE_START_CLASSES.some((c) => classes.includes(` ${c} `))) return 'rest';
+  if (tagName.toLowerCase() === 'blockquote' || (attr('type') ?? '').trim().toLowerCase() === 'cite') return 'element';
+  if (attr('hidden') !== null || (attr('aria-hidden') ?? '').trim().toLowerCase() === 'true') return 'element';
+  const style = attr('style');
+  return style && hiddenByStyle(style) ? 'element' : null;
+}
+
+/** "On <date>, <name> wrote:" and its translations (Finnish clients: "<date> <name> kirjoitti:"). */
+const ATTRIBUTION =
+  /^(?:(?:On|Am|Le|El|Il|Op|Den|Dne)\s.{3,300}\s(?:wrote|schrieb|a écrit|escribió|ha scritto|schreef|skrev|napsal)|.{3,300}\s(?:kirjoitti|skrev))\s*:?\s*$/i;
+const QUOTE_SEPARATOR =
+  /^(?:-{2,}\s*(?:Original Message|Forwarded message|Alkuperäinen viesti|Välitetty viesti|Ursprüngliche Nachricht|Weitergeleitete Nachricht|Message d'origine|Message transféré)\s*-{2,}|_{20,})\s*$/i;
+const HEADER_FROM = /^\*?(?:From|Lähettäjä|Från|Von|De)\s*:\*?\s+\S/i;
+const HEADER_NEXT = /^\*?(?:Sent|Date|To|Subject|Lähetetty|Päivämäärä|Vastaanottaja|Aihe|Skickat|Gesendet|Envoyé)\s*:/i;
+
+/**
+ * Plain text without prior correspondence: lines quoted with ">", and
+ * everything from an "On … wrote:" line, an "-----Original Message-----" or
+ * forwarded-message separator, or an Outlook "From: … / Sent: …" block on.
+ * `quoteCut` says the text ended there. Line by line, each test anchored and
+ * bounded, so linear in the text.
+ */
+export function withoutQuotedText(text: string): { text: string; quoteCut: boolean } {
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!.trim();
+    const next = i + 1 < lines.length ? lines[i + 1]!.trim() : '';
+    const startsQuote =
+      QUOTE_SEPARATOR.test(line) ||
+      ATTRIBUTION.test(line) ||
+      // an attribution wrapped over two lines: "On Mon, 12 Oct 2026 at 10:00, Alice" / "<a@b> wrote:"
+      (/^(?:On|Am|Le)\s/i.test(line) && ATTRIBUTION.test(`${line} ${next}`)) ||
+      // an Outlook header block: "From: ..." followed by "Sent:/Date:/To:" within three lines
+      (HEADER_FROM.test(line) && lines.slice(i + 1, i + 4).some((l) => HEADER_NEXT.test(l.trim())));
+    if (startsQuote) return { text: out.join('\n'), quoteCut: true };
+    if (!line.startsWith('>')) out.push(lines[i]!);
+  }
+  return { text: out.join('\n'), quoteCut: false };
 }
 
 /**
@@ -397,19 +498,23 @@ function cappedCandidate(text: string | null | undefined, max: number, mayBeCut 
  * also tend to repeat it next to unrelated numbers in the body. Wherever a
  * text was, or may have been, cut (a cap, a CUT_MARK, a closing "..." or
  * "…", a preview of PREVIEW_MAY_BE_CUT characters or more), no code is
- * offered near the cut: the body then has to show it whole.
+ * offered near the cut: the body then has to show it whole. A body with two
+ * different, about equally plausible codes gives none. The body readers
+ * leave out hidden and quoted text (excludedElement, withoutQuotedText).
  */
 export function findVerificationCode(
   subject: string | null | undefined,
   text: string | null | undefined,
   source: 'preview' | 'body' = 'body',
 ): string | null {
+  const preview = source === 'preview';
   return (
     cappedCandidate(subject, MAX_SUBJECT_CHARS)?.code ??
     cappedCandidate(
       text,
-      source === 'preview' ? MAX_PREVIEW_CHARS : MAX_BODY_CHARS,
-      source === 'preview' && (text ?? '').length >= PREVIEW_MAY_BE_CUT,
+      preview ? MAX_PREVIEW_CHARS : MAX_BODY_CHARS,
+      preview && (text ?? '').length >= PREVIEW_MAY_BE_CUT,
+      !preview,
     )?.code ??
     null
   );
@@ -434,22 +539,31 @@ const MAX_BODY_HTML = 200_000;
 /**
  * The texts of a message body to look for its code in, best first: the HTML
  * part as text (stylesheets, scripts and comments dropped, table cells kept
- * apart, quoted text kept), then the plain-text part. Parts flagged with an
- * encoding problem are skipped. A text cut on the way (the server's
- * truncated value, the HTML or text cap) ends with CUT_MARK, so the cut is
- * known to the detector even when the text left is short (a large <style>
- * before the cut).
+ * apart), then the plain-text part, each as its reader sees it: hidden
+ * elements and prior correspondence (quotes, forwarded or replied-to
+ * messages) are left out (excludedElement, withoutQuotedText), so a hidden
+ * or older code is never offered. Parts flagged with an encoding problem
+ * are skipped. A text cut on the way (the server's truncated value, the
+ * HTML or text cap) ends with CUT_MARK, so the cut is known to the detector
+ * even when the text left is short (a large <style> before the cut); one
+ * that ends where prior correspondence starts is complete.
  */
 export function verificationCodeBodyTexts(body: EmailBody): string[] {
   const out: string[] = [];
   const html = body.html.find((p) => p.type === "text/html" && p.value && !p.isEncodingProblem);
   if (html) {
     const cutHtml = html.isTruncated === true || html.value.length > MAX_BODY_HTML;
-    const text = htmlToText(html.value.slice(0, MAX_BODY_HTML), { keepQuotes: true });
-    out.push(markCut(text.slice(0, MAX_BODY_CHARS), cutHtml || text.length > MAX_BODY_CHARS));
+    const read = htmlToTextRead(html.value.slice(0, MAX_BODY_HTML), { keepQuotes: true, exclude: excludedElement });
+    const visible = withoutQuotedText(read.text);
+    const complete = read.stopped || visible.quoteCut;
+    out.push(markCut(visible.text.slice(0, MAX_BODY_CHARS), !complete && (cutHtml || visible.text.length > MAX_BODY_CHARS)));
   }
   const text = body.text.find((p) => p.type === "text/plain" && p.value && !p.isEncodingProblem);
-  if (text) out.push(markCut(text.value.slice(0, MAX_BODY_CHARS), text.isTruncated === true || text.value.length > MAX_BODY_CHARS));
+  if (text) {
+    const cut = text.isTruncated === true || text.value.length > MAX_BODY_CHARS;
+    const visible = withoutQuotedText(text.value.slice(0, MAX_BODY_CHARS));
+    out.push(markCut(visible.text, cut && !visible.quoteCut));
+  }
   return out;
 }
 

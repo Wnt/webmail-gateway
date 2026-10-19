@@ -1,0 +1,21 @@
+[
+  {"name": "a hidden code before the visible one (display:none)", "subject": "Sign in", "html": "<div style=\"display:none\">Your verification code is 123456.</div><p>Your verification code is 654321.</p>", "text": null, "code": "654321"},
+  {"name": "an older code in a quote below an ordinary reply", "subject": "Re: your order", "html": "<p>Thanks, see you on Friday.</p><blockquote>Your verification code is 123456.</blockquote>", "text": null, "code": null},
+  {"name": "a fresh code above an older quoted one", "subject": "Re: Sign in", "html": "<p>Your new verification code is 654321.</p><blockquote type=\"cite\">Your verification code was 123456.</blockquote>", "text": null, "code": "654321"},
+  {"name": "a hidden span inside the visible sentence", "subject": "Sign in", "html": "<p>Your verification code is <span style=\"display: none !important\">999999 or </span>482913.</p>", "text": null, "code": "482913"},
+  {"name": "a preheader hidden with mso-hide and zero size", "subject": "Sign in", "html": "<span style=\"mso-hide:all;font-size:0;max-height:0;overflow:hidden\">Your code is 111111</span><p>Your code is 482913</p>", "text": null, "code": "482913"},
+  {"name": "a code only in a hidden preheader", "subject": "Sign in", "html": "<div hidden>Your code is 482913</div><p>Open the app to continue.</p>", "text": null, "code": null},
+  {"name": "a code only in an aria-hidden element", "subject": "Sign in", "html": "<div aria-hidden=\"true\">Your code is 482913</div><p>Open the app to continue.</p>", "text": null, "code": null},
+  {"name": "visibility:hidden and opacity:0 are hidden too", "subject": "Sign in", "html": "<p style=\"visibility:hidden\">Your code is 111111</p><p style=\"opacity:0\">Your code is 222222</p><p>Your code is 482913</p>", "text": null, "code": "482913"},
+  {"name": "a nested hidden block with a visible-looking child", "subject": "Sign in", "html": "<div style=\"display:none\"><div><p>Your code is 111111</p></div></div><p>Your code is 482913</p>", "text": null, "code": "482913"},
+  {"name": "a Gmail quote of an earlier code", "subject": "Re: Sign in", "html": "<div dir=\"ltr\">Thanks!</div><div class=\"gmail_quote\"><div>On Mon, 19 Oct 2026 Examplepaja wrote:</div><div>Your code is 123456</div></div>", "text": null, "code": null},
+  {"name": "an Outlook reply header and an earlier code", "subject": "RE: Sign in", "html": "<div>Thanks, it worked.</div><div id=\"divRplyFwdMsg\"><b>From:</b> Examplepaja</div><div>Your code is 123456</div>", "text": null, "code": null},
+  {"name": "an Apple Mail attribution line before a quoted code", "subject": "Re: Sign in", "html": "<div>Done.</div><div>On 19 Oct 2026, at 10.00, Examplepaja &lt;info@examplepaja.test&gt; wrote:</div><blockquote type=\"cite\"><div>Your code is 123456</div></blockquote>", "text": null, "code": null},
+  {"name": "a quoted plain-text reply with an earlier code", "subject": "Re: Sign in", "html": null, "text": "Thanks, it worked.\n\n> Your verification code is 123456.\n> It expires in 10 minutes.", "code": null},
+  {"name": "a plain-text attribution line and an earlier code after it", "subject": "Re: Sign in", "html": null, "text": "Thanks!\n\nOn Mon, 19 Oct 2026 at 10:00, Examplepaja <info@examplepaja.test> wrote:\nYour verification code is 123456.", "code": null},
+  {"name": "a forwarded message with a code", "subject": "Fwd: Sign in", "html": null, "text": "See below.\n\n---------- Forwarded message ---------\nFrom: Examplepaja <info@examplepaja.test>\nYour verification code is 123456.", "code": null},
+  {"name": "an original-message block with a code", "subject": "RE: Sign in", "html": null, "text": "Got it.\n\n-----Original Message-----\nFrom: Examplepaja\nYour verification code is 123456.", "code": null},
+  {"name": "two different codes, equally plausible", "subject": "Sign in", "html": null, "text": "Your verification code is 123456.\nYour verification code is 654321.", "code": null},
+  {"name": "the same code twice", "subject": "Sign in", "html": null, "text": "Your verification code is 482913.\nEnter 482 913 to sign in. Your code: 482913", "code": "482913"},
+  {"name": "a plain-text code with no quote at all", "subject": "Sign in", "html": null, "text": "Hi Alice,\n\nYour verification code is 482913.\n\nExamplepaja", "code": "482913"}
+]

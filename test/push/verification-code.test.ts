@@ -95,9 +95,9 @@ describe("the body as the gateway reads it", () => {
     expect(findVerificationCodeInBody("Laskutin: vahvista sähköpostiosoitteesi", { text: [], html: [part("text/html", html)] })).toBe("914602");
   });
 
-  it("keeps quoted text and falls back to the plain-text part", () => {
+  it("leaves quoted text out and falls back to the plain-text part", () => {
     const quoted: EmailBody = { text: [], html: [part("text/html", "<blockquote>Your code is 482913</blockquote>")] };
-    expect(findVerificationCodeInBody("", quoted)).toBe("482913");
+    expect(findVerificationCodeInBody("", quoted)).toBeNull();
     const plain: EmailBody = {
       text: [part("text/plain", "Hi Alice,\n\nUse this code to finish signing in: 482913\n")],
       html: [part("text/html", "<p>Open the app to sign in.</p>")],
@@ -157,6 +157,14 @@ describe("hostile mail stays cheap (linear, capped)", () => {
     ["unclosed quote-start divs", (n) => () => htmlToText("<div class='x ".repeat(n / 14))],
     ["unclosed comments", (n) => () => findVerificationCodeInBody("Your code", html("<!--".repeat(n / 4)))],
     ["deep nesting", (n) => () => findVerificationCodeInBody("Your code", html(`${"<div><td>".repeat(n / 18)}code 123456${"</td></div>".repeat(n / 18)}`))],
+    ["unclosed hidden spans", (n) => () => findVerificationCodeInBody("Your code", html('<span style="display:none">'.repeat(n / 27)))],
+    ["many closed hidden elements", (n) => () => findVerificationCodeInBody("Your code", html("<div hidden>x</div>".repeat(n / 19)))],
+    ["deeply nested inside a hidden element", (n) => () => findVerificationCodeInBody("Your code", html(`<div style="display:none">${"<div>".repeat(n / 5)}code 1${"</div>".repeat(n / 6)}`))],
+    ["a long inline style", (n) => () => findVerificationCodeInBody("Your code", html(`<p style="${"a:b;".repeat(n / 4)}">code 123456</p>`))],
+    ["many attributes", (n) => () => findVerificationCodeInBody("Your code", html(`<p ${'a="b" '.repeat(n / 6)}>code 123456</p>`))],
+    ["quoted lines", (n) => () => findVerificationCodeInBody("Your code", body("> code 1234\n".repeat(n / 12)))],
+    ["a long attribution-like line", (n) => () => findVerificationCodeInBody("Your code", body(`On ${"x".repeat(n)} wrote:\ncode 123456`))],
+    ["long separator-like lines", (n) => () => findVerificationCodeInBody("Your code", body(`${"-".repeat(n / 2)}\n${"_".repeat(n / 2)}\ncode 123456`))],
   ];
 
   it.each(shapes)("%s: well under the bound, and 4x the input takes at most about 8x the time", (_, shape) => {
@@ -248,5 +256,26 @@ describe("hostile mail stays cheap (linear, capped)", () => {
     expect(findVerificationCode("", `Your code is 482913. ${pad(230)}`, "preview")).toBe("482913");
     expect(findVerificationCode("", `Your code is 482913. ${pad(150)}...`, "preview")).toBe("482913");
     expect(findVerificationCode("", `${pad(170)} Your code is 482913`, "preview")).toBe("482913"); // 190 characters: complete
+  });
+});
+
+// Shared, synthetic body cases (Bulwark runs the same file through its reader):
+// what a reader of the body sees, without hidden elements or prior correspondence.
+interface BodyCase {
+  name: string;
+  subject: string;
+  html: string | null;
+  text: string | null;
+  code: string | null;
+}
+const bodyCases = JSON.parse(readFileSync(new URL("../fixtures/verification-code-body-cases.json", import.meta.url), "utf8")) as BodyCase[];
+
+describe("the body as its reader sees it (shared body cases)", () => {
+  it.each(bodyCases.map((c) => [c.name, c] as const))("%s", (_, c) => {
+    const body: EmailBody = {
+      html: c.html === null ? [] : [{ type: "text/html", value: c.html }],
+      text: c.text === null ? [] : [{ type: "text/plain", value: c.text }],
+    };
+    expect(findVerificationCodeInBody(c.subject, body)).toBe(c.code);
   });
 });
