@@ -8,7 +8,7 @@ import { CODE_BODY_VALUE_BYTES } from "../../src/features/push/pipeline.js";
 import { getUpstream } from "../../src/features/push/store.js";
 import { apnsEnv, makeDevice, makeProviderKey, signInApp, startFakeApns, type FakeApns, type FakeDevice } from "./apns-fake.js";
 import type { FakeBodyPart } from "./fakes.js";
-import { makeHarness, type Harness } from "./harness.js";
+import { makeHarness, until, type Harness } from "./harness.js";
 
 // New mail reaches the native app (design/ios-native-app.md): one APNs push
 // per device for the newest message of a run, encrypted to the device, with
@@ -20,10 +20,19 @@ let fake: FakeApns;
 let h: Harness;
 let ip = 0;
 let mailN = 0;
+/** The APNs sender's wait before a retry (a test may hold it). */
+let retryWait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const CODE_BODY_TIMEOUT = 400;
 
 beforeAll(async () => {
   fake = await startFakeApns(key);
-  h = await makeHarness({ apns: { ca: fake.ca, retryDelaysMs: [5] } }, apnsEnv(fake, key));
+  h = await makeHarness(
+    {
+      apns: { ca: fake.ca, retryDelaysMs: [5], sleep: (ms) => retryWait(ms) },
+      pipeline: { errorRetryDelaysMs: [40], changesPageSize: 2, codeBodyTimeoutMs: CODE_BODY_TIMEOUT },
+    },
+    apnsEnv(fake, key),
+  );
   registerAuthenticator(new TokenStore(h.ctx).authenticator());
 });
 afterAll(async () => {
@@ -35,6 +44,7 @@ beforeEach(async () => {
   await h.reset();
   fake.requests.length = 0;
   fake.script.length = 0;
+  retryWait = (ms) => new Promise<void>((r) => setTimeout(r, ms));
 });
 
 /** An account whose only device is the native app. */
@@ -190,6 +200,70 @@ describe("new mail to the native app", () => {
       expect(requests, c.name).toHaveLength(1);
       expect(a.device.open(requests[0]!.json!.m!).code ?? null, c.name).toBe(c.code);
     }
+  });
+});
+
+describe("the app's push never waits long, and never holds the next run (review ios-apns-r1 N5)", () => {
+  it("the code body read ends at its deadline while a shared re-login still waits; the push goes without a code", async () => {
+    const a = await appDevice();
+    const original = h.ctx.fetch;
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    let relogins = 0;
+    h.ctx.fetch = async (input, init) => {
+      if (new Headers(init?.headers).get("authorization")?.startsWith("Basic ")) {
+        relogins++;
+        await held;
+        return original(input, init);
+      }
+      // legacy-proxy lost the account just as the body is read
+      if (typeof init?.body === "string" && init.body.includes('"maxBodyValueBytes":40000')) return new Response("", { status: 401 });
+      return original(input, init);
+    };
+    try {
+      const started = Date.now();
+      h.legacy.addEmail(a.slug, { id: "Mx.relogin.1", subject: "Your sign-in code", preview: "Open the message to see it." });
+      await h.rt.tick();
+      await until(() => fake.requests.length === 1, 5_000);
+      expect(Date.now() - started).toBeLessThan(CODE_BODY_TIMEOUT + 2_000);
+      expect(relogins).toBe(1); // still waiting: the re-login was not cut short
+      const plain = a.device.open(fake.requests[0]!.json!.m!);
+      expect(plain).toMatchObject({ emailId: "Mx.relogin.1", subject: "Your sign-in code" });
+      expect(plain.code).toBeUndefined();
+      expect(h.rt.stats.get("apns_code_body_failed")).toBe(1);
+    } finally {
+      release();
+      await h.rt.idle();
+      h.ctx.fetch = original;
+    }
+  });
+
+  it("a failing APNs (retrying) delays neither the next message's browser push nor its app push", async () => {
+    const a = await appDevice();
+    const principal = (await new TokenStore(h.ctx).authenticate((await signInApp(h.ctx, a.accountId)).accessToken))!;
+    await h.enable(principal, "apns-background-browser");
+    let resume!: () => void;
+    const held = new Promise<void>((r) => (resume = r));
+    let waiting = 0;
+    retryWait = () => {
+      waiting++;
+      return held;
+    };
+    fake.script.push({ status: 503, reason: "ServiceUnavailable" });
+    const web = () => h.pushSvc.requests.length;
+    h.legacy.addEmail(a.slug, { id: "Mx.slow.1", subject: "First", preview: "First" });
+    await h.rt.tick(); // returns once the browsers have it, the app's push still retrying
+    await until(() => waiting === 1);
+    expect(web()).toBe(1);
+    h.legacy.addEmail(a.slug, { id: "Mx.slow.2", subject: "Second", preview: "Second" });
+    await h.rt.tick();
+    expect(web()).toBe(2);
+    await until(() => fake.requests.filter((r) => r.status === 200).length === 1);
+    expect(a.device.open(fake.requests.find((r) => r.status === 200)!.json!.m!).emailId).toBe("Mx.slow.2");
+    expect(waiting).toBe(1); // the first one is still waiting for its retry
+    resume();
+    await h.rt.idle();
+    expect(fake.requests.map((r) => r.status)).toEqual([503, 200, 200]);
   });
 });
 

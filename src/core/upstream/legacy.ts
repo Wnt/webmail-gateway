@@ -3,6 +3,7 @@
 // account); on 401 the account is re-logged-in once with its sealed Gandi
 // password and a replayable request is retried once.
 import { Agent } from "undici";
+import { untilAborted } from "../abort.js";
 import { getGandiPassword, setGandiPassword } from "../accounts.js";
 import {
   LEGACY_TOKEN_TTL_SEC,
@@ -126,7 +127,8 @@ export class LegacyUpstream implements Upstream {
 
     let ok = false;
     try {
-      ok = await relogin(this.ctx, account);
+      // The caller's signal ends its wait; the shared re-login goes on for the others.
+      ok = await untilAborted(relogin(this.ctx, account), req.signal);
     } catch (err) {
       throw toUpstreamError(err);
     }

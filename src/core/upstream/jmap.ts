@@ -5,6 +5,7 @@
 // template variable order work without upstream-specific code. The credential
 // is static and sealed per account: a 401 means "re-run bootstrap", never a
 // re-login.
+import { untilAborted } from "../abort.js";
 import { getUpstreamCredential, normalizeEmail, setUpstreamCredential, type UpstreamCredential } from "../accounts.js";
 import type { CoreContext } from "../../types.js";
 import { newAgent, send, UpstreamError } from "./http.js";
@@ -132,6 +133,8 @@ export class JmapUpstream implements Upstream {
   private readonly allowedOrigins: readonly string[];
   private readonly redirectAllowed: (next: URL, from: URL) => boolean;
   private readonly sessions = new Map<string, { s: JmapSession; at: number }>();
+  /** Session discoveries in flight, shared by the callers that need one meanwhile. */
+  private readonly discovering = new Map<string, Promise<JmapSession>>();
   private readonly creds = new Map<string, { c: UpstreamCredential | null; at: number }>();
   private readonly authLost = new Set<(accountId: string) => void>();
 
@@ -160,9 +163,24 @@ export class JmapUpstream implements Upstream {
     return cred;
   }
 
-  async session(account: UpstreamAccount, opts: { fresh?: boolean } = {}): Promise<JmapSession> {
+  /**
+   * The account's session: cached, or one discovery shared by every caller
+   * that needs it meanwhile (a caller that stops waiting, `request` with its
+   * signal, does not end it for the others).
+   */
+  session(account: UpstreamAccount, opts: { fresh?: boolean } = {}): Promise<JmapSession> {
     const c = this.sessions.get(account.id);
-    if (c && !opts.fresh && this.now() - c.at < SESSION_TTL_MS) return c.s;
+    if (c && !opts.fresh && this.now() - c.at < SESSION_TTL_MS) return Promise.resolve(c.s);
+    const running = this.discovering.get(account.id);
+    if (running) return running;
+    const p: Promise<JmapSession> = this.discover(account).finally(() => {
+      if (this.discovering.get(account.id) === p) this.discovering.delete(account.id);
+    });
+    this.discovering.set(account.id, p);
+    return p;
+  }
+
+  private async discover(account: UpstreamAccount): Promise<JmapSession> {
     const r = await this.request(account, {
       target: { kind: "session" },
       method: "GET",
@@ -197,7 +215,8 @@ export class JmapUpstream implements Upstream {
       // The templates come from the session; a failure to get it is the upstream's answer, not ours.
       let session: JmapSession;
       try {
-        session = await this.session(account);
+        // The caller's signal ends its wait; a shared discovery goes on for the others.
+        session = await untilAborted(this.session(account), req.signal);
       } catch (err) {
         if (err instanceof UpstreamCallError && err.status === 401) return { kind: "authLost" };
         if (err instanceof UpstreamError) throw err;
@@ -340,6 +359,7 @@ export class JmapUpstream implements Upstream {
 
   forget(accountId: string): void {
     this.sessions.delete(accountId);
+    this.discovering.delete(accountId);
     this.creds.delete(accountId);
   }
 

@@ -36,6 +36,35 @@ afterEach(() => vi.restoreAllMocks());
 const schemes = () => fake.calls.map((c) => `${c.method} ${c.path} ${c.scheme}`);
 
 describe("legacyFetch", () => {
+  it("a caller's signal ends its wait for the shared re-login, which goes on (and fails) for the others without an unhandled rejection", async () => {
+    await setGandiPassword(ctx, account.id, "gandi-pass");
+    let fail!: () => void;
+    const held = new Promise<void>((r) => (fail = r));
+    let basic = 0;
+    const local: AppContext = {
+      ...ctx,
+      fetch: async (input, init) => {
+        if (new Headers(init?.headers).get("authorization")?.startsWith("Basic ")) {
+          basic++;
+          await held;
+          throw new Error("legacy-proxy unreachable");
+        }
+        return new Response("", { status: 401 });
+      },
+    };
+    const patient = legacyFetch(local, account, "/jmap", { method: "POST", body: "{}" });
+    const settled = patient.then(
+      () => "resolved",
+      (e: Error) => e.message,
+    );
+    const started = Date.now();
+    await expect(legacyFetch(local, account, "/jmap", { method: "POST", body: "{}", signal: AbortSignal.timeout(50) })).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(basic).toBe(1); // one re-login, shared, still running
+    fail();
+    expect(await settled).toBe("legacy-proxy unreachable");
+  });
+
   it("sends a Bearer token minted for the account, no re-login when it works", async () => {
     const res = await legacyFetch(ctx, account, "/jmap/session");
     expect(res.status).toBe(200);

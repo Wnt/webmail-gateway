@@ -1,3 +1,4 @@
+import { untilAborted } from "./abort.js";
 import { getGandiPassword, type Account } from "./accounts.js";
 import { emitLegacyRelogin } from "./hooks.js";
 import { mintToken } from "./token.js";
@@ -117,7 +118,8 @@ function reloginWithBasic(ctx: Ctx, account: LegacyAccount): Promise<boolean> {
  * If there is no stored password or the re-login fails, the original 401
  * response is returned. A streaming request body cannot be replayed: the
  * account is still re-logged-in, but the 401 is returned and the caller
- * decides whether to retry.
+ * decides whether to retry. The caller's `init.signal` also ends its wait
+ * for the re-login, which is shared and goes on for the others.
  */
 export async function legacyFetch(
   ctx: Ctx,
@@ -136,7 +138,13 @@ export async function legacyFetch(
   const first = await attempt();
   if (first.status !== 401) return first;
 
-  const ok = await reloginWithBasic(ctx, account);
+  let ok: boolean;
+  try {
+    ok = await untilAborted(reloginWithBasic(ctx, account), init.signal);
+  } catch (err) {
+    await discard(first);
+    throw err;
+  }
   if (!ok || !replayable(init.body)) return first;
   await discard(first);
   return attempt();

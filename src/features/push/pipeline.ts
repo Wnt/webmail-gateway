@@ -61,6 +61,8 @@ export interface PipelineOptions {
   /** `maxChanges` per Email/changes call. */
   changesPageSize?: number;
   summarizer?: SummarizerOptions;
+  /** The one-time-code body read gives up after this long (default CODE_BODY_TIMEOUT_MS). */
+  codeBodyTimeoutMs?: number;
 }
 
 interface EmailLite {
@@ -120,6 +122,8 @@ const MAX_BODY_VALUE_BYTES = 64 * 1024;
 export const CODE_BODY_VALUE_BYTES = 40_000;
 const CODE_BODY_RESPONSE_BYTES = 256_000;
 export const CODE_BODY_TIMEOUT_MS = 3_000;
+/** Native app pushes in flight at once (each has its own bounded retries); more are skipped. */
+export const MAX_APNS_JOBS = 64;
 
 const emailList = (g: Record<string, unknown>): EmailLite[] =>
   Array.isArray(g.list) ? (g.list as EmailLite[]).filter((e) => e && typeof e.id === "string") : [];
@@ -132,6 +136,9 @@ export class Pipeline implements SummarySource {
   private stopped = false;
   private readonly errorDelays: number[];
   private readonly changesPage: number;
+  private readonly codeBodyTimeoutMs: number;
+  /** Native app pushes running in the background (pushApns), so `idle` can wait for them. */
+  private readonly apnsJobs = new Set<Promise<void>>();
   private readonly upstream: MailUpstream;
   /** AI summaries (Phase 5); null when SUMMARY_ENABLED is off. */
   readonly summarizer: Summarizer | null;
@@ -146,6 +153,7 @@ export class Pipeline implements SummarySource {
   ) {
     this.errorDelays = opts.errorRetryDelaysMs ?? [5_000, 30_000];
     this.changesPage = opts.changesPageSize ?? CHANGES_PAGE;
+    this.codeBodyTimeoutMs = opts.codeBodyTimeoutMs ?? CODE_BODY_TIMEOUT_MS;
     this.upstream = getMailUpstream(ctx);
     const summary = ctx.config.push.summary;
     this.summarizer = summary ? new Summarizer(ctx, summary, stats, sender, this, opts.summarizer) : null;
@@ -164,14 +172,15 @@ export class Pipeline implements SummarySource {
     this.summarizer?.stop();
   }
 
-  /** Wait for every running pipeline (tests). */
+  /** Wait for every running pipeline, summary and native app push (tests). */
   async idle(): Promise<void> {
     for (;;) {
       while ([...this.runs.values()].some((r) => r.running)) {
         await Promise.all([...this.runs.values()].map((r) => r.running));
       }
       await this.summarizer?.idle();
-      if (![...this.runs.values()].some((r) => r.running)) return;
+      while (this.apnsJobs.size) await Promise.all([...this.apnsJobs]);
+      if (![...this.runs.values()].some((r) => r.running) && !this.apnsJobs.size) return;
     }
   }
 
@@ -446,42 +455,67 @@ export class Pipeline implements SummarySource {
       email: { from: newest.from, subject: newest.subject, preview: newest.preview },
     });
 
+    // The native app's push runs in the background: its body read, its
+    // retries or a failing APNs never hold this account's next run (nor the
+    // browsers' pushes of this one).
+    this.startApns(account, legacyAccountId, newest, fresh[fresh.length - 1]!);
+
     const targets = this.sender.enabled ? await targetsForAccount(this.ctx.db, accountId, this.ctx.config.allowedEmails) : [];
-    const topic = topicFor(accountId, legacyAccountId);
-    const pushWeb = async (): Promise<{ outcomes: string[]; sentAt: number } | null> => {
-      if (targets.length === 0) return null;
-      const outcomes = await this.sender.sendAll(targets, payload, topic);
-      const sentAt = Date.now();
-      // Phase 5: summarise the newest message and replace the preview quietly (same topic, same tag).
-      if (this.summarizer && payload.email) {
-        this.summarizer.enqueue({ accountId, legacyAccountId, emailId: newest.emailId, payload, topic, pushedAt: sentAt });
-      }
-      return { outcomes, sentAt };
-    };
-    // Browsers and the native app at once: neither waits for the other (nor for a summary).
-    const [web, native] = await Promise.all([pushWeb(), this.pushApns(account, legacyAccountId, newest, fresh[fresh.length - 1]!)]);
-    if (!web && !native) {
-      this.ctx.log.debug({ accountId, messages: items.length, targets: targets.length }, "push: new mail, nobody to push to");
+    if (targets.length === 0) {
+      this.ctx.log.debug({ accountId, messages: items.length, targets: 0 }, "push: new mail, no browser to push to");
       return;
     }
-    const sentAt = web?.sentAt ?? native!.sentAt;
+    const topic = topicFor(accountId, legacyAccountId);
+    const outcomes = await this.sender.sendAll(targets, payload, topic);
+    const sentAt = Date.now();
+    // Phase 5: summarise the newest message and replace the preview quietly (same topic, same tag).
+    if (this.summarizer && payload.email) {
+      this.summarizer.enqueue({ accountId, legacyAccountId, emailId: newest.emailId, payload, topic, pushedAt: sentAt });
+    }
     this.ctx.log.info(
       {
         accountId,
         messages: items.length,
         devices: targets.length,
-        ok: web ? web.outcomes.filter((o) => o === "ok").length : 0,
-        apnsDevices: native?.results.length ?? 0,
-        apnsOk: native ? native.results.filter((r) => r.outcome === "ok").length : 0,
+        ok: outcomes.filter((o) => o === "ok").length,
         via: sweep ? "sweep" : "event",
         // newest message's receivedAt -> push sent (includes the server's clock skew)
         latencyMs: sentAt - newestReceivedAt,
-        apnsLatencyMs: native ? native.sentAt - newestReceivedAt : null,
         // StateChange arrival -> push sent, when a StateChange triggered this run
         eventLatencyMs: ev ? sentAt - ev.at.getTime() : null,
       },
       "push: new mail pushed",
     );
+  }
+
+  /** Run `pushApns` in the background, tracked for `idle` and bounded in number. */
+  private startApns(
+    account: Account,
+    legacyAccountId: string,
+    item: { emailId: string; threadId: string; from: string; subject: string; preview: string },
+    raw: EmailLite & { at: number },
+  ): void {
+    if (!this.apns || this.stopped) return;
+    if (this.apnsJobs.size >= MAX_APNS_JOBS) {
+      this.stats.inc("apns_job_dropped");
+      this.ctx.log.warn({ accountId: account.id }, "push: too many native app pushes in flight; this one is skipped");
+      return;
+    }
+    const job: Promise<void> = this.pushApns(account, legacyAccountId, item, raw).then((r) => {
+      if (!r) return;
+      this.ctx.log.info(
+        {
+          accountId: account.id,
+          devices: r.results.length,
+          ok: r.results.filter((x) => x.outcome === "ok").length,
+          // newest message's receivedAt -> push sent (includes the server's clock skew)
+          latencyMs: r.sentAt - raw.at,
+        },
+        "push: new mail pushed to the app",
+      );
+    });
+    const tracked: Promise<void> = job.catch(() => undefined).finally(() => this.apnsJobs.delete(tracked));
+    this.apnsJobs.add(tracked);
   }
 
   /**
@@ -558,7 +592,7 @@ export class Pipeline implements SummarySource {
           ],
         ],
         [JMAP_CORE, JMAP_MAIL],
-        { maxResponseBytes: CODE_BODY_RESPONSE_BYTES, signal: AbortSignal.timeout(CODE_BODY_TIMEOUT_MS) },
+        { maxResponseBytes: CODE_BODY_RESPONSE_BYTES, signal: AbortSignal.timeout(this.codeBodyTimeoutMs) },
       );
       const got = emailList(response(res, "b", "Email/get")).find((x) => x.id === e.id);
       const code = got ? findVerificationCodeInBody(e.subject, emailBody(got as Parameters<typeof emailBody>[0])) : null;

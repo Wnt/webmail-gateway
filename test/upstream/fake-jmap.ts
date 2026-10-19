@@ -60,6 +60,8 @@ export interface FakeJmap {
   relativeUrls: boolean;
   /** Force the next answers on a path prefix to this status. */
   failNext: Map<string, { status: number; count: number }>;
+  /** While set, session requests wait for it (a slow session discovery). */
+  sessionGate: Promise<void> | null;
   /** Store a message (a new Email state) without any event. */
   add(mail: Partial<FakeMail> & { id: string }): FakeMail;
   /** Store a message and send a StateChange to every open EventSource. */
@@ -89,6 +91,7 @@ export async function startFakeJmap(): Promise<FakeJmap> {
     bareEventSourceUrl: false,
     relativeUrls: false,
     failNext: new Map<string, { status: number; count: number }>(),
+    sessionGate: null,
   } as FakeJmap;
 
   const who = (h: string | undefined): string | null => {
@@ -122,6 +125,7 @@ export async function startFakeJmap(): Promise<FakeJmap> {
   }
 
   api.get("/jmap/session", async (req) => {
+    if (f.sessionGate) await f.sessionGate;
     const user = who(req.headers.authorization)!;
     const rel = (u: string) => (f.relativeUrls ? u.replace(f.apiOrigin, "") : u);
     return {
@@ -289,6 +293,7 @@ export async function startFakeJmap(): Promise<FakeJmap> {
     f.bareEventSourceUrl = false;
     f.relativeUrls = false;
     f.failNext.clear();
+    f.sessionGate = null;
   };
   f.apiOrigin = await listen(api);
   f.dlOrigin = await listen(dl);

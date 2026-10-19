@@ -179,6 +179,7 @@ export interface H2Answer {
  */
 export class H2Pool {
   private readonly sessions = new Map<string, http2.ClientHttp2Session>();
+  private closed = false;
   /** Sessions opened since start (tests check reuse). */
   opened = 0;
 
@@ -209,6 +210,7 @@ export class H2Pool {
   }
 
   post(origin: string, headers: http2.OutgoingHttpHeaders, body: string): Promise<H2Answer> {
+    if (this.closed) return Promise.resolve({ status: 0 });
     return new Promise<H2Answer>((resolve) => {
       let settled = false;
       let status = 0;
@@ -259,7 +261,9 @@ export class H2Pool {
     });
   }
 
+  /** Close every session; later posts fail at once (shutdown). */
   close(): void {
+    this.closed = true;
     for (const s of this.sessions.values()) s.close();
     this.sessions.clear();
   }
@@ -294,6 +298,7 @@ export class ApnsSender {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
   private readonly token: ProviderToken | null;
+  private closed = false;
   readonly pool: H2Pool;
 
   constructor(
@@ -318,17 +323,23 @@ export class ApnsSender {
     return this.token !== null;
   }
 
+  /** Shutdown: no more attempts, retries end. */
   close(): void {
+    this.closed = true;
     this.pool.close();
   }
 
-  /** Send to every device, each with its own envelope; `build` makes the plaintext for one send time. */
+  /**
+   * Send to every device, each with its own envelope; `build` makes the
+   * plaintext for one send time. At most MAX_PARALLEL requests are in
+   * flight; a device waiting for its retry holds no slot.
+   */
   async sendAll(devices: ApnsDevice[], build: (sentAt: number) => ApnsPlaintext): Promise<ApnsResult[]> {
     if (!this.enabled) {
       this.stats.inc("apns_send_unconfigured", devices.length);
       return devices.map(() => ({ outcome: "skipped" as const }));
     }
-    return Promise.all(devices.map((d) => this.limited(() => this.sendOne(d, build))));
+    return Promise.all(devices.map((d) => this.sendOne(d, build)));
   }
 
   /** One device. `retries: false` (the test push) gives up on the first 429/5xx/network error. */
@@ -347,6 +358,7 @@ export class ApnsSender {
     let minimal = false;
     let renewed = false;
     for (let attempt = 0; ; attempt++) {
+      if (this.closed) return { outcome: "failed" };
       // Revocation is durable state: re-read before every attempt.
       if (!(await apnsTargetStillAuthorized(this.ctx.db, device, this.ctx.config.allowedEmails))) {
         this.stats.inc("apns_send_revoked");
@@ -357,17 +369,19 @@ export class ApnsSender {
       if (minimal) plaintext = minimalApnsPlaintext(plaintext);
       const envelope = sealEnvelope(JSON.stringify(plaintext), devicePublicKey, this.opts.randomness?.() ?? {});
       const jwt = this.token.current();
-      const { status, reason } = await this.pool.post(
-        origin,
-        {
-          ":path": `/3/device/${device.token}`,
-          authorization: `bearer ${jwt}`,
-          "apns-topic": device.topic,
-          "apns-push-type": "alert",
-          "apns-priority": "10",
-          "apns-expiration": String(Math.floor(sentAt / 1000) + this.ctx.config.push.ttlSec),
-        },
-        apnsJson(envelope),
+      const { status, reason } = await this.limited(() =>
+        this.pool.post(
+          origin,
+          {
+            ":path": `/3/device/${device.token}`,
+            authorization: `bearer ${jwt}`,
+            "apns-topic": device.topic,
+            "apns-push-type": "alert",
+            "apns-priority": "10",
+            "apns-expiration": String(Math.floor(sentAt / 1000) + this.ctx.config.push.ttlSec),
+          },
+          apnsJson(envelope),
+        ),
       );
       const answer = { status, ...(reason ? { reason } : {}) };
       if (status === 200) return this.done(device, { outcome: "ok", ...answer }, "apns_send_ok");
