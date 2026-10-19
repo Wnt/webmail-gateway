@@ -7,6 +7,7 @@ import { fitPayload, type PushPayload } from "./payload.js";
 import type { Sender } from "./sender.js";
 import type { PushStats } from "./stats.js";
 import { targetsForAccount } from "./store.js";
+import { isApplePushEndpoint } from "./validation.js";
 import {
   buildMessages,
   GEN_PARAMS,
@@ -51,15 +52,7 @@ export interface SummaryJob {
   pushedAt?: number;
 }
 
-/** Apple's web push service (Safari, iOS Home Screen web apps: WebKit). */
-export function isApplePushEndpoint(endpoint: string): boolean {
-  try {
-    const host = new URL(endpoint).hostname.toLowerCase();
-    return host === "push.apple.com" || host.endsWith(".push.apple.com");
-  } catch {
-    return false;
-  }
-}
+export { isApplePushEndpoint } from "./validation.js";
 
 /** Resolves after `ms`, or rejects as soon as `signal` aborts. */
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -327,7 +320,12 @@ export class Summarizer {
     if (!(await this.source.stillNotifiable(job))) return "not_notifiable";
     if (this.isStale(job) || signal.aborted) return "stale";
 
-    const payload = fitPayload({ ...job.payload, renotify: false, email: { ...email, summary } });
+    const payload = fitPayload({
+      ...job.payload,
+      renotify: false,
+      email: { ...email, summary },
+      ...(job.pushedAt !== undefined ? { firstSentAt: job.pushedAt } : {}),
+    });
     if (!payload.email?.summary) return "error";
     let targets = await targetsForAccount(db, job.accountId, config.allowedEmails);
     if (targets.length === 0 || !this.sender.enabled) return "no_devices";

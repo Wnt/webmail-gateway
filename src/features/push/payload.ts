@@ -21,6 +21,67 @@ export interface PushPayload {
   email?: PayloadEmail;
   /** `false` on the quiet replacement push: update the notification (same tag) without alerting again. */
   renotify?: false;
+  /** When this push was handed to the push service (ms since the epoch; set per device by the sender). Diagnostics only. */
+  sentAt?: number;
+  /** On the quiet replacement push: when the preview push it replaces went out (ms since the epoch). Diagnostics only. */
+  firstSentAt?: number;
+  /** Per device: a ticket that lets the service worker fetch the newest message once its session has expired (preview-ticket.ts). */
+  previewTicket?: string;
+}
+
+/**
+ * A Declarative Web Push message (WebKit, Safari 18.4 / iOS 18.4; the Push
+ * API's "declarative push message"): `web_push: 8030` plus a `notification`
+ * the browser shows by itself. On an iPhone Home Screen app, webpushd shows
+ * an immutable one at once, without launching the app or running its
+ * service worker; a classic push instead launches the app in the background
+ * and waits for the worker, which on a cold launch iOS may not run until the
+ * next push arrives (seen 2026-10-19: the preview notification appeared only
+ * with the summary push, 35 s later). Our own members stay at the top level,
+ * where the parser ignores them, so a browser without declarative support
+ * hands the same JSON to the service worker as before.
+ */
+export interface DeclarativePushPayload extends PushPayload {
+  web_push: 8030;
+  notification: {
+    title: string;
+    body: string;
+    navigate: string;
+    tag: string;
+    silent: boolean;
+    data: { kind: "email"; emailId: string; accountId: string; headlineEmailId: string };
+  };
+}
+
+/** The notification text the service worker builds from `email` when its preview lookup fails (sw.js buildPayloadEmailContent). */
+export function payloadNotificationText(email: PayloadEmail | undefined): { title: string; body: string } {
+  const from = email?.from.trim() ?? "";
+  const subject = email?.subject.trim() ?? "";
+  const preview = ((email?.summary ?? "").trim() || (email?.preview ?? "").trim()).slice(0, PREVIEW_MAX);
+  if (!from && !subject && !preview) return { title: "New mail", body: "" };
+  return { title: from || "New mail", body: [subject, preview].filter(Boolean).join("\n") || "(no subject)" };
+}
+
+/**
+ * `p` as a Declarative Web Push message that opens its newest message
+ * (the same URL the service worker gives the notification it shows).
+ */
+export function declarativePayload(p: PushPayload, publicBaseUrl: string): DeclarativePushPayload {
+  const emailId = p.emailIds[p.emailIds.length - 1] ?? "";
+  const base = publicBaseUrl.replace(/\/+$/, "");
+  const { title, body } = payloadNotificationText(p.email);
+  return {
+    web_push: 8030,
+    notification: {
+      title,
+      body,
+      navigate: emailId ? `${base}/mail/message/${encodeURIComponent(emailId)}` : `${base}/`,
+      tag: `bulwark-mail:${p.accountId || "default"}`,
+      silent: false,
+      data: { kind: "email", emailId, accountId: p.accountId, headlineEmailId: emailId },
+    },
+    ...p,
+  };
 }
 
 export const PREVIEW_MAX = 200;
@@ -142,8 +203,10 @@ export function payloadBytes(p: PushPayload): number {
 /**
  * Shrink a payload until it fits `budget` bytes: newest id only, then a
  * 100-char preview, then a 100-char subject, then no `email` at all.
+ * `wrap` measures what is really sent (a declarative message repeats the text).
  */
-export function fitPayload(p: PushPayload, budget = PAYLOAD_BUDGET_BYTES): PushPayload {
+export function fitPayload(p: PushPayload, budget = PAYLOAD_BUDGET_BYTES, wrap: (q: PushPayload) => PushPayload = (q) => q): PushPayload {
+  const size = (q: PushPayload) => Buffer.byteLength(JSON.stringify(wrap(q)), "utf8");
   let cur: PushPayload = { ...p, emailIds: p.emailIds.slice(-MAX_EMAIL_IDS) };
   const steps: ((q: PushPayload) => PushPayload)[] = [
     (q) => ({ ...q, emailIds: q.emailIds.slice(-1) }),
@@ -156,7 +219,7 @@ export function fitPayload(p: PushPayload, budget = PAYLOAD_BUDGET_BYTES): PushP
     },
   ];
   for (const step of steps) {
-    if (payloadBytes(cur) <= budget) return cur;
+    if (size(cur) <= budget) return cur;
     cur = step(cur);
   }
   return cur;

@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 import webpush from "web-push";
 import type { AppContext } from "../../types.js";
-import { minimalPayload, type PushPayload } from "./payload.js";
+import { declarativePayload, fitPayload, minimalPayload, PAYLOAD_BUDGET_BYTES, type PushPayload } from "./payload.js";
+import { mintPreviewTicket } from "./preview-ticket.js";
 import { safeHost } from "./relay-routes.js";
 import type { PushStats } from "./stats.js";
 import { recordRelayResult, targetStillAuthorized, type PushTarget, type SendOutcome } from "./store.js";
-import { endpointAllowed } from "./validation.js";
+import { endpointAllowed, isApplePushEndpoint } from "./validation.js";
 
 /**
  * Encrypted Web Push (RFC 8291 aes128gcm) with VAPID (RFC 8292). `web-push`
@@ -71,7 +72,7 @@ export class Sender {
       this.ctx.log.warn({ relay: target.relayId.slice(0, 6), host: safeHost(target.endpoint) }, "push: endpoint host no longer allowed");
       return this.done(target, "gone", "push_send_refused");
     }
-    let body = payload;
+    let base = payload;
     let shrunk = false;
     for (let attempt = 0; ; attempt++) {
       // Revocation is durable state: re-read it before every attempt, so a
@@ -80,7 +81,7 @@ export class Sender {
         this.stats.inc("push_send_revoked");
         return "revoked";
       }
-      const { status, retryAfterMs } = await this.post(target, body, topic);
+      const { status, retryAfterMs } = await this.post(target, this.bodyFor(target, base), topic);
       if (status >= 200 && status < 300) return this.done(target, "ok", "push_send_ok");
       if (status === 404 || status === 410) {
         this.ctx.log.info({ relay: target.relayId.slice(0, 6), host: safeHost(target.endpoint), status }, "push: endpoint gone");
@@ -88,7 +89,7 @@ export class Sender {
       }
       if (status === 413 && !shrunk) {
         this.stats.inc("push_send_too_large");
-        body = minimalPayload(body);
+        base = minimalPayload(base);
         shrunk = true;
         attempt--;
         continue;
@@ -107,6 +108,36 @@ export class Sender {
       this.stats.inc("push_send_retry");
       await this.sleep(Math.min(Math.max(retryAfterMs ?? delay, delay), 60_000));
     }
+  }
+
+  /**
+   * What one device gets: the payload with its send time and, when enabled,
+   * a preview ticket minted for this device (preview-ticket.ts); for an
+   * Apple endpoint a new-mail push becomes a Declarative Web Push message
+   * (payload.ts). The text is shrunk to fit what is really sent; the ticket
+   * goes in only when it still fits, so it never costs the notification text.
+   */
+  bodyFor(target: PushTarget, payload: PushPayload, now = Date.now()): PushPayload {
+    const cfg = this.ctx.config.push;
+    const declarative = cfg.appleDeclarative && payload.renotify !== false && isApplePushEndpoint(target.endpoint);
+    const wrap = declarative
+      ? (q: PushPayload): PushPayload => declarativePayload(q, this.ctx.config.publicBaseUrl)
+      : (q: PushPayload): PushPayload => q;
+    let p = fitPayload({ ...payload, sentAt: now }, PAYLOAD_BUDGET_BYTES, wrap);
+    const emailId = p.emailIds[p.emailIds.length - 1];
+    if (cfg.previewTickets && emailId) {
+      const withTicket: PushPayload = {
+        ...p,
+        previewTicket: mintPreviewTicket(
+          this.ctx.config.encKey,
+          { accountId: target.accountId, relayId: target.relayId, legacyAccountId: p.accountId, emailId },
+          now,
+        ),
+      };
+      if (Buffer.byteLength(JSON.stringify(wrap(withTicket)), "utf8") <= PAYLOAD_BUDGET_BYTES) p = withTicket;
+      else this.stats.inc("push_ticket_dropped");
+    }
+    return wrap(p);
   }
 
   private async done(target: PushTarget, outcome: SendOutcome, counter: string): Promise<SendOutcome> {

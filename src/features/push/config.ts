@@ -71,6 +71,15 @@ export const pushConfigSchema = z
     PUSH_TTL_S: posInt(21600),
     /** Run the background reconciler once the server listens. */
     PUSH_WORKER_ENABLED: bool("true"),
+    /**
+     * Apple's push service only: send the new-mail push as a Declarative Web
+     * Push message (payload.ts declarativePayload), which iOS shows at once
+     * without launching the Home Screen app. The quiet replacement push stays
+     * a classic one, so the service worker takes the notification over.
+     */
+    PUSH_APPLE_DECLARATIVE: bool("true"),
+    /** Put a preview ticket (preview-ticket.ts) in every push, for the worker's fetch once the session has expired. */
+    PUSH_PREVIEW_TICKETS: bool("true"),
 
     // --- AI summaries (Phase 5): a quiet replacement push with `email.summary`
     /** Summarise new mail and send a quiet replacement push. */
@@ -141,6 +150,10 @@ export interface PushConfig {
   maxNotifyAgeMs: number;
   ttlSec: number;
   workerEnabled: boolean;
+  /** New-mail pushes to Apple endpoints are declarative (PUSH_APPLE_DECLARATIVE). */
+  appleDeclarative: boolean;
+  /** Pushes carry a preview ticket (PUSH_PREVIEW_TICKETS). */
+  previewTickets: boolean;
   /** null: no AI summaries (SUMMARY_ENABLED=false). */
   summary: SummaryConfig | null;
 }
@@ -162,6 +175,8 @@ export function parsePushConfig(env: NodeJS.ProcessEnv): PushConfig {
     maxNotifyAgeMs: c.PUSH_MAX_NOTIFY_AGE_S * 1000,
     ttlSec: c.PUSH_TTL_S,
     workerEnabled: c.PUSH_WORKER_ENABLED,
+    appleDeclarative: c.PUSH_APPLE_DECLARATIVE,
+    previewTickets: c.PUSH_PREVIEW_TICKETS,
     summary:
       c.SUMMARY_ENABLED && c.SUMMARY_API_URL && c.SUMMARY_MODEL
         ? {

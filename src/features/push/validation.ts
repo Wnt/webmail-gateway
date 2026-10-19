@@ -41,3 +41,13 @@ export function endpointAllowed(endpoint: string, patterns: string[]): boolean {
     return false;
   }
 }
+
+/** Apple's web push service (Safari, iOS Home Screen web apps: WebKit). */
+export function isApplePushEndpoint(endpoint: string): boolean {
+  try {
+    const host = new URL(endpoint).hostname.toLowerCase();
+    return host === "push.apple.com" || host.endsWith(".push.apple.com");
+  } catch {
+    return false;
+  }
+}

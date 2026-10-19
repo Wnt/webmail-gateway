@@ -69,11 +69,19 @@ describe("AI summary replacement push", () => {
     const [preview, replacement] = got;
     expect(preview!.payload.email).toEqual({ from: "Alice Example <alice@example.com>", subject: "Planning", preview: "Hi, can you join" });
     expect(preview!.payload.renotify).toBeUndefined();
-    expect(replacement!.payload).toEqual({
-      ...preview!.payload,
+    // Per send: the send time and a preview ticket for this device; the summary also names the preview's send time.
+    const { sentAt: previewSentAt, previewTicket: previewTicket, ...previewRest } = preview!.payload;
+    const { sentAt: summarySentAt, previewTicket: summaryTicket, firstSentAt, ...replacementRest } = replacement!.payload;
+    expect(replacementRest).toEqual({
+      ...previewRest,
       renotify: false,
       email: { ...preview!.payload.email, summary: DEFAULT_SUMMARY },
     });
+    expect(summarySentAt).toBeGreaterThanOrEqual(previewSentAt!);
+    expect(firstSentAt).toBeGreaterThanOrEqual(previewSentAt!);
+    expect(firstSentAt).toBeLessThanOrEqual(summarySentAt!);
+    expect(previewTicket).toMatch(/^[A-Za-z0-9_-]{100,400}$/);
+    expect(summaryTicket).toMatch(/^[A-Za-z0-9_-]{100,400}$/);
     expect(replacement!.headers.topic).toBe(preview!.headers.topic);
     expect(outcomes.map((o) => o.outcome)).toEqual(["pushed"]);
 

@@ -1,8 +1,18 @@
 import { isIPv6 } from "node:net";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { getAccountById } from "../../core/accounts.js";
+import { getUpstream, JMAP_CORE, JMAP_MAIL } from "../../core/upstream/index.js";
 import type { AppContext } from "../../types.js";
+import { openPreviewTicket } from "./preview-ticket.js";
 import type { PushStats } from "./stats.js";
-import { deleteRelaySub, getRelaySub, PENDING_WINDOW_MS, registerRelaySub, relayActive } from "./store.js";
+import {
+  deleteRelaySub,
+  getRelaySub,
+  PENDING_WINDOW_MS,
+  previewTargetAuthorized,
+  registerRelaySub,
+  relayActive,
+} from "./store.js";
 import { endpointAllowed, isValidSubscriptionId, isValidWebPushSubscription } from "./validation.js";
 
 /** A fresh relay record counts as active this long even before verification (same as the relay). */
@@ -47,6 +57,63 @@ export function sourceKey(ip: string): string {
   const groups = ip.includes("::") ? [...h, ...Array<string>(8 - width(h) - width(t)).fill("0"), ...t] : h;
   return `${groups.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(":")}::/64`;
 }
+
+/**
+ * The Email properties a preview ticket may read (RFC 8621 section 4.1, no
+ * `header:` forms), and the default: what Bulwark's reading pane asks for
+ * (its lib/jmap/full-email.ts), which is what the service worker keeps.
+ */
+export const PREVIEW_EMAIL_PROPERTIES = new Set([
+  "id", "blobId", "threadId", "mailboxIds", "keywords", "size", "receivedAt", "messageId", "inReplyTo",
+  "references", "sender", "from", "to", "cc", "bcc", "replyTo", "subject", "sentAt", "hasAttachment",
+  "preview", "bodyStructure", "bodyValues", "textBody", "htmlBody", "attachments", "headers",
+]);
+export const PREVIEW_DEFAULT_PROPERTIES = [
+  "id", "threadId", "mailboxIds", "keywords", "size", "receivedAt", "sentAt", "from", "to", "cc", "bcc",
+  "replyTo", "subject", "preview", "textBody", "htmlBody", "bodyValues", "hasAttachment", "attachments",
+  "messageId", "inReplyTo", "references", "headers", "bodyStructure", "blobId",
+];
+/** Largest body value a preview read asks for, and the largest answer it returns (JSON characters). */
+export const PREVIEW_MAX_BODY_VALUE_BYTES = 256_000;
+export const PREVIEW_MAX_RESPONSE_CHARS = 600_000;
+
+interface PreviewRequest {
+  ticket: string;
+  properties: string[];
+  fetchTextBodyValues: boolean;
+  fetchHTMLBodyValues: boolean;
+  fetchAllBodyValues: boolean;
+  maxBodyValueBytes: number;
+}
+
+/** The request body, or null when anything in it is not what a preview read may ask for. */
+export function parsePreviewRequest(body: unknown): PreviewRequest | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const b = body as Record<string, unknown>;
+  for (const k of Object.keys(b)) {
+    if (!["ticket", "properties", "fetchTextBodyValues", "fetchHTMLBodyValues", "fetchAllBodyValues", "maxBodyValueBytes"].includes(k)) return null;
+  }
+  if (typeof b.ticket !== "string") return null;
+  let properties = PREVIEW_DEFAULT_PROPERTIES;
+  if (b.properties !== undefined) {
+    if (!Array.isArray(b.properties) || b.properties.length === 0 || b.properties.length > PREVIEW_EMAIL_PROPERTIES.size) return null;
+    if (!b.properties.every((x) => typeof x === "string" && PREVIEW_EMAIL_PROPERTIES.has(x))) return null;
+    properties = [...new Set(["id", ...(b.properties as string[])])];
+  }
+  const flag = (v: unknown, def: boolean) => (v === undefined ? def : typeof v === "boolean" ? v : null);
+  const text = flag(b.fetchTextBodyValues, true);
+  const html = flag(b.fetchHTMLBodyValues, true);
+  const all = flag(b.fetchAllBodyValues, true);
+  if (text === null || html === null || all === null) return null;
+  let max = PREVIEW_MAX_BODY_VALUE_BYTES;
+  if (b.maxBodyValueBytes !== undefined) {
+    if (typeof b.maxBodyValueBytes !== "number" || !Number.isInteger(b.maxBodyValueBytes) || b.maxBodyValueBytes < 1) return null;
+    max = Math.min(b.maxBodyValueBytes, PREVIEW_MAX_BODY_VALUE_BYTES);
+  }
+  return { ticket: b.ticket, properties, fetchTextBodyValues: text, fetchHTMLBodyValues: html, fetchAllBodyValues: all, maxBodyValueBytes: max };
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const err = (reply: FastifyReply, status: number, error: string) =>
   reply.code(status).header("cache-control", "no-store").send({ error });
@@ -117,6 +184,60 @@ export async function registerRelayRoutes(app: FastifyInstance, ctx: AppContext,
         }
         stats.inc("relay_registered");
         return reply.header("cache-control", "no-store").send({ ok: true });
+      });
+
+      // Preview tickets (preview-ticket.ts): the service worker reads the one
+      // message a push named, when the webmail session behind Bulwark's
+      // /api/push/preview has expired. The ticket in the body is the
+      // capability; it never appears in a URL or a log line.
+      const previewLimit = new RateLimiter(60);
+      r.post("/preview", { bodyLimit: BODY_LIMIT, onRequest: limited(previewLimit) }, async (req, reply) => {
+        const started = Date.now();
+        const done = (status: number, outcome: string, body: unknown) => {
+          stats.inc(`preview_ticket_${outcome}`);
+          ctx.log.info({ outcome, status, ms: Date.now() - started }, "push: preview ticket");
+          return reply.code(status).header("cache-control", "no-store").send(body);
+        };
+        const parsed = parsePreviewRequest(req.body);
+        if (!parsed) return done(400, "bad_request", { error: "Invalid request" });
+        const ticket = openPreviewTicket(ctx.config.encKey, parsed.ticket);
+        if (!ticket || !UUID_RE.test(ticket.accountId)) return done(403, "refused", { error: "Invalid or expired ticket" });
+        if (!(await previewTargetAuthorized(ctx.db, ticket.accountId, ticket.relayId, ctx.config.allowedEmails))) {
+          return done(403, "revoked", { error: "Invalid or expired ticket" });
+        }
+        const account = await getAccountById(ctx, ticket.accountId);
+        if (!account) return done(403, "revoked", { error: "Invalid or expired ticket" });
+        let res;
+        try {
+          res = await getUpstream(ctx).jmap(
+            account,
+            [[
+              "Email/get",
+              {
+                accountId: ticket.legacyAccountId,
+                ids: [ticket.emailId],
+                properties: parsed.properties,
+                fetchTextBodyValues: parsed.fetchTextBodyValues,
+                fetchHTMLBodyValues: parsed.fetchHTMLBodyValues,
+                fetchAllBodyValues: parsed.fetchAllBodyValues,
+                maxBodyValueBytes: parsed.maxBodyValueBytes,
+              },
+              "g",
+            ]],
+            [JMAP_CORE, JMAP_MAIL],
+          );
+        } catch (e) {
+          ctx.log.warn({ err: (e as Error).message }, "push: preview ticket read failed");
+          return done(502, "upstream_error", { error: "Mail server unavailable" });
+        }
+        const g = res.methodResponses.find(([, , id]) => id === "g");
+        const list = g && g[0] === "Email/get" && Array.isArray((g[1] as { list?: unknown }).list) ? (g[1] as { list: unknown[] }).list : null;
+        if (!list) return done(502, "upstream_error", { error: "Mail server unavailable" });
+        const email = list.find((e) => !!e && typeof e === "object" && (e as { id?: unknown }).id === ticket.emailId);
+        if (!email) return done(404, "not_found", { error: "Message not found" });
+        const body = { email };
+        if (JSON.stringify(body).length > PREVIEW_MAX_RESPONSE_CHARS) return done(413, "too_large", { error: "Message too large" });
+        return done(200, "ok", body);
       });
 
       // FCM and UnifiedPush are for the mobile app: out of scope.

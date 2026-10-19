@@ -376,6 +376,25 @@ export async function targetStillAuthorized(db: Queryable, target: PushTarget, a
   return rows.length > 0;
 }
 
+/**
+ * A preview ticket's push target (preview-ticket.ts) can still use it: the
+ * relay record exists and is not gone, and a deliverable subscription of
+ * the account (verified, unexpired, authorized: see AUTHORIZED) points at it.
+ */
+export async function previewTargetAuthorized(
+  db: Queryable,
+  accountId: string,
+  relayId: string,
+  allowed: readonly string[],
+): Promise<boolean> {
+  const { rows } = await db.query(
+    `SELECT 1 FROM push_jmap_sub s JOIN push_relay_sub r ON r.relay_id = s.relay_id
+      WHERE s.account_id = $1 AND s.relay_id = $2 AND r.gone_at IS NULL AND ${DELIVERABLE} AND ${ALLOWED(3)} LIMIT 1`,
+    [accountId, relayId, [...allowed]],
+  );
+  return rows.length > 0;
+}
+
 // -------------------------------------------------------------- upstream subscription
 
 export type UpstreamStatus = "none" | "creating" | "verifying" | "active" | "failed";
