@@ -4,6 +4,7 @@ import type { EmailBody } from "../../src/features/push/summary-text.js";
 import { htmlToText } from "../../src/features/push/summary-text.js";
 import {
   CUT_MARK,
+  detectorWork,
   findVerificationCode,
   findVerificationCodeInBody,
   markCut,
@@ -123,20 +124,27 @@ describe("hostile mail stays cheap (linear, capped)", () => {
     }
     return best;
   };
-  /** The fastest of seven runs at 5,000 and at 20,000 characters, taken in turn so both see the same load. */
+  /**
+   * Nine rounds at 5,000 and at 20,000 characters, taken in turn so both see
+   * the same load: the fastest large run, and whether any round was linear
+   * (4x the input in at most 8x the time, plus 10 ms of timer and scheduling
+   * noise). A quadratic shape fails every round; a busy host only some.
+   */
   const scaling = (shape: (n: number) => () => unknown) => {
     const [runSmall, runLarge] = [shape(5_000), shape(20_000)];
-    let small = Infinity;
     let large = Infinity;
-    for (let i = 0; i < 7; i++) {
+    let linear = false;
+    for (let i = 0; i < 9; i++) {
       let t0 = performance.now();
       runSmall();
-      small = Math.min(small, performance.now() - t0);
+      const s = performance.now() - t0;
       t0 = performance.now();
       runLarge();
-      large = Math.min(large, performance.now() - t0);
+      const l = performance.now() - t0;
+      large = Math.min(large, l);
+      if (l < 8 * s + 10) linear = true;
     }
-    return { small, large };
+    return { large, linear };
   };
   const body = (value: string): EmailBody => ({ text: [{ type: "text/plain", value }], html: [] });
   const pad = (n: number) => "Lorem ipsum ".repeat(Math.ceil(n / 12)).slice(0, n);
@@ -168,9 +176,22 @@ describe("hostile mail stays cheap (linear, capped)", () => {
   ];
 
   it.each(shapes)("%s: well under the bound, and 4x the input takes at most about 8x the time", (_, shape) => {
-    const { small, large } = scaling(shape);
+    const { large, linear } = scaling(shape);
     expect(large).toBeLessThan(250);
-    expect(large).toBeLessThan(8 * small + 10);
+    expect(linear).toBe(true);
+  });
+
+  it("dense candidates and code words: the keyword lookups grow linearly (counted, not timed)", () => {
+    const steps = (n: number) => {
+      detectorWork.keywordSteps = 0;
+      findVerificationCode("", "code 1234 ".repeat(n));
+      return detectorWork.keywordSteps;
+    };
+    const [s100, s400, s2000] = [steps(100), steps(400), steps(2_000)];
+    // At most a window's worth of code words per candidate (the spans of a list do not overlap), and no log factor.
+    expect(s2000 / 2_000).toBeLessThan(60);
+    expect(s2000 / s400).toBeLessThan(5 * 1.05);
+    expect(s400 / s100).toBeLessThan(4 * 1.1);
   });
 
   it("a 40,000-character word, 20,000 characters of 'code 1234 ' and huge inputs finish quickly", () => {
@@ -277,5 +298,17 @@ describe("the body as its reader sees it (shared body cases)", () => {
       text: c.text === null ? [] : [{ type: "text/plain", value: c.text }],
     };
     expect(findVerificationCodeInBody(c.subject, body)).toBe(c.code);
+  });
+});
+
+describe("a preview's ellipsis or an unmarked server cut never leaves a fragment (review bulwark-n1 r2 R5, the same core)", () => {
+  it("gives no code for the review's examples, and the whole code for a complete preview or from the body", () => {
+    expect(findVerificationCode("", "Your code is 1234 56...", "preview")).toBeNull();
+    expect(findVerificationCode("", "Your code is 1234 ...", "preview")).toBeNull();
+    expect(findVerificationCode("", "Your code is 1 2 3 4 5...", "preview")).toBeNull();
+    expect(findVerificationCode("", "Your code is 1234 5678", "preview")).toBe("12345678");
+    const body = `${"x".repeat(238)} Your code is 12345678`;
+    expect(findVerificationCode("", body.slice(0, 256), "preview")).toBeNull();
+    expect(findVerificationCodeInBody("", { text: [{ type: "text/plain", value: body }], html: [] })).toBe("12345678");
   });
 });

@@ -102,19 +102,33 @@ function findCodeWords(text: string): Span[][] {
   return lists;
 }
 
+/** Work counters (tests check the detector stays linear by counting, not timing). */
+export const detectorWork = { keywordSteps: 0 };
+
+/**
+ * Where each keyword list's lookups start: a candidate pass (one regex over
+ * the text) finds its candidates in text order, so the keywords that end too
+ * far before one also end too far before every later one. Each list's
+ * cursor only moves forward, so a pass skips every keyword at most once.
+ */
+type Cursors = number[];
+
 /** The keywords of one list that can matter for a candidate at start..end:
  *  those ending at most MAX_AFTER before it or starting at most MAX_BEFORE
- *  after it (or overlapping it). Found by binary search, so the scoring is
- *  linear in the text, not candidates times keywords. */
-function* nearbyKeywords(list: Span[], start: number, end: number): Generator<Span> {
-  let lo = 0;
-  let hi = list.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (list[mid]!.end < start - MAX_AFTER) lo = mid + 1;
-    else hi = mid;
+ *  after it (or overlapping it). The cursor moves past the ones ending too
+ *  early for good; the ones looked at are at most a window's worth (spans in
+ *  a list do not overlap). Linear in the text over a whole pass. */
+function* nearbyKeywords(list: Span[], cursors: Cursors, which: number, start: number, end: number): Generator<Span> {
+  let i = cursors[which]!;
+  while (i < list.length && list[i]!.end < start - MAX_AFTER) {
+    i++;
+    detectorWork.keywordSteps++;
   }
-  for (let i = lo; i < list.length && list[i]!.start <= end + MAX_BEFORE; i++) yield list[i]!;
+  cursors[which] = i;
+  for (; i < list.length && list[i]!.start <= end + MAX_BEFORE; i++) {
+    detectorWork.keywordSteps++;
+    yield list[i]!;
+  }
 }
 
 // Tried in this order at each position, so "557 260" and "6ZA-BRE" are taken
@@ -194,7 +208,7 @@ function contextWindow(text: string, from: number, to: number): string {
 
 interface Candidate extends Span { code: string; score: number }
 
-function scoreCandidate(text: string, raw: string, start: number, keywords: Span[][]): Candidate | null {
+function scoreCandidate(text: string, raw: string, start: number, keywords: Span[][], cursors: Cursors): Candidate | null {
   const end = start + raw.length;
   const letters = raw.replace(/[^A-Za-z]/g, '');
   const digits = raw.replace(/\D/g, '');
@@ -224,8 +238,8 @@ function scoreCandidate(text: string, raw: string, start: number, keywords: Span
 
   let best = Infinity;
   let bestAfter = Infinity;
-  for (const list of keywords) {
-    for (const kw of nearbyKeywords(list, start, end)) {
+  for (const [which, list] of keywords.entries()) {
+    for (const kw of nearbyKeywords(list, cursors, which, start, end)) {
       if (kw.start < end && kw.end > start) return null; // the candidate is part of a keyword ("2FA-Code")
       if (kw.end <= start && start - kw.end <= MAX_AFTER) {
         bestAfter = Math.min(bestAfter, start - kw.end);
@@ -347,10 +361,11 @@ function bestCandidate(rawText: string, cut = false, unique = false): Candidate 
   let best: Candidate | null = null;
   const byCode = new Map<string, number>();
   for (const re of [CANDIDATE, GLUED_DIGITS]) {
+    const cursors: Cursors = keywords.map(() => 0); // each pass finds its candidates in text order
     for (const match of text.matchAll(re)) {
       if (read.visibleEnd - (match.index! + match[0].length + read.lead) < PROMO_AFTER) continue;
       if (re === GLUED_DIGITS && !gluedToWords(text, match.index!, match.index! + match[0].length)) continue;
-      const candidate = scoreCandidate(text, match[0], match.index!, keywords);
+      const candidate = scoreCandidate(text, match[0], match.index!, keywords, cursors);
       if (!candidate) continue;
       byCode.set(candidate.code, Math.min(byCode.get(candidate.code) ?? Infinity, candidate.score));
       if (!best || candidate.score < best.score) best = candidate;
