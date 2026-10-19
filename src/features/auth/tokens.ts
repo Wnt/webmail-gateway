@@ -115,9 +115,15 @@ export class TokenStore {
   }
 
   /**
-   * Redeem a code exactly once. A second redemption of a code that already
-   * produced a grant revokes that grant (RFC 9700 §4.5.3). Returns null on any
-   * failure; the caller answers `invalid_grant`.
+   * Redeem a code exactly once. Nothing happens unless the request proves it
+   * is the client the code was issued to: the same client id, the same
+   * redirect URI and the PKCE verifier of the code's challenge. Only then is
+   * an unused code spent, and only then does presenting a code that was
+   * already redeemed count as a replay, which revokes the grant it produced
+   * (RFC 9700 §4.5.3). So a request from another client (the public one
+   * needs no secret) or without the verifier neither spends a code nor
+   * revokes a grant. Returns null on any failure; the caller answers
+   * `invalid_grant`.
    */
   async redeemCode(input: { code: string; clientId: string; redirectUri: string; codeVerifier: string }): Promise<IssuedTokens | null> {
     if (tokenKind(input.code) !== "code") return null;
@@ -125,61 +131,62 @@ export class TokenStore {
     const t = this.now();
     let replayOf: string | null = null;
     const issued = await this.ctx.db.transaction(async (tx) => {
-      // The code and the account's auth generation in one snapshot, then the
-      // generation and the code's passkey held before the code is spent: a
-      // reset or passkey deletion either finished first (no grant) or waits
-      // for this grant and revokes it.
-      const live = await tx.query<{ account_id: string; passkey_id: Uint8Array; auth_generation: number; passkey_expires_at: Date | null }>(
-        `SELECT c.account_id, c.passkey_id, a.auth_generation, p.expires_at AS passkey_expires_at
-         FROM oauth_code c JOIN account a ON a.id = c.account_id JOIN passkey p ON p.id = c.passkey_id
-         WHERE c.code_hash = $1 AND c.used_at IS NULL AND c.expires_at > $2`,
-        [hash, new Date(t)],
-      );
-      const held = live.rows[0];
-      // A temporary passkey that expired meanwhile authorizes no grant.
-      if (held?.passkey_expires_at && held.passkey_expires_at.getTime() <= t) return null;
-      if (
-        held &&
-        !(await holdAuth(tx, { accountId: held.account_id, generation: held.auth_generation, passkeyId: asBuffer(held.passkey_id)! }))
-      ) {
-        return null;
-      }
+      // The code, its bindings and the account's auth generation in one
+      // snapshot. The bindings never change, so they are checked here,
+      // before anything is written.
       const { rows } = await tx.query<{
         client_id: string;
-        account_id: string;
-        passkey_id: Uint8Array;
         redirect_uri: string;
         code_challenge: string;
+        used_at: Date | null;
+        expires_at: Date;
+        account_id: string;
+        passkey_id: Uint8Array;
         scopes: string;
         resource: string | null;
         email: string;
+        auth_generation: number;
+        passkey_expires_at: Date | null;
       }>(
-        `UPDATE oauth_code c SET used_at = $2 FROM account a
-         WHERE c.code_hash = $1 AND c.used_at IS NULL AND c.expires_at > $2 AND a.id = c.account_id
-         RETURNING c.client_id, c.account_id, c.passkey_id, c.redirect_uri, c.code_challenge, c.scopes, c.resource, a.email`,
-        [hash, new Date(t)],
+        `SELECT c.client_id, c.redirect_uri, c.code_challenge, c.used_at, c.expires_at, c.account_id, c.passkey_id, c.scopes, c.resource,
+                a.email, a.auth_generation, p.expires_at AS passkey_expires_at
+         FROM oauth_code c JOIN account a ON a.id = c.account_id JOIN passkey p ON p.id = c.passkey_id
+         WHERE c.code_hash = $1`,
+        [hash],
       );
       const row = rows[0];
-      if (!row) {
+      if (!row) return null;
+      if (row.client_id !== input.clientId || row.redirect_uri !== input.redirectUri || !pkceMatches(input.codeVerifier, row.code_challenge)) {
+        return null;
+      }
+      const replay = async () => {
         const prior = await tx.query<{ grant_id: string | null }>(
           "SELECT grant_id FROM oauth_code WHERE code_hash = $1 AND used_at IS NOT NULL",
           [hash],
         );
         replayOf = prior.rows[0]?.grant_id ?? null;
         return null;
-      }
-      if (
-        row.client_id !== input.clientId ||
-        row.redirect_uri !== input.redirectUri ||
-        !pkceMatches(input.codeVerifier, row.code_challenge) ||
-        !this.allowed(row.email)
-      ) {
-        return null;
-      }
+      };
+      if (row.used_at) return replay();
+      if (row.expires_at.getTime() <= t) return null;
+      // A temporary passkey that expired meanwhile authorizes no grant.
+      if (row.passkey_expires_at && row.passkey_expires_at.getTime() <= t) return null;
+      if (!this.allowed(row.email)) return null;
+      // The generation and the code's passkey held before the code is spent:
+      // a reset or passkey deletion either finished first (no grant) or waits
+      // for this grant and revokes it.
+      const passkeyId = asBuffer(row.passkey_id)!;
+      if (!(await holdAuth(tx, { accountId: row.account_id, generation: row.auth_generation, passkeyId }))) return null;
+      const spent = await tx.query("UPDATE oauth_code SET used_at = $2 WHERE code_hash = $1 AND used_at IS NULL AND expires_at > $2", [
+        hash,
+        new Date(t),
+      ]);
+      // Spent meanwhile by a request that proved the same bindings: a replay.
+      if ((spent.rowCount ?? 0) === 0) return replay();
       const grant = await this.createGrant(tx, {
         accountId: row.account_id,
-        passkeyId: asBuffer(row.passkey_id)!,
-        passkeyExpiresAt: held?.passkey_expires_at?.getTime() ?? null,
+        passkeyId,
+        passkeyExpiresAt: row.passkey_expires_at?.getTime() ?? null,
         clientId: row.client_id,
         scopes: scopeUtil.parse(row.scopes),
         resource: row.resource,

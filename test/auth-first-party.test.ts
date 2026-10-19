@@ -129,9 +129,10 @@ describe("first-party passkey sign-in", () => {
     expect(iss).toBe(BASE);
     expect(b.cookies.has("__Host-gw_session")).toBe(true); // the gateway session, as /auth/login does
     expect(b.cookies.has("gw_chal")).toBe(false);
-    // Bound to its redirect URI: another one is refused, and that attempt spends the code.
+    // Bound to its redirect URI: another one is refused, and that attempt
+    // spends nothing (only a request proving every binding does: review ios-apns-r1 N2).
     expect((await token({ grant_type: "authorization_code", code, redirect_uri: `${BASE}/de/auth/callback`, code_verifier: verifier })).json().error).toBe("invalid_grant");
-    expect((await token({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: verifier })).json().error).toBe("invalid_grant");
+    expect((await token({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: verifier })).statusCode).toBe(200);
     // A fresh code redeems once, then never again.
     const b2 = new Browser("10.0.0.2");
     const second = await fpOptions(b2);

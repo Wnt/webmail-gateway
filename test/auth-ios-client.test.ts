@@ -7,7 +7,7 @@ import { resetHooks } from "../src/core/hooks.js";
 import { buildClients, IOS_CLIENT_ID, redirectAllowed } from "../src/features/auth/clients.js";
 import { createEnrollToken } from "../src/features/auth/enroll.js";
 import { makeAuthPlugin } from "../src/features/auth/index.js";
-import { REFRESH_GRACE_MS } from "../src/features/auth/tokens.js";
+import { REFRESH_GRACE_MS, TokenStore } from "../src/features/auth/tokens.js";
 import type { AppContext } from "../src/types.js";
 import { SoftAuthenticator } from "./fake-authenticator.js";
 import { makeTestContext } from "./helpers.js";
@@ -252,7 +252,7 @@ describe("the madekivi-ios client", () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it("needs the PKCE verifier, the right verifier and the same redirect URI", async () => {
+  it("needs the PKCE verifier, the right verifier and the same redirect URI; a failed attempt spends nothing", async () => {
     const a = authr();
     await enroll(a);
     const { verifier, challenge } = pkce();
@@ -262,10 +262,11 @@ describe("the madekivi-ios client", () => {
     expect(res.json()).toMatchObject({ error: "invalid_request" });
     res = await post("/oauth/token", { grant_type: "authorization_code", code, redirect_uri: DEV_REDIRECT, code_verifier: verifier, client_id: IOS_CLIENT_ID });
     expect(res.json()).toEqual({ error: "invalid_grant" });
-    // The code is spent by the first redemption attempt that reached it.
-    const second = (await signIn(a, challenge)).searchParams.get("code")!;
-    res = await post("/oauth/token", { grant_type: "authorization_code", code: second, redirect_uri: REDIRECT, code_verifier: pkce().verifier, client_id: IOS_CLIENT_ID });
+    res = await post("/oauth/token", { grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: pkce().verifier, client_id: IOS_CLIENT_ID });
     expect(res.json()).toEqual({ error: "invalid_grant" });
+    // None of those proved the bindings, so the code is still the app's to redeem.
+    res = await post("/oauth/token", { grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: verifier, client_id: IOS_CLIENT_ID });
+    expect(res.statusCode).toBe(200);
   });
 
   it("cannot use the first-party sign-in endpoints", async () => {
@@ -276,5 +277,67 @@ describe("the madekivi-ios client", () => {
       payload: JSON.stringify({ client_id: IOS_CLIENT_ID }),
     });
     expect(res.statusCode).toBe(400);
+  });
+});
+
+describe("codes and grants of other clients (review ios-apns-r1 N2)", () => {
+  const BULWARK_REDIRECT = `${BASE}/en/auth/callback`;
+  const bulwarkCode = async () => {
+    const passkey = (await ctx.db.query<{ id: Buffer }>("SELECT id FROM passkey WHERE account_id = $1 LIMIT 1", [accountId])).rows[0]!.id;
+    const { verifier, challenge } = pkce();
+    const store = new TokenStore(ctx, () => now);
+    const code = await store.issueCode({ clientId: "bulwark", accountId, passkeyId: passkey, redirectUri: BULWARK_REDIRECT, codeChallenge: challenge, scopes: ["mail"] });
+    return { code, verifier };
+  };
+  const asBulwark = (body: Record<string, string>) => post("/oauth/token", { client_id: "bulwark", client_secret: SECRET, ...body });
+  const asApp = (code: string, verifier = pkce().verifier) =>
+    post("/oauth/token", { grant_type: "authorization_code", client_id: IOS_CLIENT_ID, code, redirect_uri: REDIRECT, code_verifier: verifier });
+  const live = async (accessToken: string) => (await authenticate({ headers: { authorization: `Bearer ${accessToken}` } } as never)) !== null;
+
+  beforeEach(async () => {
+    await enroll(authr());
+  });
+
+  it("the public client cannot spend another client's unused code", async () => {
+    const { code, verifier } = await bulwarkCode();
+    expect((await asApp(code)).json()).toEqual({ error: "invalid_grant" });
+    expect((await asApp(code, verifier)).json()).toEqual({ error: "invalid_grant" }); // even with the verifier: wrong client and redirect
+    const res = await asBulwark({ grant_type: "authorization_code", code, redirect_uri: BULWARK_REDIRECT, code_verifier: verifier });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it("the public client cannot revoke another client's grant by replaying its used code", async () => {
+    const { code, verifier } = await bulwarkCode();
+    const t = (await asBulwark({ grant_type: "authorization_code", code, redirect_uri: BULWARK_REDIRECT, code_verifier: verifier })).json() as { access_token: string };
+    expect(await live(t.access_token)).toBe(true);
+    expect((await asApp(code)).json()).toEqual({ error: "invalid_grant" });
+    expect((await asApp(code, verifier)).json()).toEqual({ error: "invalid_grant" });
+    expect(await live(t.access_token)).toBe(true);
+  });
+
+  it("the right client without the verifier or with another redirect neither spends a code nor revokes its grant", async () => {
+    const { code, verifier } = await bulwarkCode();
+    expect((await asBulwark({ grant_type: "authorization_code", code, redirect_uri: BULWARK_REDIRECT, code_verifier: pkce().verifier })).statusCode).toBe(400);
+    expect((await asBulwark({ grant_type: "authorization_code", code, redirect_uri: `${BASE}/fi/auth/callback`, code_verifier: verifier })).statusCode).toBe(400);
+    const t = (await asBulwark({ grant_type: "authorization_code", code, redirect_uri: BULWARK_REDIRECT, code_verifier: verifier })).json() as { access_token: string };
+    expect(await live(t.access_token)).toBe(true);
+    expect((await asBulwark({ grant_type: "authorization_code", code, redirect_uri: BULWARK_REDIRECT, code_verifier: pkce().verifier })).statusCode).toBe(400);
+    expect(await live(t.access_token)).toBe(true);
+    // A replay that proves every binding still revokes what the code issued.
+    expect((await asBulwark({ grant_type: "authorization_code", code, redirect_uri: BULWARK_REDIRECT, code_verifier: verifier })).json()).toEqual({ error: "invalid_grant" });
+    expect(await live(t.access_token)).toBe(false);
+  });
+
+  it("the same for the app's own codes", async () => {
+    const a = authr();
+    await enroll(a);
+    const { verifier, challenge } = pkce();
+    const code = (await signIn(a, challenge)).searchParams.get("code")!;
+    const t = (await asApp(code, verifier)).json() as { access_token: string };
+    expect((await asApp(code)).json()).toEqual({ error: "invalid_grant" });
+    expect((await asBulwark({ grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: verifier })).json()).toEqual({ error: "invalid_grant" });
+    expect(await live(t.access_token)).toBe(true);
+    expect((await asApp(code, verifier)).json()).toEqual({ error: "invalid_grant" });
+    expect(await live(t.access_token)).toBe(false);
   });
 });
