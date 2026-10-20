@@ -15,6 +15,9 @@
 -- incarnation: new on every registration of the row (a renewal, a revival,
 -- a takeover); a send and its result apply only to the incarnation they
 -- were made for, so a late answer for an earlier one changes nothing.
+-- key_created_at: when the device made public_key (epoch ms, as the app
+-- sends it; 0 when it did not): within one grant a registration carrying an
+-- older key never replaces a newer one (a delayed POST of a lost key).
 CREATE TABLE push_apns_device (
   id              text PRIMARY KEY CHECK (id ~ '^[A-Za-z0-9_-]{16,64}$'),
   account_id      uuid NOT NULL REFERENCES account(id) ON DELETE CASCADE,
@@ -31,7 +34,8 @@ CREATE TABLE push_apns_device (
   last_push_at    timestamptz,
   fail_count      integer NOT NULL DEFAULT 0,
   gone_at         timestamptz,
-  incarnation     text NOT NULL DEFAULT gen_random_uuid()::text
+  incarnation     text NOT NULL DEFAULT gen_random_uuid()::text,
+  key_created_at  bigint NOT NULL DEFAULT 0 CHECK (key_created_at >= 0)
 );
 CREATE INDEX push_apns_device_account_idx ON push_apns_device (account_id);
 CREATE INDEX push_apns_device_grant_idx ON push_apns_device (grant_id);

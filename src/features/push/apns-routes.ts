@@ -19,7 +19,7 @@ import {
  * The native iPhone app's device registration (design/ios-native-app.md,
  * "Device registration"), under /relay/api/push/apns:
  *
- * - `POST devices` {token, environment, topic?, publicKey, name?, locale?} -> {id}
+ * - `POST devices` {token, environment, topic?, publicKey, name?, locale?, keyCreatedAt?} -> {id}
  * - `DELETE devices/:id`
  * - `POST devices/:id/test`: one encrypted test push (`kind: "test"`, code 123456): 5 an hour per
  *   device token (deleting and registering it again does not reset that) and 10 an hour per account.
@@ -31,7 +31,7 @@ import {
 const BODY_LIMIT = 16 * 1024;
 const ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const TOKEN_RE = /^[0-9a-f]{64,200}$/;
-const FIELDS = new Set(["token", "environment", "topic", "publicKey", "name", "locale"]);
+const FIELDS = new Set(["token", "environment", "topic", "publicKey", "name", "locale", "keyCreatedAt"]);
 export const NAME_MAX = 64;
 /** Test pushes per device token per hour (whatever registration it is under), and per account. */
 export const TEST_PUSHES_PER_HOUR = 5;
@@ -44,6 +44,8 @@ export interface ApnsRegistration {
   publicKey: string;
   name: string | null;
   locale: "fi" | "en" | null;
+  /** Epoch ms when the device made `publicKey`; 0 when the app did not say. */
+  keyCreatedAt: number;
 }
 
 /** The registration body, or the name of the first field that is wrong. */
@@ -51,7 +53,7 @@ export function parseRegistration(body: unknown, topics: readonly string[]): { o
   if (!body || typeof body !== "object" || Array.isArray(body)) return { ok: false, field: "body" };
   const b = body as Record<string, unknown>;
   for (const k of Object.keys(b)) if (!FIELDS.has(k)) return { ok: false, field: k.slice(0, 32) };
-  const { token, environment, topic, publicKey, name, locale } = b;
+  const { token, environment, topic, publicKey, name, locale, keyCreatedAt } = b;
   if (typeof token !== "string" || !TOKEN_RE.test(token) || token.length % 2 !== 0) return { ok: false, field: "token" };
   if (environment !== "production" && environment !== "sandbox") return { ok: false, field: "environment" };
   const t = topic === undefined || topic === null ? topics[0] : topic;
@@ -63,7 +65,12 @@ export function parseRegistration(body: unknown, topics: readonly string[]): { o
     label = name.trim() || null;
   }
   if (locale !== undefined && locale !== null && locale !== "fi" && locale !== "en") return { ok: false, field: "locale" };
-  return { ok: true, value: { token, environment, topic: t, publicKey, name: label, locale: (locale as "fi" | "en" | null | undefined) ?? null } };
+  const keyAt = keyCreatedAt === undefined || keyCreatedAt === null ? 0 : keyCreatedAt;
+  if (typeof keyAt !== "number" || !Number.isSafeInteger(keyAt) || keyAt < 0) return { ok: false, field: "keyCreatedAt" };
+  return {
+    ok: true,
+    value: { token, environment, topic: t, publicKey, name: label, locale: (locale as "fi" | "en" | null | undefined) ?? null, keyCreatedAt: keyAt },
+  };
 }
 
 const err = (reply: FastifyReply, status: number, error: string, extra: Record<string, unknown> = {}) =>
@@ -144,6 +151,7 @@ export async function registerApnsRoutes(app: FastifyInstance, ctx: AppContext, 
           if (res.reason === "quota") return err(reply, 409, "Too many devices", { max: MAX_APNS_DEVICES_PER_ACCOUNT });
           if (res.reason === "taken") return err(reply, 409, "Device registered to another account");
           if (res.reason === "superseded") return err(reply, 409, "Device registered by a newer sign-in");
+          if (res.reason === "stale_key") return err(reply, 409, "A newer key is registered");
           return err(reply.header("www-authenticate", 'Bearer realm="push"'), 401, "Unauthorized");
         }
         stats.inc("apns_registered");

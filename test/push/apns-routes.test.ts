@@ -144,6 +144,10 @@ describe("POST devices", () => {
       [{ ...body(d), name: "line\nbreak" }, "Invalid name"],
       [{ ...body(d), name: 7 }, "Invalid name"],
       [{ ...body(d), locale: "de" }, "Invalid locale"],
+      [{ ...body(d), keyCreatedAt: -1 }, "Invalid keyCreatedAt"],
+      [{ ...body(d), keyCreatedAt: 1.5 }, "Invalid keyCreatedAt"],
+      [{ ...body(d), keyCreatedAt: "1760000000000" }, "Invalid keyCreatedAt"],
+      [{ ...body(d), keyCreatedAt: 2 ** 53 }, "Invalid keyCreatedAt"],
       [{ ...body(d), extra: true }, "Invalid extra"],
       [[body(d)], "Invalid body"],
     ];
@@ -264,6 +268,103 @@ describe("re-registration across sign-ins of one account (review ios-app-r4 R4-4
     const res = await register(a.accessToken, d.publicKey);
     expect(res.statusCode).toBe(200);
     expect(await getApnsDevice(h.ctx.db, (res.json() as { id: string }).id, a.account.id)).toMatchObject({ grantId: a.grantId, publicKey: d.publicKey });
+  });
+});
+
+describe("key replacement within one sign-in (review ios-app-r5 R5-3)", () => {
+  const K1_AT = 1_760_000_000_000;
+  const K2_AT = K1_AT + 60_000;
+
+  /** One sign-in, one device token, and two keys: K1 (lost), then K2 made to replace it. */
+  async function oneSignIn() {
+    const a = await app();
+    const d = makeDevice();
+    const k2 = makeDevice().publicKey;
+    const register = (publicKey: string, keyCreatedAt?: number) =>
+      a.call("POST", "/relay/api/push/apns/devices", body(d, keyCreatedAt === undefined ? { publicKey } : { publicKey, keyCreatedAt }));
+    const targets = async () =>
+      (await apnsTargetsForAccount(h.ctx.db, a.account.id, h.ctx.config.allowedEmails)).map((t) => [t.grantId, t.publicKey, t.keyCreatedAt]);
+    return { a, d, k1: d.publicKey, k2, register, targets };
+  }
+
+  it("the reviewer's sequence: K2 registered, then K1's delayed POST answers 409 and changes nothing", async () => {
+    const { a, k1, k2, register, targets } = await oneSignIn();
+    const repaired = await register(k2, K2_AT);
+    expect(repaired.statusCode).toBe(200);
+    const { id } = repaired.json() as { id: string };
+    const before = (await getApnsDevice(h.ctx.db, id, a.account.id))!;
+    const old = await register(k1, K1_AT); // built before the key was replaced, delivered afterwards
+    expect(old.statusCode).toBe(409);
+    expect(old.json()).toEqual({ error: "A newer key is registered" });
+    expect(await getApnsDevice(h.ctx.db, id, a.account.id)).toEqual(before);
+    expect(await targets()).toEqual([[a.grantId, k2, K2_AT]]);
+  });
+
+  it("an older client's POST without keyCreatedAt never replaces a key that has one", async () => {
+    const { a, k1, k2, register, targets } = await oneSignIn();
+    expect((await register(k2, K2_AT)).statusCode).toBe(200);
+    const old = await register(k1);
+    expect(old.statusCode).toBe(409);
+    expect(old.json()).toEqual({ error: "A newer key is registered" });
+    expect(await targets()).toEqual([[a.grantId, k2, K2_AT]]);
+  });
+
+  it("the same key with the same keyCreatedAt renews (200, same id); a newer key replaces; the same instant with another key does not", async () => {
+    const { a, k1, k2, register, targets } = await oneSignIn();
+    const first = await register(k1, K1_AT);
+    expect(first.statusCode).toBe(200);
+    const renewed = await register(k1, K1_AT);
+    expect(renewed.statusCode).toBe(200);
+    expect(renewed.json()).toEqual(first.json());
+    expect(await targets()).toEqual([[a.grantId, k1, K1_AT]]);
+    const clash = await register(makeDevice().publicKey, K1_AT);
+    expect(clash.statusCode).toBe(409);
+    expect(await targets()).toEqual([[a.grantId, k1, K1_AT]]);
+    const replaced = await register(k2, K2_AT);
+    expect(replaced.statusCode).toBe(200);
+    expect(replaced.json()).toEqual(first.json());
+    expect(await targets()).toEqual([[a.grantId, k2, K2_AT]]);
+  });
+
+  it("without keyCreatedAt on either side it behaves as before: the later POST replaces", async () => {
+    const { a, k1, k2, register, targets } = await oneSignIn();
+    expect((await register(k2)).statusCode).toBe(200);
+    expect((await register(k1)).statusCode).toBe(200);
+    expect(await targets()).toEqual([[a.grantId, k1, 0]]);
+    // The first keyed registration then wins over the unkeyed row.
+    expect((await register(k2, K2_AT)).statusCode).toBe(200);
+    expect(await targets()).toEqual([[a.grantId, k2, K2_AT]]);
+  });
+
+  it("racing POSTs of K1 and K2 always leave K2, in either order", async () => {
+    for (const order of [0, 1]) {
+      const { a, k1, k2, register, targets } = await oneSignIn();
+      const posts = [() => register(k1, K1_AT), () => register(k2, K2_AT)];
+      if (order) posts.reverse();
+      const codes = (await Promise.all(posts.map((p) => p()))).map((r) => r.statusCode).sort();
+      expect([[200, 200], [200, 409]]).toContainEqual(codes);
+      expect(await targets()).toEqual([[a.grantId, k2, K2_AT]]);
+    }
+  });
+
+  it("a key made after the token went gone still replaces it; an older one still does not", async () => {
+    const { a, k1, k2, register, targets } = await oneSignIn();
+    const { id } = (await register(k1, K1_AT)).json() as { id: string };
+    await h.ctx.db.query("UPDATE push_apns_device SET gone_at = now() WHERE id = $1", [id]);
+    expect((await register(makeDevice().publicKey, K1_AT - 1)).statusCode).toBe(409);
+    expect((await register(k2, K2_AT)).statusCode).toBe(200);
+    expect(await targets()).toEqual([[a.grantId, k2, K2_AT]]);
+  });
+
+  it("across sign-ins the grant order decides, whatever the keys' times", async () => {
+    const { a, d, k1, register } = await oneSignIn();
+    expect((await register(k1, K2_AT)).statusCode).toBe(200);
+    const b = await signInApp(h.ctx, a.account.id);
+    const keyB = makeDevice().publicKey;
+    const res = await a.call("POST", "/relay/api/push/apns/devices", body(d, { publicKey: keyB, keyCreatedAt: K1_AT }), b.accessToken);
+    expect(res.statusCode).toBe(200);
+    const targets = await apnsTargetsForAccount(h.ctx.db, a.account.id, h.ctx.config.allowedEmails);
+    expect(targets.map((t) => [t.grantId, t.publicKey, t.keyCreatedAt])).toEqual([[b.grantId, keyB, K1_AT]]);
   });
 });
 

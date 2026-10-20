@@ -687,6 +687,8 @@ export interface ApnsDevice {
   goneAt: Date | null;
   /** New on every (re-)registration of the row (migration 240): what a send and its result are for. */
   incarnation: string;
+  /** When the device made `publicKey` (epoch ms, as the app sent it; 0 when it did not). */
+  keyCreatedAt: number;
 }
 
 interface ApnsRow {
@@ -704,6 +706,7 @@ interface ApnsRow {
   fail_count: number;
   gone_at: Date | null;
   incarnation: string;
+  key_created_at: string | number | bigint;
 }
 
 const toApns = (r: ApnsRow): ApnsDevice => ({
@@ -721,9 +724,10 @@ const toApns = (r: ApnsRow): ApnsDevice => ({
   failCount: r.fail_count,
   goneAt: r.gone_at,
   incarnation: r.incarnation,
+  keyCreatedAt: Number(r.key_created_at),
 });
 
-export type ApnsRegisterResult = { ok: true; id: string } | { ok: false; reason: "quota" | "revoked" | "taken" | "superseded" };
+export type ApnsRegisterResult = { ok: true; id: string } | { ok: false; reason: "quota" | "revoked" | "taken" | "superseded" | "stale_key" };
 
 /**
  * Register (or re-register) a device token for `accountId`, bound to
@@ -732,7 +736,13 @@ export type ApnsRegisterResult = { ok: true; id: string } | { ok: false; reason:
  * key, new grant, same id) unless the row is bound to a newer grant (by the
  * server's grant creation order, the grant id breaking ties): a delayed
  * registration of a previous sign-in never replaces its successor's
- * binding (`superseded`). A token registered to another account is
+ * binding (`superseded`). Within one grant, a registration whose key is
+ * older (`keyCreatedAt`, the device's own clock) than the registered one
+ * changes nothing (`stale_key`): a delayed POST of a key the device has
+ * since replaced. The same key with the same `keyCreatedAt` renews it; a
+ * registration without one counts as 0, so it never replaces a key that
+ * has one, and two without one behave as before (the later replaces).
+ * A token registered to another account is
  * `taken` while that registration is still authorized and not gone; a
  * dead one (signed out, reset, expired temporary passkey, gone) is
  * replaced, under a new id for another account. Decided by the upsert
@@ -756,6 +766,8 @@ export async function registerApnsDevice(
     publicKey: string;
     name: string | null;
     locale: "fi" | "en" | null;
+    /** Epoch ms when the device made `publicKey`; 0 (or absent) when the app did not say. */
+    keyCreatedAt?: number;
   },
   max = MAX_APNS_DEVICES_PER_ACCOUNT,
 ): Promise<ApnsRegisterResult> {
@@ -771,8 +783,8 @@ export async function registerApnsDevice(
     );
     if ((rows[0]?.n ?? 0) >= max) return { ok: false, reason: "quota" };
     const ins = await tx.query<{ id: string }>(
-      `INSERT INTO push_apns_device AS d (id, account_id, grant_id, auth_generation, token, environment, topic, public_key, name, locale)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `INSERT INTO push_apns_device AS d (id, account_id, grant_id, auth_generation, token, environment, topic, public_key, name, locale, key_created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (token) DO UPDATE SET
          id = CASE WHEN d.account_id = EXCLUDED.account_id THEN d.id ELSE EXCLUDED.id END,
          account_id = EXCLUDED.account_id, grant_id = EXCLUDED.grant_id, auth_generation = EXCLUDED.auth_generation,
@@ -780,20 +792,26 @@ export async function registerApnsDevice(
          name = EXCLUDED.name, locale = EXCLUDED.locale, updated_at = now(), gone_at = NULL, fail_count = 0,
          last_push_at = CASE WHEN d.account_id = EXCLUDED.account_id THEN d.last_push_at END,
          created_at = CASE WHEN d.account_id = EXCLUDED.account_id THEN d.created_at ELSE now() END,
-         incarnation = gen_random_uuid()::text
-       WHERE d.gone_at IS NOT NULL OR NOT (${APNS_AUTHORIZED})
-          OR (d.account_id = EXCLUDED.account_id
-              AND NOT EXISTS (SELECT 1 FROM oauth_grant bound, oauth_grant asking
-                               WHERE bound.id = d.grant_id AND asking.id = EXCLUDED.grant_id
-                                 AND (bound.created_at, bound.id) > (asking.created_at, asking.id)))
+         incarnation = gen_random_uuid()::text, key_created_at = EXCLUDED.key_created_at
+       WHERE (d.gone_at IS NOT NULL OR NOT (${APNS_AUTHORIZED})
+              OR (d.account_id = EXCLUDED.account_id
+                  AND NOT EXISTS (SELECT 1 FROM oauth_grant bound, oauth_grant asking
+                                   WHERE bound.id = d.grant_id AND asking.id = EXCLUDED.grant_id
+                                     AND (bound.created_at, bound.id) > (asking.created_at, asking.id))))
+         AND (d.grant_id <> EXCLUDED.grant_id
+              OR EXCLUDED.key_created_at > d.key_created_at
+              OR (EXCLUDED.key_created_at = d.key_created_at AND (EXCLUDED.public_key = d.public_key OR d.key_created_at = 0)))
        RETURNING id`,
-      [d.newId, d.accountId, d.grantId, acc.rows[0].auth_generation, d.token, d.environment, d.topic, d.publicKey, d.name, d.locale],
+      [d.newId, d.accountId, d.grantId, acc.rows[0].auth_generation, d.token, d.environment, d.topic, d.publicKey, d.name, d.locale, d.keyCreatedAt ?? 0],
     );
     if (ins.rows[0]) return { ok: true, id: ins.rows[0].id };
-    // No row: the token's live registration belongs to another account, or
-    // to a newer sign-in of this one (a delayed POST of the previous sign-in).
-    const owner = await tx.query<{ account_id: string }>("SELECT account_id FROM push_apns_device WHERE token = $1", [d.token]);
-    return { ok: false, reason: owner.rows[0]?.account_id === d.accountId ? "superseded" : "taken" };
+    // No row: the token's live registration belongs to another account, to
+    // a newer sign-in of this one (a delayed POST of the previous sign-in),
+    // or, in this very grant, to a newer key (a delayed POST of a lost key).
+    const owner = await tx.query<{ account_id: string; grant_id: string }>("SELECT account_id, grant_id FROM push_apns_device WHERE token = $1", [d.token]);
+    const o = owner.rows[0];
+    if (o?.account_id !== d.accountId) return { ok: false, reason: "taken" };
+    return { ok: false, reason: o.grant_id === d.grantId ? "stale_key" : "superseded" };
   });
 }
 
