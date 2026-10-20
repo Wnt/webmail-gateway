@@ -183,6 +183,32 @@ export interface HtmlToTextOptions {
 /** Elements without content (no closing tag). */
 const VOID = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
 
+/** Whether the `<` at `lt` starts markup, as in a browser: "a < b" and "<3" are text. */
+const startsTag = (s: string, lt: number): boolean => /[A-Za-z/!?]/.test(s.charAt(lt + 1));
+
+/**
+ * Where the tag opened at `lt` ends (its `>`), reading attribute values as
+ * browsers do: a value quoted after `=` may hold a `>`. -1 when it never
+ * ends (an unclosed quote takes the rest, as in a browser). Each tag is read
+ * once, so a scan stays linear.
+ */
+function tagEnd(s: string, lt: number): number {
+  for (let i = lt + 1; i < s.length; i++) {
+    const c = s.charAt(i);
+    if (c === ">") return i;
+    if (c !== "=") continue;
+    let j = i + 1;
+    while (j < s.length && /\s/.test(s.charAt(j))) j++;
+    const quote = s.charAt(j);
+    if (quote === '"' || quote === "'") {
+      const close = s.indexOf(quote, j + 1);
+      if (close < 0) return -1;
+      i = close;
+    } else i = j - 1;
+  }
+  return -1;
+}
+
 /** The attributes of a tag (the text between its name and its `>`), read once from left to right. */
 function tagAttributes(t: string): Map<string, string> {
   const out = new Map<string, string>();
@@ -240,15 +266,46 @@ export function htmlToTextRead(html: string, opts: HtmlToTextOptions = {}): { te
     }
     return m.index + m[0].length;
   };
-  /** End of the element opened just before `from`, nested ones of the same name counted, or -1. */
+  /**
+   * End of the element opened just before `from`: the tags after it are read
+   * as the main scan reads them (quoted values, comments, raw-text elements),
+   * nested ones of the same name counted; `/>` on a non-void element opens
+   * it, as in a browser. -1 when it never closes.
+   */
   const elementEnd = (name: string, from: number): number => {
-    const re = new RegExp(`<(\\/?)${name}\\b[^<>]*>`, "gi");
-    re.lastIndex = from;
     let depth = 1;
-    for (let m = re.exec(s); m; m = re.exec(s)) {
-      if (m[1]) {
-        if (--depth === 0) return m.index + m[0].length;
-      } else if (!m[0].endsWith("/>")) depth++;
+    let i = from;
+    while (i < s.length) {
+      const lt = s.indexOf("<", i);
+      if (lt < 0) return -1;
+      if (!startsTag(s, lt)) {
+        i = lt + 1;
+        continue;
+      }
+      if (s.startsWith("<!--", lt)) {
+        const end = s.indexOf("-->", lt + 4);
+        if (end < 0) return -1;
+        i = end + 3;
+        continue;
+      }
+      const m = TAG_NAME.exec(s.slice(lt + 1, lt + 66));
+      const tag = m ? m[2]!.toLowerCase() : "";
+      if (m && !m[1] && NOT_TEXT.has(tag)) {
+        const end = closing(tag, lt + 1 + tag.length);
+        if (end >= 0) {
+          i = end;
+          continue;
+        }
+        if (NOT_TEXT_TO_END.has(tag)) return -1;
+      }
+      const gt = tagEnd(s, lt);
+      if (gt < 0) return -1;
+      if (tag === name) {
+        if (m![1]) {
+          if (--depth === 0) return gt + 1;
+        } else depth++;
+      }
+      i = gt + 1;
     }
     return -1;
   };
@@ -260,6 +317,11 @@ export function htmlToTextRead(html: string, opts: HtmlToTextOptions = {}): { te
       break;
     }
     out.push(s.slice(i, lt));
+    if (!startsTag(s, lt)) {
+      out.push("<");
+      i = lt + 1;
+      continue;
+    }
     if (s.startsWith("<!--", lt)) {
       const end = s.indexOf("-->", lt + 4);
       out.push(" ");
@@ -280,18 +342,23 @@ export function htmlToTextRead(html: string, opts: HtmlToTextOptions = {}): { te
         break;
       }
     }
-    const gt = s.indexOf(">", lt + 1);
+    const gt = tagEnd(s, lt);
     // A tag cut off at the end (a value cut at maxBodyValueBytes) is not text.
     if (gt < 0) break;
     if (name && opts.exclude) {
       const attrs = tagAttributes(s.slice(lt + 1 + name.length, gt));
-      const verdict = opts.exclude(name, (a) => attrs.get(a) ?? null);
+      // Values as the browser sees them: "display&#58;none" is display:none.
+      const verdict = opts.exclude(name, (a) => {
+        const v = attrs.get(a);
+        return v === undefined ? null : decodeEntities(v);
+      });
       if (verdict === "rest") {
         stopped = true;
         break;
       }
       if (verdict === "element") {
-        if (VOID.has(name) || s.charAt(gt - 1) === "/") {
+        // Only a void element ends with its tag: "<div hidden/>" opens a div.
+        if (VOID.has(name)) {
           i = gt + 1;
           continue;
         }

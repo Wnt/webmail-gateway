@@ -117,7 +117,7 @@ describe("new mail to the native app", () => {
     });
     const outside = req.body.replace(req.json!.m!, "");
     for (const v of [id, `Tx.otp.${mailN}`, "482913", "examplepaja", "Alice", "verification", a.accountId]) expect(outside).not.toContain(v);
-    expect(h.rt.stats.get("apns_code_subject")).toBe(1); // a code in the subject is visible as it is: no body read
+    expect(h.rt.stats.get("apns_code_body")).toBe(1); // the subject's code, confirmed by the body
   });
 
   it("mail without a code: no code field, and no body read", async () => {
@@ -189,20 +189,68 @@ describe("new mail to the native app", () => {
     expect(a.device.open(requests[0]!.json!.m!).code).toBeUndefined();
   });
 
-  it("when the body cannot be read, the preview's code is used", async () => {
-    const a = await appDevice();
+  /** Deliver with the code body read failing (the upstream answers 500 to it). */
+  async function deliverBodyUnreadable(slug: string, m: Mail) {
     const original = h.ctx.fetch;
     h.ctx.fetch = async (input, init) =>
       typeof init?.body === "string" && init.body.includes('"maxBodyValueBytes":40000') ? new Response("", { status: 500 }) : original(input, init);
     try {
-      const { requests } = await deliver(a.slug, { subject: "Sign in", preview: "Your verification code is 482913. It expires soon." });
-      expect(requests).toHaveLength(1);
-      expect(a.device.open(requests[0]!.json!.m!).code).toBe("482913");
-      expect(h.rt.stats.get("apns_code_body_failed")).toBe(1);
-      expect(h.rt.stats.get("apns_code_preview")).toBe(1);
+      return await deliver(slug, m);
     } finally {
       h.ctx.fetch = original;
     }
+  }
+
+  it("when the body cannot be read, the preview's code is used", async () => {
+    const a = await appDevice();
+    const { requests } = await deliverBodyUnreadable(a.slug, {
+      subject: "Sign in",
+      preview: "Your verification code is 482913. It expires in ten minutes; never share it with anyone.",
+    });
+    expect(requests).toHaveLength(1);
+    expect(a.device.open(requests[0]!.json!.m!).code).toBe("482913");
+    expect(h.rt.stats.get("apns_code_body_failed")).toBe(1);
+    expect(h.rt.stats.get("apns_code_preview")).toBe(1);
+  });
+
+  it("when the body cannot be read, a code near the preview's end is not used: it may be cut (review ios-apns-r4 R4-1)", async () => {
+    const a = await appDevice();
+    // legacy-proxy reads 8,192 bytes of the part; whitespace collapses them to this.
+    const { requests } = await deliverBodyUnreadable(a.slug, { subject: "Sign in", preview: "Your code is 1234" });
+    expect(requests).toHaveLength(1);
+    expect(a.device.open(requests[0]!.json!.m!).code).toBeUndefined();
+    expect(h.rt.stats.get("apns_code_body_failed")).toBe(1);
+  });
+
+  it("a subject's code yields to a body that presents another one as the code: none is sent", async () => {
+    const a = await appDevice();
+    const { requests } = await deliver(a.slug, {
+      subject: "Your code is 123456",
+      preview: "Sign in to continue.",
+      body: [{ type: "text/plain", value: "Hi Alice,\n\nYour verification code is 654321.\n\nExamplepaja" }],
+    });
+    expect(a.device.open(requests[0]!.json!.m!).code).toBeUndefined();
+    // The same body agreeing with the subject: the subject's code.
+    const agree = await deliver(a.slug, {
+      subject: "Your code is 123456",
+      preview: "Sign in to continue.",
+      body: [{ type: "text/plain", value: "Hi Alice,\n\nYour verification code is 123456.\n\nExamplepaja" }],
+    });
+    expect(a.device.open(agree.requests[0]!.json!.m!).code).toBe("123456");
+    // And the body unreadable: the subject's code.
+    const unreadable = await deliverBodyUnreadable(a.slug, { subject: "Your code is 123456", preview: "Sign in to continue." });
+    expect(a.device.open(unreadable.requests[0]!.json!.m!).code).toBe("123456");
+  });
+
+  it.each([
+    ["an Outlook reply separator", '<div id="divRplyFwdMsg"><b>From:</b> Alice Example</div><div>Earlier message</div>'],
+    ["an attribution line", "<div>On Monday, Alice Example wrote:</div><div>Earlier message</div>"],
+  ])("a body cut inside its code, then %s: no fragment is sent (review ios-apns-r4 R4-2)", async (_, quote) => {
+    const a = await appDevice();
+    const html = `<p>${"Lorem ipsum ".repeat(1_700).slice(0, 20_000 - 1 - "Your code is 1234".length)}Your code is 123456</p>${quote}`;
+    const { requests } = await deliver(a.slug, { subject: "Your sign-in code", preview: "Open the message for your code.", body: [{ type: "text/html", value: html, in: "both" }] });
+    expect(requests).toHaveLength(1);
+    expect(a.device.open(requests[0]!.json!.m!).code).toBeUndefined();
   });
 
   it("a body that names a code but has none: the push goes without one", async () => {

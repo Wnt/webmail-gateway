@@ -562,21 +562,20 @@ export class Pipeline implements SummarySource {
   }
 
   /**
-   * The one-time code. A code in the subject is visible as it is and is used
-   * at once. Otherwise the body decides, read once and bounded: the reader
-   * shows the body, while a server-made preview may carry hidden preheader
-   * text or be cut, so a code found only in the preview is used only when the
-   * body cannot be read in time. Without a code word in the subject or the
-   * preview nothing is read. Never throws.
+   * The one-time code. The body decides: a code in the subject stands unless
+   * the body presents another one, and a code only in the preview is
+   * confirmed there (a server-made preview can carry hidden preheader text,
+   * or end inside a code; the body reader skips hidden and quoted text). So
+   * a subject or preview code, or a code word, means one bounded body read.
+   * If the body cannot be read in time, the subject's code, else the
+   * preview's, is used (never one near the preview's end, which may be a
+   * fragment). Never throws.
    */
   private async codeFor(account: Account, legacyAccountId: string, e: EmailLite): Promise<string | null> {
     const fromSubject = findVerificationCode(e.subject, "", "preview");
-    if (fromSubject) {
-      this.stats.inc("apns_code_subject");
-      return fromSubject;
-    }
-    const fromPreview = findVerificationCode(e.subject, e.preview, "preview");
-    if (!fromPreview && !mentionsVerificationCode(e.subject) && !mentionsVerificationCode(e.preview)) return null;
+    const fromPreview = fromSubject ? null : findVerificationCode(e.subject, e.preview, "preview");
+    const fallback = fromSubject ?? fromPreview;
+    if (!fallback && !mentionsVerificationCode(e.subject) && !mentionsVerificationCode(e.preview)) return null;
     const started = Date.now();
     try {
       const res = await this.upstream.jmap(
@@ -599,17 +598,22 @@ export class Pipeline implements SummarySource {
         { maxResponseBytes: CODE_BODY_RESPONSE_BYTES, signal: AbortSignal.timeout(this.codeBodyTimeoutMs) },
       );
       const got = emailList(response(res, "b", "Email/get")).find((x) => x.id === e.id);
-      if (!got) return fromPreview;
+      if (!got) return this.codeFallback(fromSubject, fromPreview);
       const code = findVerificationCodeInBody(e.subject, emailBody(got as Parameters<typeof emailBody>[0]));
       this.stats.inc(code ? "apns_code_body" : "apns_code_body_none");
       return code;
     } catch (err) {
       this.stats.inc("apns_code_body_failed");
       this.ctx.log.debug({ accountId: account.id, err: (err as Error).message, ms: Date.now() - started }, "push: code body read failed");
-      // The body could not be read in time: the preview's code (it is never one cut at the preview's end) is
-      // the best there is.
-      if (fromPreview) this.stats.inc("apns_code_preview");
-      return fromPreview;
+      return this.codeFallback(fromSubject, fromPreview);
     }
   }
+
+  /** When the body cannot be read: the subject's code, else the preview's (counted). */
+  private codeFallback(fromSubject: string | null, fromPreview: string | null): string | null {
+    if (fromSubject) this.stats.inc("apns_code_subject");
+    else if (fromPreview) this.stats.inc("apns_code_preview");
+    return fromSubject ?? fromPreview;
+  }
+
 }

@@ -206,7 +206,12 @@ function contextWindow(text: string, from: number, to: number): string {
   return text.slice(start, end);
 }
 
-interface Candidate extends Span { code: string; score: number }
+interface Candidate extends Span {
+  code: string;
+  score: number;
+  /** Presented as the code: "code is X" (or "code: X"), or on a line of its own. */
+  strong: boolean;
+}
 
 function scoreCandidate(text: string, raw: string, start: number, keywords: Span[][], cursors: Cursors): Candidate | null {
   const end = start + raw.length;
@@ -267,7 +272,7 @@ function scoreCandidate(text: string, raw: string, start: number, keywords: Span
   let score = best;
   if (linked) score -= 15;
   if (ownLine) score -= 15;
-  return { start, end, code, score };
+  return { start, end, code, score, strong: linked || ownLine };
 }
 
 const WORD_CHAR_OR_HYPHEN = /^[\p{L}\p{N}-]$/u;
@@ -396,11 +401,12 @@ export function markCut(text: string, cut: boolean): string {
   return cut ? text + CUT_MARK : text;
 }
 
-// A preview may have been cut by the server that made it, with no mark at
-// all: JMAP's preview is "up to 256 characters", and legacy-proxy cuts there
-// and trims (so a cut one is at most a few characters shorter). A preview this
-// long is read as possibly cut; a shorter one is complete.
-const PREVIEW_MAY_BE_CUT = 200;
+// A preview may end where the server that made it stopped reading, with no
+// mark at all, whatever its length: JMAP's preview is "up to 256
+// characters", legacy-proxy cuts there, and before that reads only the first
+// 8,192 bytes of a part, whose whitespace and markup can collapse to a few
+// characters ("Your code is 1234"). JMAP has no property saying a preview is
+// complete, so every preview is read as possibly cut at its end.
 
 /** Whether `text` ends with "..." or "…" (and whitespace): cut, by its own say. */
 function endsWithEllipsis(text: string): boolean {
@@ -451,9 +457,14 @@ export function hiddenByStyle(style: string): boolean {
   return false;
 }
 
-/** Where an earlier message starts in common clients' HTML: everything from it on is prior correspondence. */
-const QUOTE_START_IDS = new Set(['divrplyfwdmsg', 'appendonsend', 'mail-editor-reference-message-container', 'stopspelling']);
-const QUOTE_START_CLASSES = ['gmail_quote', 'yahoo_quoted', 'moz-cite-prefix'];
+// Prior correspondence in HTML, as Bulwark's viewer collapses it
+// (lib/quote-collapse.ts): a container wraps the quoted message (left out
+// with its content; text after it is read), a separator is followed by it
+// (left out with everything after it).
+const QUOTE_CONTAINER_CLASSES = ['gmail_quote_container', 'gmail_quote', 'yahoo_quoted', 'protonmail_quote'];
+const QUOTE_CONTAINER_IDS = new Set(['mail-editor-reference-message-container']);
+const QUOTE_SEPARATOR_IDS = new Set(['divrplyfwdmsg', 'appendonsend', 'stopspelling']);
+const QUOTE_SEPARATOR_CLASSES = ['moz-cite-prefix'];
 
 /**
  * What the code reader does with an element: leave it and its content out
@@ -463,9 +474,10 @@ const QUOTE_START_CLASSES = ['gmail_quote', 'yahoo_quoted', 'moz-cite-prefix'];
  */
 export function excludedElement(tagName: string, attr: (name: string) => string | null): 'element' | 'rest' | null {
   const id = (attr('id') ?? '').trim().toLowerCase();
-  if (QUOTE_START_IDS.has(id)) return 'rest';
   const classes = ` ${(attr('class') ?? '').toLowerCase().replace(/\s+/g, ' ')} `;
-  if (QUOTE_START_CLASSES.some((c) => classes.includes(` ${c} `))) return 'rest';
+  const hasClass = (list: string[]) => list.some((c) => classes.includes(` ${c} `));
+  if (QUOTE_SEPARATOR_IDS.has(id) || hasClass(QUOTE_SEPARATOR_CLASSES)) return 'rest';
+  if (QUOTE_CONTAINER_IDS.has(id) || hasClass(QUOTE_CONTAINER_CLASSES) || attr('data-quoted-html') !== null) return 'element';
   if (tagName.toLowerCase() === 'blockquote' || (attr('type') ?? '').trim().toLowerCase() === 'cite') return 'element';
   if (attr('hidden') !== null || (attr('aria-hidden') ?? '').trim().toLowerCase() === 'true') return 'element';
   const style = attr('style');
@@ -512,8 +524,8 @@ export function withoutQuotedText(text: string): { text: string; quoteCut: boole
  * subject wins, since senders that put it there ("Your code is 177945")
  * also tend to repeat it next to unrelated numbers in the body. Wherever a
  * text was, or may have been, cut (a cap, a CUT_MARK, a closing "..." or
- * "…", a preview of PREVIEW_MAY_BE_CUT characters or more), no code is
- * offered near the cut: the body then has to show it whole. A body with two
+ * "…", the end of any preview), no code is offered near the cut: the body
+ * then has to show it whole. A body with two
  * different, about equally plausible codes gives none. The body readers
  * leave out hidden and quoted text (excludedElement, withoutQuotedText).
  */
@@ -523,16 +535,13 @@ export function findVerificationCode(
   source: 'preview' | 'body' = 'body',
 ): string | null {
   const preview = source === 'preview';
-  return (
-    cappedCandidate(subject, MAX_SUBJECT_CHARS)?.code ??
-    cappedCandidate(
-      text,
-      preview ? MAX_PREVIEW_CHARS : MAX_BODY_CHARS,
-      preview && (text ?? '').length >= PREVIEW_MAY_BE_CUT,
-      !preview,
-    )?.code ??
-    null
-  );
+  const fromSubject = cappedCandidate(subject, MAX_SUBJECT_CHARS);
+  const fromText = cappedCandidate(text, preview ? MAX_PREVIEW_CHARS : MAX_BODY_CHARS, preview, !preview);
+  if (!fromSubject) return fromText?.code ?? null;
+  // A body that presents another code as the code ("code is 654321", or on a
+  // line of its own) disagrees with its subject: no code, a wrong one is worse.
+  if (!preview && fromText?.strong && fromText.code !== fromSubject.code) return null;
+  return fromSubject.code;
 }
 
 // ---------------------------------------------------------------- gateway additions
@@ -570,8 +579,11 @@ export function verificationCodeBodyTexts(body: EmailBody): string[] {
     const cutHtml = html.isTruncated === true || html.value.length > MAX_BODY_HTML;
     const read = htmlToTextRead(html.value.slice(0, MAX_BODY_HTML), { keepQuotes: true, exclude: excludedElement });
     const visible = withoutQuotedText(read.text);
+    // Two causes, kept apart: the text cap (a quote after it does not make
+    // what was cut whole), and the HTML cut, which a quote or separator
+    // before it makes harmless.
     const complete = read.stopped || visible.quoteCut;
-    out.push(markCut(visible.text.slice(0, MAX_BODY_CHARS), !complete && (cutHtml || visible.text.length > MAX_BODY_CHARS)));
+    out.push(markCut(visible.text.slice(0, MAX_BODY_CHARS), visible.text.length > MAX_BODY_CHARS || (!complete && cutHtml)));
   }
   const text = body.text.find((p) => p.type === "text/plain" && p.value && !p.isEncodingProblem);
   if (text) {
@@ -582,11 +594,19 @@ export function verificationCodeBodyTexts(body: EmailBody): string[] {
   return out;
 }
 
-/** The code in a message's body (after the subject, as `findVerificationCode` reads it), or null. */
+/**
+ * The code in a message's body, read as `findVerificationCode` reads it
+ * after the subject: from the HTML part as its reader shows it, else from
+ * the plain-text part. When the subject has a code, the first body text
+ * decides whether it stands (a body presenting another code gives none).
+ */
 export function findVerificationCodeInBody(subject: string | null | undefined, body: EmailBody): string | null {
-  for (const text of verificationCodeBodyTexts(body)) {
+  const texts = verificationCodeBodyTexts(body);
+  if (texts.length === 0) return findVerificationCode(subject, "");
+  const subjectHasCode = findVerificationCode(subject, "") !== null;
+  for (const text of texts) {
     const code = findVerificationCode(subject, text);
-    if (code) return code;
+    if (code || subjectHasCode) return code;
   }
   return null;
 }

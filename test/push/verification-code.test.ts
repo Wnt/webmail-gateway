@@ -170,6 +170,12 @@ describe("hostile mail stays cheap (linear, capped)", () => {
     ["deeply nested inside a hidden element", (n) => () => findVerificationCodeInBody("Your code", html(`<div style="display:none">${"<div>".repeat(n / 5)}code 1${"</div>".repeat(n / 6)}`))],
     ["a long inline style", (n) => () => findVerificationCodeInBody("Your code", html(`<p style="${"a:b;".repeat(n / 4)}">code 123456</p>`))],
     ["many attributes", (n) => () => findVerificationCodeInBody("Your code", html(`<p ${'a="b" '.repeat(n / 6)}>code 123456</p>`))],
+    ["quoted values holding >", (n) => () => findVerificationCodeInBody("Your code", html(`<div title="a > b" hidden>x</div>`.repeat(n / 34)))],
+    ["an unclosed quoted value", (n) => () => findVerificationCodeInBody("Your code", html(`<p title="${"a > b ".repeat(n / 6)}`))],
+    ["chained quoted values", (n) => () => findVerificationCodeInBody("Your code", html('<a b="'.repeat(n / 6)))],
+    ["bare < inside hidden elements", (n) => () => findVerificationCodeInBody("Your code", html("<div hidden>1 < 2</div>".repeat(n / 23)))],
+    ["self-closed hidden divs, never closed", (n) => () => findVerificationCodeInBody("Your code", html("<div hidden/>x".repeat(n / 14)))],
+    ["entity-heavy attribute values", (n) => () => findVerificationCodeInBody("Your code", html(`<p style="${"&#58;".repeat(n / 5)}">code 123456</p>`))],
     ["quoted lines", (n) => () => findVerificationCodeInBody("Your code", body("> code 1234\n".repeat(n / 12)))],
     ["a long attribution-like line", (n) => () => findVerificationCodeInBody("Your code", body(`On ${"x".repeat(n)} wrote:\ncode 123456`))],
     ["long separator-like lines", (n) => () => findVerificationCodeInBody("Your code", body(`${"-".repeat(n / 2)}\n${"_".repeat(n / 2)}\ncode 123456`))],
@@ -227,8 +233,10 @@ describe("hostile mail stays cheap (linear, capped)", () => {
       expect(findVerificationCode("", `${at(MAX_BODY_CHARS, lead)}5678`)).toBeNull();
       expect(findVerificationCodeInBody("", body(`${at(MAX_BODY_CHARS, lead)}5678`))).toBeNull();
     }
-    // Uncut, the whole code.
-    expect(findVerificationCode("", "Your code is 1234 5678", "preview")).toBe("12345678");
+    // Uncut, the whole code; a preview may always be cut at its end, so it gives one only with room after it.
+    expect(findVerificationCode("", "Your code is 1234 5678")).toBe("12345678");
+    expect(findVerificationCode("", "Your code is 1234 5678", "preview")).toBeNull();
+    expect(findVerificationCode("", "Your code is 1234 5678. It expires in 10 minutes, so use it soon.", "preview")).toBe("12345678");
   });
 
   it("keeps the cut through HTML extraction: a large removed <style> before the cut leaves a short text that is still cut", () => {
@@ -272,11 +280,17 @@ describe("hostile mail stays cheap (linear, capped)", () => {
       expect(findVerificationCode("", "Your code is 1234...", source)).toBeNull();
     }
     expect(findVerificationCode("Your code is 1234 ...", "")).toBeNull();
-    // No over-correction: a short preview is complete, and a long one still gives a code far from its end.
-    expect(findVerificationCode("", "Your code is 482913. It expires in 10 minutes.", "preview")).toBe("482913");
+    // Any preview may end where its server stopped reading (review ios-apns-r4 R4-1: legacy-proxy reads
+    // 8,192 bytes, and whitespace can collapse them to "Your code is 1234"): a preview gives a code only
+    // with 40 visible characters after it, however short it is.
+    const collapsed = `${" ".repeat(8192 - "Your code is 1234".length)}Your code is 123456`.slice(0, 8192).trim();
+    expect(collapsed).toBe("Your code is 1234");
+    expect(findVerificationCode("", collapsed, "preview")).toBeNull();
+    expect(findVerificationCode("", "Your code is 482913. It expires in 10 minutes.", "preview")).toBeNull();
+    expect(findVerificationCode("", "Your code is 482913. It expires in 10 minutes, so use it soon.", "preview")).toBe("482913");
     expect(findVerificationCode("", `Your code is 482913. ${pad(230)}`, "preview")).toBe("482913");
     expect(findVerificationCode("", `Your code is 482913. ${pad(150)}...`, "preview")).toBe("482913");
-    expect(findVerificationCode("", `${pad(170)} Your code is 482913`, "preview")).toBe("482913"); // 190 characters: complete
+    expect(findVerificationCode("", `${pad(170)} Your code is 482913`, "preview")).toBeNull();
   });
 });
 
@@ -306,9 +320,32 @@ describe("a preview's ellipsis or an unmarked server cut never leaves a fragment
     expect(findVerificationCode("", "Your code is 1234 56...", "preview")).toBeNull();
     expect(findVerificationCode("", "Your code is 1234 ...", "preview")).toBeNull();
     expect(findVerificationCode("", "Your code is 1 2 3 4 5...", "preview")).toBeNull();
-    expect(findVerificationCode("", "Your code is 1234 5678", "preview")).toBe("12345678");
+    expect(findVerificationCode("", "Your code is 1234 5678", "preview")).toBeNull();
+    expect(findVerificationCode("", "Your code is 1234 5678")).toBe("12345678");
     const body = `${"x".repeat(238)} Your code is 12345678`;
     expect(findVerificationCode("", body.slice(0, 256), "preview")).toBeNull();
     expect(findVerificationCodeInBody("", { text: [{ type: "text/plain", value: body }], html: [] })).toBe("12345678");
+  });
+});
+
+describe("a quote after the text cap does not make the cut text whole (review ios-apns-r4 R4-2)", () => {
+  // "<p>" gives "\n"; the 20,000-character text cap then falls right after "1234".
+  const lead = `<p>${"Lorem ipsum ".repeat(1_700).slice(0, MAX_BODY_CHARS - 1 - "Your code is 1234".length)}Your code is 123456</p>`;
+  const variants: [string, string][] = [
+    ["an Outlook reply separator", `${lead}<div id="divRplyFwdMsg"><b>From:</b> Alice Example</div><div>Earlier message</div>`],
+    ["a Gmail quote container", `${lead}<div class="gmail_quote"><div>Earlier message</div></div>`],
+    ["an attribution line", `${lead}<div>On Monday, Alice Example wrote:</div><div>Earlier message</div>`],
+    ["a quote just beyond the cap", `${lead}<blockquote>Earlier message</blockquote>`],
+  ];
+  it.each(variants)("%s", (_, markup) => {
+    const body: EmailBody = { text: [], html: [{ type: "text/html", value: markup }] };
+    const [text] = verificationCodeBodyTexts(body);
+    expect(text!.endsWith(CUT_MARK)).toBe(true);
+    expect(findVerificationCodeInBody("", body)).toBeNull();
+  });
+
+  it("without the cap in the way, the code before the quote is found", () => {
+    const body: EmailBody = { text: [], html: [{ type: "text/html", value: '<p>Your code is 123456</p><div class="gmail_quote">Earlier</div>' }] };
+    expect(findVerificationCodeInBody("", body)).toBe("123456");
   });
 });

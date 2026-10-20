@@ -17,5 +17,19 @@
   {"name": "an original-message block with a code", "subject": "RE: Sign in", "html": null, "text": "Got it.\n\n-----Original Message-----\nFrom: Examplepaja\nYour verification code is 123456.", "code": null},
   {"name": "two different codes, equally plausible", "subject": "Sign in", "html": null, "text": "Your verification code is 123456.\nYour verification code is 654321.", "code": null},
   {"name": "the same code twice", "subject": "Sign in", "html": null, "text": "Your verification code is 482913.\nEnter 482 913 to sign in. Your code: 482913", "code": "482913"},
-  {"name": "a plain-text code with no quote at all", "subject": "Sign in", "html": null, "text": "Hi Alice,\n\nYour verification code is 482913.\n\nExamplepaja", "code": "482913"}
+  {"name": "a plain-text code with no quote at all", "subject": "Sign in", "html": null, "text": "Hi Alice,\n\nYour verification code is 482913.\n\nExamplepaja", "code": "482913"},
+  {"name": "a hidden attribute after a quoted '>' in another attribute", "subject": "Sign in", "html": "<div title=\"a > b\" hidden>Your code is 111111.</div><p>Welcome.</p>", "text": null, "code": null},
+  {"name": "an entity-encoded display:none", "subject": "Sign in", "html": "<div style=\"display&#58;none\">Your code is 111111.</div><p>Welcome.</p>", "text": null, "code": null},
+  {"name": "a non-void hidden element written with '/>' still hides what follows", "subject": "Sign in", "html": "<div hidden/>Your code is 111111.", "text": null, "code": null},
+  {"name": "a hidden code inside a link label", "subject": "Sign in", "html": "<a href=\"https://examplepaja.test/login\"><span hidden>Your code is 123456</span>Continue</a>", "text": null, "code": null},
+  {"name": "a cited code inside a link label", "subject": "Sign in", "html": "<a href=\"https://examplepaja.test/login\"><span type=\"cite\">Your code is 123456</span>Continue</a>", "text": null, "code": null},
+  {"name": "a quote start inside a link ends the current text", "subject": "Re: Sign in", "html": "<a href=\"https://examplepaja.test/\"><div class=\"moz-cite-prefix\">On Mon Examplepaja wrote:</div></a><p>Your code is 123456</p>", "text": null, "code": null},
+  {"name": "a visible code after a link with a hidden label part", "subject": "Sign in", "html": "<a href=\"https://examplepaja.test/login\"><span hidden>Your code is 123456</span>Continue</a><p>Your verification code is 654321.</p>", "text": null, "code": "654321"},
+  {"name": "Bulwark's own quoted-html wrapper", "subject": "Re: Sign in", "html": "<p>Thanks, done.</p><div data-quoted-html>Your code is 123456</div>", "text": null, "code": null},
+  {"name": "a Proton Mail quote (div)", "subject": "Re: Sign in", "html": "<p>Thanks, done.</p><div class=\"protonmail_quote\">Your code is 123456</div>", "text": null, "code": null},
+  {"name": "a Proton Mail quote (blockquote)", "subject": "Re: Sign in", "html": "<p>Thanks, done.</p><blockquote class=\"protonmail_quote\">Your code is 123456</blockquote>", "text": null, "code": null},
+  {"name": "a Gmail quote container", "subject": "Re: Sign in", "html": "<p>Thanks, done.</p><div class=\"gmail_quote_container\"><div class=\"gmail_attr\">On Mon wrote:</div><div>Your code is 123456</div></div>", "text": null, "code": null},
+  {"name": "current text after a quoted container is still read", "subject": "Re: Sign in", "html": "<div class=\"gmail_quote\">Your code was 123456</div><p>Here is the new one. Your verification code is 654321.</p>", "text": null, "code": "654321"},
+  {"name": "a bare '<' inside a hidden element does not end it early or hide what follows", "subject": "Sign in", "html": "<div hidden>Price 1 < 2. Your code is 111111.</div><p>Your verification code is 654321.</p>", "text": null, "code": "654321"},
+  {"name": "a bare '<' before a hidden element does not reveal it", "subject": "Sign in", "html": "<p>3 < 4</p><div hidden>Your code is 111111.</div><p>Welcome.</p>", "text": null, "code": null}
 ]
