@@ -3,16 +3,28 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { fetch as undiciFetch } from "undici";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, expect, it } from "vitest";
-import { httpFetch } from "../src/core/http-fetch.js";
+import { httpDispatcher, httpFetch } from "../src/core/http-fetch.js";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
 describe("ctx.fetch default (core/http-fetch)", () => {
-  it("is the pinned undici's fetch, not Node's bundled one", () => {
-    expect(httpFetch).toBe(undiciFetch);
+  it("goes through its own Agent of the pinned undici, even after the global fetch ran", async () => {
     expect(httpFetch).not.toBe(globalThis.fetch);
+    const server = createServer((_req, res) => res.end("ok"));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      // The global fetch installs Node's bundled dispatcher as the global one.
+      expect(await (await globalThis.fetch(origin)).text()).toBe("ok");
+      const res = await httpFetch(`${origin}/x`, { headers: new Headers({ "x-test": "1" }), signal: AbortSignal.timeout(5_000) });
+      expect(await res.text()).toBe("ok");
+      expect(Object.keys(httpDispatcher.stats)).toContain(origin);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 
   // GHSA-xjj6-f33q-929c: an over-encoded response that closes early left a
