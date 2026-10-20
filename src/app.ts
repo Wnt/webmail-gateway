@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import { pino } from "pino";
 import type { Config } from "./config.js";
+import { httpFetch } from "./core/http-fetch.js";
 import { closeUpstream } from "./core/upstream/index.js";
 import { authPlugin } from "./features/auth/index.js";
 import { jmapPlugin } from "./features/jmap/index.js";
@@ -13,7 +14,7 @@ import type { AppContext, AppDeps } from "./types.js";
  */
 export async function buildApp(config: Config, deps: AppDeps): Promise<FastifyInstance> {
   const log = deps.log ?? (pino({ level: "silent" }) as AppContext["log"]);
-  const ctx: AppContext = { config, db: deps.db, log, fetch: deps.fetch ?? fetch };
+  const ctx: AppContext = { config, db: deps.db, log, fetch: deps.fetch ?? httpFetch };
 
   const app = Fastify({ loggerInstance: log, trustProxy: true });
   // The upstream (core/upstream) is shared by every feature; its connections close with the app.

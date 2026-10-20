@@ -1,6 +1,7 @@
 import { loadConfig } from "./config.js";
 import { migrate } from "./db/migrate.js";
 import { createPgDb } from "./db/pool.js";
+import { httpFetch } from "./core/http-fetch.js";
 import { closeUpstream } from "./core/upstream/index.js";
 import { authCliCommands } from "./features/auth/index.js";
 import { jmapCliCommands } from "./features/jmap/index.js";
@@ -28,7 +29,7 @@ if (!cmd) {
 const config = loadConfig();
 const log = createLogger(config);
 const db = createPgDb(config.databaseUrl);
-const ctx: AppContext = { config, db, log, fetch };
+const ctx: AppContext = { config, db, log, fetch: httpFetch };
 let code = 0;
 try {
   code = (await cmd(args, ctx)) ?? 0;

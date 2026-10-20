@@ -6,7 +6,7 @@ import type { Db } from "./db/pool.js";
 export interface AppDeps {
   db: Db;
   log?: FastifyBaseLogger;
-  /** Override for outgoing HTTP (legacy-proxy calls). Defaults to global `fetch`. */
+  /** Override for outgoing HTTP (legacy-proxy, push services, summaries). Defaults to `httpFetch` (core/http-fetch.ts). */
   fetch?: typeof fetch;
 }
 

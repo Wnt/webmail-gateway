@@ -1,6 +1,7 @@
 import { untilAborted } from "./abort.js";
 import { getGandiPassword, type Account } from "./accounts.js";
 import { emitLegacyRelogin } from "./hooks.js";
+import { httpFetch } from "./http-fetch.js";
 import { mintToken } from "./token.js";
 import type { CoreContext } from "../types.js";
 
@@ -91,7 +92,7 @@ function reloginWithBasic(ctx: Ctx, account: LegacyAccount): Promise<boolean> {
     const password = await getGandiPassword(ctx, account.id);
     if (password === null) return false;
     const basic = Buffer.from(`${account.email}:${password}`, "utf8").toString("base64");
-    const res = await (ctx.fetch ?? fetch)(joinUrl(ctx.config.legacyProxyUrl, "/jmap/session"), {
+    const res = await (ctx.fetch ?? httpFetch)(joinUrl(ctx.config.legacyProxyUrl, "/jmap/session"), {
       headers: { authorization: `Basic ${basic}` },
       signal: AbortSignal.timeout(RELOGIN_TIMEOUT_MS),
     });
@@ -127,7 +128,7 @@ export async function legacyFetch(
   path: string,
   init: RequestInit = {},
 ): Promise<Response> {
-  const doFetch = ctx.fetch ?? fetch;
+  const doFetch = ctx.fetch ?? httpFetch;
   const url = joinUrl(ctx.config.legacyProxyUrl, path);
   const attempt = (): Promise<Response> => {
     const headers = new Headers(init.headers);

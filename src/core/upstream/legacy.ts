@@ -5,6 +5,7 @@
 import { Agent } from "undici";
 import { untilAborted } from "../abort.js";
 import { getGandiPassword, setGandiPassword } from "../accounts.js";
+import { httpFetch } from "../http-fetch.js";
 import {
   LEGACY_TOKEN_TTL_SEC,
   LegacyError,
@@ -213,7 +214,7 @@ export class LegacyUpstream implements Upstream {
     const basic = Buffer.from(`${email}:${password}`, "utf8").toString("base64");
     let status: number;
     try {
-      const res = await (this.ctx.fetch ?? fetch)(this.base + LEGACY_TEMPLATES.session, {
+      const res = await (this.ctx.fetch ?? httpFetch)(this.base + LEGACY_TEMPLATES.session, {
         headers: { authorization: `Basic ${basic}` },
         signal: AbortSignal.timeout(30_000),
       });
