@@ -226,8 +226,9 @@ export async function sweepExpiredPasskeys(s: AuthState): Promise<number> {
   return n;
 }
 
+/** A display name: whitespace runs become one space, other control characters (NUL, which text columns refuse) go. */
 export const passkeyName = (raw: unknown, fallback: string): string => {
-  const name = typeof raw === "string" ? raw.trim().replace(/\s+/g, " ") : "";
+  const name = typeof raw === "string" ? raw.replace(/(?!\s)\p{Cc}/gu, "").replace(/\s+/g, " ").trim() : "";
   return name ? name.slice(0, 64) : fallback;
 };
 

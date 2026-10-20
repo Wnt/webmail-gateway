@@ -7,6 +7,7 @@ import { createEnrollToken } from "../src/features/auth/enroll.js";
 import { makeAuthPlugin } from "../src/features/auth/index.js";
 import { createAuthState } from "../src/features/auth/state.js";
 import { b64url } from "../src/features/auth/util.js";
+import { passkeyName } from "../src/features/auth/webauthn.js";
 import type { AppContext } from "../src/types.js";
 import { SoftAuthenticator } from "./fake-authenticator.js";
 import { makeTestContext } from "./helpers.js";
@@ -378,6 +379,27 @@ describe("passkey management", () => {
     res = await b.go("POST", "/auth/logout", {});
     expect(res.json()).toEqual({ next: "/auth/login" });
     expect((await b.go("GET", "/auth/passkeys")).statusCode).toBe(303);
+  });
+
+  it("drops control characters from names when enrolling, adding and renaming", async () => {
+    expect(passkeyName(" My\u0000\tphone\u0007 ", "x")).toBe("My phone");
+    expect(passkeyName("\u0000\u001f", "fallback")).toBe("fallback");
+    const b = new Browser();
+    const a = authr();
+    expect((await enroll(b, a, "Pho\u0000ne")).statusCode).toBe(200);
+    let res = await b.go("POST", "/auth/passkeys/reauth/options", {});
+    expect((await b.go("POST", "/auth/passkeys/reauth/verify", a.authenticate(res.json()))).statusCode).toBe(200);
+    res = await b.go("POST", "/auth/passkeys/options", {});
+    res = await b.go("POST", "/auth/passkeys/verify", { response: a.register(res.json()), name: "Sec\u0000ond" });
+    expect(res.statusCode).toBe(200);
+    const second = res.json() as { id: string; name: string };
+    expect(second.name).toBe("Second");
+    expect((await b.go("PATCH", `/auth/passkeys/${second.id}`, { name: "Renamed\u0000" })).json()).toEqual({ ok: true });
+    res = await b.go("PATCH", `/auth/passkeys/${second.id}`, { name: "\u0000" });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error: "invalid_request" });
+    const names = (await ctx.db.query<{ name: string }>("SELECT name FROM passkey ORDER BY created_at, name")).rows.map((r) => r.name);
+    expect(names.sort()).toEqual(["Phone", "Renamed"]);
   });
 
   it("sessions expire after their TTL", async () => {
