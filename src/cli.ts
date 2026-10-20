@@ -1,3 +1,5 @@
+// First: the pinned undici becomes the process's fetch (core/http-install.ts).
+import "./core/http-install.js";
 import { loadConfig } from "./config.js";
 import { migrate } from "./db/migrate.js";
 import { createPgDb } from "./db/pool.js";
