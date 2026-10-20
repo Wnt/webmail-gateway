@@ -8,6 +8,7 @@ import {
   type PublicKeyCredentialRequestOptionsJSON,
   type RegistrationResponseJSON,
 } from "@simplewebauthn/server";
+import { decodeAttestationObject, isoBase64URL, isoCBOR } from "@simplewebauthn/server/helpers";
 import type { Queryable } from "../../db/pool.js";
 import { audit } from "./audit.js";
 import { holdAuth, holdSession, holdStepUp, lockAccountForRevocation } from "./generation.js";
@@ -252,15 +253,53 @@ export async function registrationOptions(s: AuthState, account: { id: string; e
 /** A registration response that verified; `storePasskey` writes it. */
 export type NewCredential = NonNullable<Awaited<ReturnType<typeof verifyRegistrationResponse>>["registrationInfo"]>;
 
+/**
+ * The response with its attestation statement replaced by "none", and the
+ * format the client sent. Registration asks for attestation "none" and never
+ * judges an authenticator's attestation, so whatever format a client sends,
+ * the library verifies the response as "none" (challenge, origin, RP ID, user
+ * presence and verification, key algorithm: all from the client data and the
+ * authenticator data, which stay as sent) and never parses a certificate from
+ * the statement or contacts an address named in one. Browsers send "none" for
+ * this request already, or self attestation, which proves nothing a "none"
+ * response would not; neither is refused.
+ */
+export function withoutAttestationStatement(response: RegistrationResponseJSON): { response: RegistrationResponseJSON; fmt: string } {
+  const raw: unknown = response?.response?.attestationObject;
+  if (typeof raw !== "string") throw new CeremonyError("registration: bad attestation object");
+  let fmt: unknown;
+  let authData: unknown;
+  try {
+    const decoded: unknown = decodeAttestationObject(isoBase64URL.toBuffer(raw));
+    if (decoded instanceof Map) {
+      fmt = decoded.get("fmt");
+      authData = decoded.get("authData");
+    }
+  } catch {
+    // Not CBOR: refused below.
+  }
+  if (typeof fmt !== "string" || !(authData instanceof Uint8Array)) throw new CeremonyError("registration: bad attestation object");
+  const none = isoCBOR.encode(
+    new Map<string, Parameters<typeof isoCBOR.encode>[0]>([
+      ["fmt", "none"],
+      ["attStmt", new Map()],
+      ["authData", authData],
+    ]),
+  );
+  return { response: { ...response, response: { ...response.response, attestationObject: isoBase64URL.fromBuffer(none) } }, fmt };
+}
+
 /** Verify a registration response (no database writes). */
 export async function verifyRegistration(
   s: AuthState,
   input: { response: RegistrationResponseJSON; challenge: string },
 ): Promise<NewCredential> {
+  const { response, fmt } = withoutAttestationStatement(input.response);
+  if (fmt !== "none") s.ctx.log.info({ fmt: fmt.slice(0, 32) }, "registration: attestation statement ignored");
   let result: Awaited<ReturnType<typeof verifyRegistrationResponse>>;
   try {
     result = await verifyRegistrationResponse({
-      response: input.response,
+      response,
       expectedChallenge: input.challenge,
       expectedOrigin: s.origin,
       expectedRPID: s.rpId,
