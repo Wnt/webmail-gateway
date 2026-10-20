@@ -156,6 +156,40 @@ describe("enrollment", () => {
     expect(reasons.length).toBe(4);
     expect(reasons[0]!.details.reason).toMatch(/origin/i);
   });
+
+  it("refuses transports it cannot store as a verification failure (400), when enrolling and when adding", async () => {
+    const bad: unknown[] = [{}, "usb", null, [1], ["two words"], ["nul\u0000"], [""], Array(17).fill("usb")];
+    const withTransports = (r: ReturnType<SoftAuthenticator["register"]>, transports: unknown) =>
+      ({ ...r, response: { ...r.response, transports } }) as unknown as ReturnType<SoftAuthenticator["register"]>;
+    const b = new Browser();
+    const a = authr();
+    const { token } = await createEnrollToken(ctx, accountId, now);
+    await b.go("GET", `/auth/enroll/${token}`);
+    for (const t of bad) {
+      now += 61_000; // the enrollment rate limit's window
+      const opts = (await b.go("POST", "/auth/enroll/options", {})).json();
+      const res = await b.go("POST", "/auth/enroll/verify", { response: withTransports(a.register(opts), t), name: "Phone" });
+      expect(res.statusCode, JSON.stringify(t)).toBe(400);
+      expect(res.json()).toEqual({ error: "verification_failed" });
+    }
+    expect((await ctx.db.query("SELECT 1 FROM passkey")).rows).toHaveLength(0);
+    expect(b.cookies.has("__Host-gw_session")).toBe(false);
+    let opts = (await b.go("POST", "/auth/enroll/options", {})).json();
+    let res = await b.go("POST", "/auth/enroll/verify", { response: withTransports(a.register(opts), ["hybrid", "internal"]), name: "Phone" });
+    expect(res.statusCode).toBe(200);
+
+    res = await b.go("POST", "/auth/passkeys/reauth/options", {});
+    const first = [...a.credentials.keys()].at(-1);
+    expect((await b.go("POST", "/auth/passkeys/reauth/verify", a.authenticate(res.json(), {}, first))).statusCode).toBe(200);
+    for (const t of bad) {
+      opts = (await b.go("POST", "/auth/passkeys/options", {})).json();
+      res = await b.go("POST", "/auth/passkeys/verify", { response: withTransports(a.register(opts), t), name: "Second" });
+      expect(res.statusCode, JSON.stringify(t)).toBe(400);
+      expect(res.json()).toEqual({ error: "verification_failed" });
+    }
+    const rows = (await ctx.db.query<{ transports: string }>("SELECT transports FROM passkey")).rows;
+    expect(rows).toEqual([{ transports: "hybrid internal" }]);
+  });
 });
 
 describe("login", () => {

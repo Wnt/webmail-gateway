@@ -289,12 +289,17 @@ export function withoutAttestationStatement(response: RegistrationResponseJSON):
   return { response: { ...response, response: { ...response.response, attestationObject: isoBase64URL.fromBuffer(none) } }, fmt };
 }
 
+/** Transports as `storePasskey` keeps them (space-separated): absent, or a few tokens like `getTransports()` gives ("internal", "hybrid"). */
+const storableTransports = (t: unknown): boolean =>
+  t === undefined || (Array.isArray(t) && t.length <= 16 && t.every((x) => typeof x === "string" && /^[\x21-\x7e]{1,64}$/.test(x)));
+
 /** Verify a registration response (no database writes). */
 export async function verifyRegistration(
   s: AuthState,
   input: { response: RegistrationResponseJSON; challenge: string },
 ): Promise<NewCredential> {
   const { response, fmt } = withoutAttestationStatement(input.response);
+  if (!storableTransports(response.response.transports)) throw new CeremonyError("registration: bad transports");
   if (fmt !== "none") s.ctx.log.info({ fmt: fmt.slice(0, 32) }, "registration: attestation statement ignored");
   let result: Awaited<ReturnType<typeof verifyRegistrationResponse>>;
   try {
